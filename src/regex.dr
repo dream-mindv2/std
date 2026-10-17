@@ -842,8 +842,8 @@ let split re s = {
 /// match: a regex as a token inside a larger grammar.
 let parser : Regex -> p.Parser Match;
 let parser re s at = match run (Regex.code re) s at 4 {
-    () => #[:fail, #[at, ["text matching /" + Regex.source re + "/"]]],
-    caps => #[:ok, match_of re s caps, caps.[1], ()],
+    () => p.expected at ("text matching /" + Regex.source re + "/"),
+    caps => p.found (match_of re s caps) caps.[1],
 };
 
 /// The same, answering just the matched text.
