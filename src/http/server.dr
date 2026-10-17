@@ -465,12 +465,24 @@ priv let split_target target = {
     [path, query]
 };
 
+/// Force what a handler answered, so that a raise anywhere in it happens
+/// here, inside the `try!` that turns it into a 500 -- all of it but a
+/// stream. A stream is made as it is sent, and may never end: forcing it
+/// here would hold the whole body in memory before the first byte went out,
+/// or never send one. The values are shared with `out`, so forcing them in a
+/// copy without the stream forces them in `out`.
+priv let settle! : :any -> :unit;
+priv let settle! out = match type_of out {
+    :map => { strict! (map.remove :stream out); () },
+    _ => { strict! out; () },
+};
+
 /// The handler's answer, as a response: a raise becomes a 500 (and goes to
 /// the logger), a string a text response, `()` a 204.
 priv let answer! : :any -> :map -> :map -> :map;
 priv let answer! handle req options = try! {
     let out = handle req;
-    strict! out
+    settle! out
     match type_of out {
         :map => if map.has :status out { out } else { http.json out },
         :string => http.text out,
@@ -881,7 +893,7 @@ let logged! : :map -> :any -> :map -> :map;
 let logged! lg app req = {
     let start = time.monotonic! ();
     let resp = (handler app) req;
-    strict! resp
+    settle! resp
     let status = resp.[:status else 200];
     log.at! lg (if status >= 500 { :error } else if status >= 400 { :warn } else { :info })
            (http.Request.method req + " " + http.Request.path req)
@@ -1078,6 +1090,21 @@ when test {
             stop! s
             test.eq! [true, true] [Result.unwrap_or "" got == str.concat_all (list.map (fn n -> to_string n + ",") (list.range 0 1000)),
                                    str.contains_str "Transfer-Encoding: chunked" out]
+        } ),
+        test.case "an endless stream is sent as it is made" $( {
+            let rec from n = list.cons (to_string n + ",") (from (n + 1));
+            let s = serve! 0 (router |> get "/" (fn req -> http.stream (from 0)));
+            let first! u = {
+                let sock = net.connect! "127.0.0.1" (port s);
+                streams.write_all! sock "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+                let [got, _] = http.read_exact! (http.reader sock) 256;
+                strict! got
+                io.close! sock
+                got
+            };
+            let got = time.within! (2 * time.second) (first! ());
+            stop! s
+            test.eq! true (match got { Result.ok(text) => str.contains_str "\r\n3\r\n10,\r\n" text, _ => false })
         } ),
         test.case "a stream made by a function, with effects" $( {
             let counter = agent.start! 0;
