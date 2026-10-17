@@ -11,7 +11,7 @@ as a file header, network packet, device register or another language's struct.
 
 ## A packet
 
-```dream
+```dream no-run
 import std.binary as b;
 
 let packet = b.record [
@@ -118,7 +118,7 @@ The reader compares its result using `crypto.equal`. The body layout must find
 its own end: use a fixed-width body or `sized`/`blob`, rather than an unbounded
 `rest`, which would consume the digest as well.
 
-```dream
+```dream no-run
 let choices = b.tagged b.u8 %{
     1 => b.u32be,
     2 => b.blob b.u16le 1024,
@@ -133,7 +133,7 @@ let bounded = b.sized b.u16be 4096 (b.record [
 
 ## Bit fields and alignment
 
-```dream
+```dream no-run
 let flags = b.record [
     [:version, b.bits :msb 3],
     [:urgent, b.flag],
@@ -256,7 +256,7 @@ integers use the language's infinite two's-complement semantics.
 
 `std.binary.io` uses callbacks or existing IO handles:
 
-```dream
+```dream no-run
 // source! maximum -> up to maximum bytes; empty string means EOF.
 // sink! bytes -> number of bytes written.
 bio.read_exact_with! count source!
@@ -275,7 +275,7 @@ owns recovery. Callers should bound count according to their protocol.
 
 Existing wire framing can be described without changing it:
 
-```dream
+```dream no-run
 let frame_bytes = b.blob b.u32le 1048576;
 // b.encode frame_bytes (wire.encode value) has the bytes of wire.frame value.
 // The explicit limit is this application's policy.

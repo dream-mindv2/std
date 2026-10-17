@@ -3,7 +3,7 @@
 `std.console` is implemented in Dream. `std.io` supplies the handles and system
 calls; rendering, formatting, prompts, colors and logging live in the library.
 
-```dream
+```dream no-run
 import std.console;
 
 let main! = {
@@ -28,7 +28,7 @@ There is no user-space output buffer to flush. A zero-progress write raises
 `:io_error` rather than looping forever. Each message is assembled before its
 first write; large messages can still interleave if the OS requires short writes.
 
-```dream
+```dream no-run
 console.printf! "{}: {} items" ["queue", 12]  // newline
 console.writef! "progress: {}%" [75]           // no newline
 console.errorf! "cannot open {}" [path]
@@ -51,7 +51,7 @@ stdin. This leaves stdout available for redirected program results.
 surrounding whitespace. An empty line chooses the Boolean default. Invalid input
 prints help and retries. EOF returns `()` even when the default is `true`.
 
-```dream
+```dream no-run
 match console.confirm! "Overwrite?" false {
     true => save! (),
     false => (),
@@ -63,7 +63,7 @@ match console.confirm! "Overwrite?" false {
 `ask! question parser` handles custom validation: the pure parser returns
 `Result.ok value` or `Result.error help`. For example:
 
-```dream
+```dream no-run
 let port line = match console.integer line {
     Result.ok(n) if n >= 1 && n <= 65535 => Result.ok n,
     _ => Result.error "Enter a port from 1 to 65535.",
@@ -73,7 +73,7 @@ let chosen = console.ask! "Port? " port;
 
 For tests, files, or alternate streams, construct a session:
 
-```dream
+```dream no-run
 let session = console.Session.new input_handle output_handle
               |> console.Session.set_max_line 4096;
 let name = console.prompt_with! session "Name? ";
@@ -93,7 +93,7 @@ A session should have one reader at a time. Handles remain the caller's property
 Styles are `:bold`, `:dim`, `:italic`, `:underline`, and the eight foreground
 colors `:black`, `:red`, `:green`, `:yellow`, `:blue`, `:magenta`, `:cyan`, `:white`.
 
-```dream
+```dream no-run
 console.styled! [:bold, :green] "Build succeeded"
 ```
 
@@ -119,7 +119,7 @@ stderr. Levels are `:debug`, `:info`, `:warn`, `:error`; `:off` disables output.
 `logf! level template values` formats a log message. The default minimum is
 `:info`, with automatic color.
 
-```dream
+```dream no-run
 let log = console.logger! ()
           |> console.Logger.set_minimum :debug
           |> console.Logger.set_prefix "worker"

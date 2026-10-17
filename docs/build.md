@@ -37,7 +37,7 @@ Four constraints decided most of what follows.
 
 A script is a **pure function from a context to a plan**:
 
-```dream
+```dream no-run
 // build.dr, beside mind.toml
 import std.build;
 import std.build.cc;
@@ -92,7 +92,7 @@ are the other files in `mind/std/src/build/`.
 What a script is told, and all it may know about the world outside its own
 files:
 
-```dream
+```dream no-run
 mapping Context {
     package             // :string, the key it is built under
     version             // :string, from its manifest
@@ -135,7 +135,7 @@ alongside it. Every tool needs these, so they are written once, here.
 
 ### Inputs and artifacts
 
-```dream
+```dream no-run
 union Input {
     file(path : :string)                    // in the package, relative to its root
     tree(dir : :string, suffix : :string)   // every file under dir ending in suffix
@@ -155,7 +155,7 @@ built.
 
 ### Steps
 
-```dream
+```dream no-run
 mapping Step {
     tool                // :string, "cc"
     name                // :string, what this one makes, for people and logs
@@ -222,7 +222,7 @@ includes.
 
 What an action receives:
 
-```dream
+```dream no-run
 mapping Job {
     dir                 // this step's directory
     ctx : Context
@@ -234,7 +234,7 @@ with `build.path job input` and `build.out job "name"`. What an action answers
 is a list of operations, done in order in the step's directory and stopping
 at the first that fails:
 
-```dream
+```dream no-run
 union Op {
     write(name : :string, text : :string)
     copy(from : :string, name : :string)
@@ -279,7 +279,7 @@ step it comes from: the whole graph upstream, copied for every step run.
 A plan is what a package contributes to the compile, and every contribution
 takes the plan last so that they chain with `|>`:
 
-```dream
+```dream no-run
 mapping Plan {
     payloads = %{}      // name => Input, each becomes --payload NAME=PATH
     modules = []        // [Input], directories of generated modules
@@ -322,7 +322,7 @@ Is `libsqlite3` installed? What does `pkg-config --cflags` say? These are
 steps like any other, whose output is small and whose **answer changes the
 plan**:
 
-```dream
+```dream no-run
 let plan ctx =
     build.given (probe.library ctx "sqlite3") (fn found -> match found {
         "" => build.empty |> build.payload "sqlite" (sqlite ctx) |> build.define "vendored",
@@ -344,7 +344,7 @@ A tool is a module that derives the behavior `std.build.tool`, which has four
 holes to fill and gives back the step construction every tool would
 otherwise write for itself:
 
-```dream
+```dream no-run
 // mind/std/src/build/tool.dr
 virtual let name cfg;                   // "cc"
 virtual let inputs cfg;                 // [Input]
@@ -367,7 +367,7 @@ A tool's configuration is its own record, built with its own `|>`
 modifiers, and handed to `step` or `artifact` at the end. A parser
 generator:
 
-```dream
+```dream no-run
 // a package's own tool
 import std.build;
 derive std.build.tool;
@@ -406,7 +406,7 @@ compiler -- and is plain functions over `build.step`.
 
 `std.build.command` is the escape hatch that keeps the rest honest:
 
-```dream
+```dream no-run
 let parser = command.make "peg" "peg-gen" [command.file "grammar.peg", "-o", command.out "parser.dr"];
 build.module "parser" parser
 ```
@@ -423,7 +423,7 @@ imports, so `mind` treats it as a dependency like any other.
 `cc` builds C and C++ with **the machine's own compiler**, whichever that is,
 from one description:
 
-```dream
+```dream no-run
 let lib = cc.shared "demo" ["src/demo.cpp"]
           |> cc.standard :cxx20 |> cc.optimize 2 |> cc.warnings :extra
           |> cc.public_include "include" |> cc.threads
@@ -485,7 +485,7 @@ mean what they say there, and writes into the step's.
 
 ## Dream programs: `std.build.dream`
 
-```dream
+```dream no-run
 let stage2 = dream.program "dreams" "dreams/src/main.dr" seed vm |> dream.paths ["mind", "."];
 let stage3 = dream.program "dreams" "dreams/src/main.dr" (dream.artifact stage2) vm |> dream.paths ["mind", "."];
 ```
