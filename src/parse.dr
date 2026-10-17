@@ -835,6 +835,448 @@ priv let level [fixity, ops] tighter = {
 priv let longest_first : [[:any]] -> [[:any]];
 priv let longest_first ops = list.sort_by (fn a b -> len (b.[0]) < len (a.[0])) ops;
 
+// --- compiling a grammar -------------------------------------------------------------------
+//
+// The combinators above are functions, and a parser built from them is a tree
+// of closures: every step a call, every call a reply to match. That is as fast
+// as a grammar that is read once in a while needs, and about half as fast as
+// a hand-written reader -- the measured cost of the combinators themselves on
+// a JSON document was twice the reading. `expand parse.compile p` removes it:
+//
+//     let value : parse.Parser :any;
+//     let value = expand parse.compile (ws |> parse.then (parse.switch "a value" (fn b -> match b { .. })));
+//
+// The grammar is the same expression, and what the macro answers is one
+// function over the text and an offset with the combinators gone: each step
+// written out where it happens, continuing straight into the next, with no
+// reply made between two steps that cannot fail. It reads each combinator by
+// its name here, through whatever the caller imported this module as, and
+// rewrites the ones defined from others (`sep_by`, `between`, `lexeme`, ..)
+// into what they are defined from first, so the compiled grammar accepts,
+// answers and fails exactly as the combinators do -- the same values, and the
+// same errors, merged the same way. Anything it does not know -- `quoted`, a
+// parser of the caller's, another rule -- is called as the parser it is, so a
+// grammar is compiled one rule at a time and rules name each other as usual.
+//
+// A continuation needed in two places -- both sides of an `or`, every arm of
+// a `switch` -- is made a local function and called from each, so the code
+// grows with the grammar and not with the number of ways through it.
+//
+// The functions below `compiled` are what the generated code calls. They are
+// public because the code is written into the caller's module, not this one,
+// and are not meant to be called by hand.
+
+/// What a compiled grammar is passed through, once, when it is defined: it
+/// answers the parser as it is, and naming it means a grammar compiled
+/// against a module that is not this one fails to compile rather than having
+/// its `then` misread.
+let compiled : Parser a -> Parser a;
+let compiled p = p;
+
+/// The byte at `at`, or `-1` past the end.
+let byte_at : :string -> :integer -> :integer;
+let byte_at s at = str.byte at s;
+
+/// The offset after the run, possibly empty, of bytes from `set` at `at`.
+let span_end : :string -> :integer -> :string -> :integer;
+let span_end s at set = str.span set at s;
+
+/// The text from one offset to another.
+let text_between : :string -> :integer -> :integer -> :string;
+let text_between s from to = str.slice from (to - from) s;
+
+/// Whether `t` is the text at `at`.
+let text_at : :string -> :integer -> :string -> :bool;
+let text_at s at t = str.slice at (len t) s == t;
+
+/// The problem carried past a step that ended at `next`: what was carried
+/// before it that is still ahead, merged with the step's own.
+let carry : Problem | :unit -> Problem | :unit -> :integer -> Problem | :unit;
+let carry before step next = if before == () { step } else { merge (ahead before next) step };
+
+/// Two problems merged: the furthest, or both expectations when they tie.
+let merged : Problem | :unit -> Problem | :unit -> Problem | :unit;
+let merged a b = merge a b;
+
+/// A failure, with what was carried before it.
+let failing : Problem | :unit -> Problem -> Reply :any;
+let failing before problem = Reply.fail (furthest before problem);
+
+/// A failure where `what` was expected at `at`, with what was carried.
+let missing : Problem | :unit -> :integer -> :any -> Reply :any;
+let missing before at what = failing before (Problem.make at [what]);
+
+/// A problem: at `at`, `what` was expected.
+let problem_at : :integer -> :any -> Problem;
+let problem_at at what = Problem.make at [what];
+
+/// The furthest of two problems, each possibly none.
+let failing_problem : Problem | :unit -> Problem -> Problem;
+let failing_problem a b = furthest a b;
+
+/// A list built in reverse, put right.
+let reversed : [a] -> [a];
+let reversed xs = list.reverse xs;
+
+/// `p`, compiled: see "compiling a grammar" above.
+macro compile p = compile_grammar p;
+
+// What follows runs while compiling: it reads syntax and writes syntax, the
+// tagged lists `dreams/src/ast.dr` defines.
+
+priv let g_span = [0, 0];
+priv let g_name : :string -> :any;
+priv let g_name n = [:name, n, g_span];
+priv let g_call : :any -> [:any] -> :any;
+priv let g_call f args = [:apply, f, args, g_span];
+priv let g_int : :integer -> :any;
+priv let g_int n = [:int, n, g_span];
+priv let g_str : :string -> :any;
+priv let g_str t = [:str, t, g_span];
+priv let g_unit = [:unit, g_span];
+priv let g_bin : :atom -> :any -> :any -> :any;
+priv let g_bin op a b = [:binary, op, a, b, g_span];
+priv let g_if : :any -> :any -> :any -> :any;
+priv let g_if c a b = [:if, c, a, b, g_span];
+priv let g_match : :any -> [:any] -> :any;
+priv let g_match e arms = [:match, e, arms, g_span];
+priv let g_arm : :any -> :any -> :any;
+priv let g_arm pattern body = [pattern, (), body, g_span];
+priv let g_guarded : :any -> :any -> :any -> :any;
+priv let g_guarded pattern guard body = [pattern, guard, body, g_span];
+priv let g_bind : :string -> :any;
+priv let g_bind n = [:bind, n, g_span];
+priv let g_wild = [:wildcard, g_span];
+priv let g_block : [:any] -> :any;
+priv let g_block stmts = [:block, stmts, g_span];
+priv let g_fun : :string -> [:string] -> :any -> :bool -> :any;
+priv let g_fun n params body is_rec = [:let, n, list.map (fn p -> [p, g_span]) params, body, is_rec, g_span];
+priv let g_strict_fun : :string -> :string -> [:string] -> :any -> :any;
+priv let g_strict_fun n first rest body =
+    [:let, n, list.cons [first, g_span] (list.map (fn p -> [p, g_span, (), :strict]) rest), body, true, g_span];
+priv let g_lambda : [:string] -> :any -> :any;
+priv let g_lambda params body = [:lambda, list.map (fn p -> [p, g_span]) params, body, g_span];
+/// `name = e` bound strictly, then `body`: a match's subject is evaluated where
+/// it stands, which a `let` would suspend.
+priv let g_with : :string -> :any -> :any -> :any;
+priv let g_with n e body = g_match e [g_arm (g_bind n) body];
+
+/// What generation reads and writes: the module's name in the caller, the
+/// name of the text, and a path in the grammar to make names from.
+mapping Gen {
+    alias : :string
+    text : :string
+    path : :string
+}
+
+/// A member of this module as the caller names it: `alias.m`, or `m` alone
+/// where the grammar names the combinators unqualified -- this module's own
+/// tests, or a caller that imported them by name.
+priv let member : Gen -> :string -> :any;
+priv let member g m = if Gen.alias g == "" { g_name m } else { [:field, g_name (Gen.alias g), m, g_span] };
+priv let helper : Gen -> :string -> [:any] -> :any;
+priv let helper g m args = g_call (member g m) args;
+priv let reply_ok_p : Gen -> [:any] -> :any;
+priv let reply_ok_p g pats = [:record_p, [:field, member g "Reply", "ok", g_span], pats, g_span];
+priv let reply_fail_p : Gen -> [:any] -> :any;
+priv let reply_fail_p g pats = [:record_p, [:field, member g "Reply", "fail", g_span], pats, g_span];
+priv let reply_ok : Gen -> :any -> :any -> :any -> :any;
+priv let reply_ok g v n pr = g_call [:field, member g "Reply", "ok", g_span] [v, n, pr];
+/// A name no caller can write, from where in the grammar it is made.
+priv let fresh : Gen -> :string -> :string;
+priv let fresh g label = "<parse " + Gen.path g + " " + label + ">";
+priv let deeper : Gen -> :string -> Gen;
+priv let deeper g step = Gen.set_path (Gen.path g + "." + step) g;
+
+/// A problem known to be none while compiling, or the syntax of one.
+priv let unit_or : :any -> :any;
+priv let unit_or carried = match carried { :none => g_unit, c => c };
+
+// --- reading the grammar --------------------------------------------------
+
+/// The combinators this compiles, and how many arguments each takes before
+/// the text and the offset.
+priv let arities : %{ :string => :integer };
+priv let arities = %{ "then" => 2, "skip" => 2, "keep" => 2, "map" => 2, "map2" => 3, "to" => 2,
+                      "succeed" => 1, "or" => 2, "choice" => 1, "optional" => 1, "default" => 2,
+                      "many" => 1, "many1" => 1, "sep_by" => 2, "sep_by1" => 2, "between" => 3,
+                      "parens" => 1, "brackets" => 1, "braces" => 1, "lexeme" => 1, "symbol" => 1,
+                      "char" => 1, "text" => 1, "span" => 1, "switch" => 2, "lazy" => 1, "spaces" => 0 };
+
+/// `a |> f x` as the call it is, `f x a`, everywhere in a tree.
+priv let unpipe : :any -> :any;
+priv let rec unpipe e = match e {
+    [:pipe, lhs, [:apply, f, args, sp], _] => [:apply, unpipe f, list.append (list.map unpipe args) [unpipe lhs], sp],
+    [:pipe, lhs, f, sp] => [:apply, unpipe f, [unpipe lhs], sp],
+    [:apply, f, args, sp] => [:apply, unpipe f, list.map unpipe args, sp],
+    other => other,
+};
+
+/// The name the caller gave this module: the qualifier most of the
+/// combinator calls in the grammar use, or `""` when they are unqualified.
+priv let alias_of : :any -> :string | :unit;
+priv let alias_of e = {
+    let rec found t = match t {
+        [:field, [:name, q, _], m, _] if map.has m arities => [q],
+        items if type_of items == :list => list.flat_map found items,
+        _ => [],
+    };
+    let rec bare t = match t {
+        [:apply, [:name, m, _], _, _] if map.has m arities => true,
+        [:name, "spaces", _] => true,
+        items if type_of items == :list => list.any bare items,
+        _ => false,
+    };
+    match found e {
+        [] => if bare e { "" } else { () },
+        qs => list.head (list.sort_on (fn q -> 0 - list.length (list.filter (fn x -> x == q) qs)) qs),
+    }
+};
+
+/// The grammar in the core forms generation knows, or `[:opaque, e]` for
+/// what it does not.
+priv let core : :string -> :any -> :any;
+priv let rec core alias e = {
+    let d x = core alias x;
+    let cons_f = g_lambda ["<parse x>", "<parse xs>"] (g_bin :cons (g_name "<parse x>") (g_name "<parse xs>"));
+    let spaces = [:span, " \t\r\n"];
+    let lexeme p = [:skip, d p, spaces];
+    let token t = [:skip, [:text, t], spaces];
+    let between o c p = [:skip, [:then, o, d p], c];
+    let sep_by1 sep p = [:map2, cons_f, d p, [:many, [:then, d sep, d p]]];
+    let rec choice ps = match ps { [p] => d p, [p, ..rest] => [:or, d p, choice rest], [] => [:opaque, e] };
+    let named = match e {
+        [:field, [:name, q, _], m, _] if q == alias => m,
+        [:name, m, _] if alias == "" => m,
+        _ => (),
+    };
+    let called = match e {
+        [:apply, [:field, [:name, q, _], m, _], args, _] if q == alias => [m, args],
+        [:apply, [:name, m, _], args, _] if alias == "" => [m, args],
+        _ => (),
+    };
+    match [named, called] {
+        ["spaces", _] => spaces,
+        [_, [m, args]] if arities.[m else ()] == list.length args =>
+            match [m, args] {
+                ["then", [q2, p]] => [:then, d p, d q2],
+                ["skip", [check, p]] => [:skip, d p, d check],
+                ["keep", [p, pf]] => [:keep, d pf, d p],
+                ["map", [f, p]] => [:map, f, d p],
+                ["map2", [f, a, b]] => [:map2, f, d a, d b],
+                ["to", [v, p]] => [:to, v, d p],
+                ["succeed", [v]] => [:succeed, v],
+                ["or", [q2, p]] => [:or, d p, d q2],
+                ["choice", [[:list, ps, _]]] => choice ps,
+                ["optional", [p]] => [:or, d p, [:succeed, g_unit]],
+                ["default", [v, p]] => [:or, d p, [:succeed, v]],
+                ["many", [p]] => [:many, d p],
+                ["many1", [p]] => [:map2, cons_f, d p, [:many, d p]],
+                ["sep_by", [sep, p]] => [:or, sep_by1 sep p, [:succeed, [:list, [], g_span]]],
+                ["sep_by1", [sep, p]] => sep_by1 sep p,
+                ["between", [o, c, p]] => between (d o) (d c) p,
+                ["parens", [p]] => between (token "(") (token ")") p,
+                ["brackets", [p]] => between (token "[") (token "]") p,
+                ["braces", [p]] => between (token "{") (token "}") p,
+                ["lexeme", [p]] => lexeme p,
+                ["symbol", [[:str, t, _]]] => token t,
+                ["char", [[:char, c, _]]] if char.code c < 128 => [:char, c],
+                ["text", [[:str, t, _]]] => [:text, t],
+                ["span", [[:str, set, _]]] => [:span, set],
+                ["switch", [name, [:lambda, [[b, _]], [:match, [:name, b2, _], arms, _], _]]] if b == b2 =>
+                    [:switch, name, b, list.map (fn [pat, guard, body, sp] -> [pat, guard, match body { [:unit, _] => (), x => d x }]) arms],
+                ["lazy", [[:lambda, [[(), _]], body, _]]] => d body,
+                _ => [:opaque, e],
+            },
+        _ => [:opaque, e],
+    }
+};
+
+// --- writing the parser ---------------------------------------------------
+//
+// `generate g c at carried k fk` is code that parses `c` from offset `at`.
+// Where it succeeds it carries on as `k value next carried` says; where it
+// fails, as `fk problem` does, `problem` being the step's own -- what was
+// carried before it is the caller's to add. `carried` is the syntax of the
+// problem carried so far, or `:none` when it is known while compiling to be
+// none, which most of the time it is.
+//
+// Two continuations, so that what backtracks -- `or`, `many` -- goes straight
+// on to the other side or out of the loop, with no reply made to say which.
+
+/// Code for `body` of where a step that ended at `next` leaves the carried
+/// problem, given a problem of the step's own (`:none` for none). The usual
+/// case, nothing carried, is decided inline; the merge is a call only when
+/// there is something to merge.
+priv let carried_after : Gen -> :any -> :any -> :any -> (:any -> :any) -> :any;
+priv let carried_after g carried step next body = match [carried, step] {
+    [:none, :none] => body :none,
+    [:none, st] => body st,
+    [c, st] => {
+        let n = fresh g "c";
+        g_with n (g_if (g_bin :eq c g_unit) (unit_or st) (helper g "carry" [c, unit_or st, next])) (body (g_name n))
+    },
+};
+
+/// How a rule, or a side of a choice, ends: a reply.
+priv let reply_k : Gen -> :any -> :any -> :any -> :any;
+priv let reply_k g v n cc = reply_ok g v n (unit_or cc);
+
+/// The failure that ends a rule, with what was carried before it.
+priv let failure : Gen -> :any -> :any -> :any;
+priv let failure g carried problem = match carried {
+    :none => g_call [:field, member g "Reply", "fail", g_span] [problem],
+    c => helper g "failing" [c, problem],
+};
+
+/// How many nodes a piece of syntax has: what decides whether a continuation
+/// is copied into each place it is needed or made a function they call.
+priv let size : :any -> :integer;
+priv let rec size t = if type_of t == :list { list.fold (fn n x -> n + size x) 1 t } else { 0 };
+
+/// A continuation that is needed in several places, ready to be used there:
+/// itself when it is small, else a local function `join` and calls of it.
+/// Answers `[statements to put first, the continuation to use]`.
+priv let shared : Gen -> (:any -> :any -> :any -> :any) -> [[:any], :any -> :any -> :any -> :any];
+priv let shared g k = {
+    let [v, n, cc] = [fresh g "v", fresh g "n", fresh g "cc"];
+    let body = k (g_name v) (g_name n) (g_name cc);
+    if size body < 160 { [[], k] }
+    else {
+        let join = fresh g "join";
+        [[g_fun join [v, n, cc] body false], fn rv rn rc -> g_call (g_name join) [rv, rn, unit_or rc]]
+    }
+};
+
+/// Code that parses core form `c` from `at`, continuing as `k` on success and
+/// `fk` on failure: see "writing the parser" above.
+priv let generate : Gen -> :any -> :any -> :any -> (:any -> :any -> :any -> :any) -> (:any -> :any) -> :any;
+priv let rec generate g c at carried k fk = {
+    let s = g_name (Gen.text g);
+    let expected what = helper g "problem_at" [at, what];
+    match c {
+        [:char, ch] => {
+            let n = fresh g "n";
+            g_if (g_bin :eq (helper g "byte_at" [s, at]) (g_int (char.code ch)))
+                 (g_with n (g_bin :add at (g_int 1))
+                         (carried_after g carried :none (g_name n) (fn cc -> k [:char, ch, g_span] (g_name n) cc)))
+                 (fk (expected (g_str (quote (str.of_chars [ch])))))
+        },
+        [:text, t] => {
+            let n = fresh g "n";
+            g_if (helper g "text_at" [s, at, g_str t])
+                 (g_with n (g_bin :add at (g_int (len t)))
+                         (carried_after g carried :none (g_name n) (fn cc -> k (g_str t) (g_name n) cc)))
+                 (fk (expected (g_str (quote t))))
+        },
+        [:span, set] => {
+            let n = fresh g "n";
+            g_with n (helper g "span_end" [s, at, g_str set])
+                   (carried_after g carried :none (g_name n)
+                                  (fn cc -> k (helper g "text_between" [s, at, g_name n]) (g_name n) cc))
+        },
+        [:succeed, v] => k v at carried,
+        [:map, f, p] => generate (deeper g "m") p at carried (fn v n cc -> k (g_call f [v]) n cc) fk,
+        [:to, v, p] => generate (deeper g "t") p at carried (fn _ n cc -> k v n cc) fk,
+        // A failure in the second half of a sequence carries what the first
+        // half stepped around: the problem it adds is the carried one's.
+        [:then, p, q] => generate (deeper g "a") p at carried
+                                  (fn _ n cc -> generate (deeper g "b") q n cc k (fn pr -> fk (with_carried g cc pr))) fk,
+        [:skip, p, q] => generate (deeper g "a") p at carried
+                                  (fn v n cc -> generate (deeper g "b") q n cc (fn _ n2 cc2 -> k v n2 cc2)
+                                                         (fn pr -> fk (with_carried g cc pr))) fk,
+        [:keep, pf, p] => generate (deeper g "a") pf at carried
+                                   (fn f n cc -> generate (deeper g "b") p n cc (fn v n2 cc2 -> k (g_call f [v]) n2 cc2)
+                                                          (fn pr -> fk (with_carried g cc pr))) fk,
+        [:map2, f, a, b] => generate (deeper g "a") a at carried
+                                     (fn x n cc -> generate (deeper g "b") b n cc (fn y n2 cc2 -> k (g_call f [x, y]) n2 cc2)
+                                                            (fn pr -> fk (with_carried g cc pr))) fk,
+        [:opaque, e] => {
+            let [v, n, pr] = [fresh g "v", fresh g "n", fresh g "p"];
+            g_match (g_call e [s, at]) [
+                g_arm (reply_ok_p g [g_bind v, g_bind n, g_bind pr])
+                      (carried_after g carried (g_name pr) (g_name n) (fn cc -> k (g_name v) (g_name n) cc)),
+                g_arm (reply_fail_p g [g_bind pr]) (fk (g_name pr)),
+            ]
+        },
+        [:or, p, q] => {
+            // Both sides from the same place with nothing carried, as `or`
+            // tries them; the left side's failure is what the right side's
+            // success or failure is merged with.
+            let [first, k2] = shared g k;
+            let p1 = fresh g "p1";
+            let after pr n v = carried_after g carried pr n (fn c2 -> k2 v n c2);
+            g_block (list.append first [
+                generate (deeper g "l") p at :none
+                         (fn v n cc -> after (unit_or cc) n v)
+                         (fn left -> g_with p1 left
+                             (generate (deeper g "r") q at :none
+                                       (fn v n cc -> after (helper g "carry" [g_name p1, unit_or cc, n]) n v)
+                                       (fn right -> fk (helper g "failing_problem" [g_name p1, right])))),
+            ])
+        },
+        [:many, p] => {
+            // `many_from`, written out: a local loop, which parses one more
+            // element or stops where one fails or stands still, and answers
+            // what it collected.
+            let [loop, here, acc, pr, vs, n, pp] = list.map (fresh g) ["loop", "here", "acc", "pr", "vs", "n", "pp"];
+            let done = fn last -> reply_ok g (helper g "reversed" [g_name acc]) (g_name here)
+                                             (helper g "carry" [g_name pr, last, g_name here]);
+            g_block [
+                g_strict_fun loop here [acc, pr]
+                    (generate (deeper g "e") p (g_name here) :none
+                              (fn v nn cc -> g_if (g_bin :gt nn (g_name here))
+                                                  (g_call (g_name loop) [nn, g_bin :cons v (g_name acc),
+                                                                         helper g "merged" [g_name pr, unit_or cc]])
+                                                  (done (unit_or cc)))
+                              (fn failed -> done failed)),
+                g_match (g_call (g_name loop) [at, [:list, [], g_span], g_unit]) [
+                    g_arm (reply_ok_p g [g_bind vs, g_bind n, g_bind pp])
+                          (carried_after g carried (g_name pp) (g_name n) (fn cc -> k (g_name vs) (g_name n) cc)),
+                    g_arm g_wild (fk g_unit),
+                ],
+            ]
+        },
+        [:switch, name, b, arms] => {
+            let [first, k2] = shared g k;
+            let arm_code i [pat, guard, body] =
+                g_guarded pat guard (match body {
+                    () => fk (expected name),
+                    parser => generate (deeper g ("s" + to_string i)) parser at carried k2 fk,
+                });
+            g_block (list.append first [
+                g_with b (helper g "byte_at" [s, at])
+                       (g_match (g_name b) (list.map (fn [i, a] -> arm_code i a) (list.enumerate arms))),
+            ])
+        },
+        _ => [:unit, g_span],
+    }
+};
+
+/// A step's problem with what was carried into it: a failure part way
+/// through a sequence reports the furthest of the two.
+priv let with_carried : Gen -> :any -> :any -> :any;
+priv let with_carried g carried problem = match carried {
+    :none => problem,
+    c => helper g "failing_problem" [c, problem],
+};
+
+/// The parser `p` compiles to, or why it cannot be: a macro answers its
+/// syntax as it is, and only a failure as a result.
+priv let compile_grammar : :any -> :any;
+priv let compile_grammar p = {
+    let e = unpipe p;
+    match alias_of e {
+        () => Result.error "std.parse.compile: no std.parse combinator to compile here",
+        alias => {
+            let g = Gen.make alias "<parse text>" "r";
+            let at = "<parse at>";
+            let body = generate g (core alias e) (g_name at) :none (fn v n cc -> reply_k g v n cc) (fn pr -> failure g :none pr);
+            g_call (member g "compiled") [g_lambda [Gen.text g, at] body]
+        },
+    }
+};
+
 when test {
     import std.test;
 
@@ -857,7 +1299,52 @@ when test {
             (succeed (fn k v -> [k, v]) |> keep (lexeme quoted) |> skip (symbol ":") |> keep (lazy (fn () -> json_value))))),
     ]) s at;
 
+    // A grammar written twice, as combinators and compiled: every answer,
+    // error and all, must be the same. It covers every core form the
+    // compiler writes out and an opaque parser in each position.
+    let tg_item : Parser :any;
+    let tg_item = spaces |> then (switch "an tg_item" (fn b -> match b {
+        91 => tg_list_of,
+        40 => to :unit (text "()"),
+        34 => quoted,
+        _ if b >= 48 && b <= 57 => number,
+        _ => (),
+    }));
+    let tg_list_of : Parser [:any];
+    let tg_list_of = char '[' |> then (sep_by (spaces |> then (char ',')) tg_item) |> skip spaces |> skip (char ']');
+    let tg_pair : Parser [:any];
+    let tg_pair = succeed (fn k v -> [k, v]) |> keep (lexeme identifier) |> skip (symbol "=") |> keep tg_item;
+    let tg_words : Parser [:any];
+    let tg_words = many1 (lexeme identifier) |> or (to [] (text "-"));
+    let tg_maybe : Parser :any;
+    let tg_maybe = optional (char '!') |> then (default :none (to :some (text "x")));
+
+    let tg_item_c : Parser :any;
+    let tg_item_c = expand compile (spaces |> then (switch "an tg_item" (fn b -> match b {
+        91 => tg_list_of_c,
+        40 => to :unit (text "()"),
+        34 => quoted,
+        _ if b >= 48 && b <= 57 => number,
+        _ => (),
+    })));
+    let tg_list_of_c : Parser [:any];
+    let tg_list_of_c = expand compile (char '[' |> then (sep_by (spaces |> then (char ',')) tg_item_c) |> skip spaces |> skip (char ']'));
+    let tg_pair_c : Parser [:any];
+    let tg_pair_c = expand compile (succeed (fn k v -> [k, v]) |> keep (lexeme identifier) |> skip (symbol "=") |> keep tg_item_c);
+    let tg_words_c : Parser [:any];
+    let tg_words_c = expand compile (many1 (lexeme identifier) |> or (to [] (text "-")));
+    let tg_maybe_c : Parser :any;
+    let tg_maybe_c = expand compile (optional (char '!') |> then (default :none (to :some (text "x"))));
+
+    let agree p c inputs = list.filter (fn t -> run_text p t != run_text c t) inputs;
     let tests = [
+        test.case "a compiled grammar answers as its combinators do, errors included"
+            $( test.eq! [[], [], [], []]
+                        [agree tg_item tg_item_c ["1", "[1, 2]", "[[1],[2, \"x\"]]", " ()", "[1,]", "[1", "[", "x", "", "[1 2]",
+                                             "\"\\ud83d\\ude00\"", "[(), (]", "012", "[ 3 , [ ] ]"],
+                         agree tg_pair tg_pair_c ["a = 1", "a=[2]", "a 1", "= 1", "a =", "a = x"],
+                         agree tg_words tg_words_c ["a b c", "-", "", "a -", "  a"],
+                         agree tg_maybe tg_maybe_c ["", "!", "x", "!x", "!!", "y"]] ),
         test.case "a surrogate pair is one character, and a lone half is U+FFFD"
             $( test.eq! [Result.ok "\u{1f600}", Result.ok "\u{fffd}A", Result.ok "\u{fffd}A", Result.ok "\u{fffd}"]
                         (list.map (fn t -> run_text quoted t)
