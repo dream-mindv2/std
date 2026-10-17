@@ -1,0 +1,76 @@
+# The standard library's documentation -- every module's API, its source,
+# and the guides in docs/ -- built and published to GitHub Pages on every
+# push. Every example in it is compiled and run as it is built.
+name: Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # This repository is the standard library, so it is checked out where
+      # the toolchain looks for one.
+      - uses: actions/checkout@v4
+        with:
+          path: toolchain/mind/std
+      - run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      # The toolchain at the head of each repository's main: the docs show
+      # what the code says now.
+      - id: heads
+        run: |
+          for r in dream dreams std mind; do
+            echo "$r=$(git ls-remote https://github.com/dream-mindv2/$r refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+          done
+      - uses: actions/cache@v4
+        with:
+          path: toolchain/build
+          key: vm-${{ steps.heads.outputs.dream }}
+      - name: Build the VM and mind
+        env:
+          DREAM_REF: ${{ steps.heads.outputs.dream }}
+          DREAMS_REF: ${{ steps.heads.outputs.dreams }}
+          STD_REF: ${{ steps.heads.outputs.std }}
+          MIND_REF: ${{ steps.heads.outputs.mind }}
+        run: |
+          fetch() {
+            rm -rf "$2"; git init -q "$2"
+            git -C "$2" fetch -q --depth 1 "https://github.com/dream-mindv2/$1" "$3"
+            git -C "$2" checkout -q FETCH_HEAD
+          }
+          mkdir -p toolchain && cd toolchain
+          fetch dream dream "$DREAM_REF"
+          fetch dreams dreams "$DREAMS_REF"
+          fetch mind mind/tool "$MIND_REF"
+          : # the standard library is this checkout
+          if [ ! -x build/bin/dream ]; then
+            cmake -S dream -B build -DDREAM_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --parallel 4 --target dream_cli
+          fi
+          build/bin/dream dreams/bootstrap/dreams.dream -L mind/std mind/tool/src/main.dr -o mind.dream
+      - name: Build the documentation
+        run: |
+          T="$PWD/toolchain"
+          cd toolchain/mind/std
+          DREAM="$T/build/bin/dream" DREAMS="$T/dreams/bootstrap/dreams.dream" MIND_STDLIB="$T/mind" \
+            "$T/build/bin/dream" "$T/mind.dream" docs
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: toolchain/mind/std/target/docs
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

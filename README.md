@@ -7,6 +7,9 @@ itself (`$MIND_STDLIB`, or the installation's copy). Calling the compiler
 directly, pass `-L` with the directory that holds this one, or `-L std=PATH`
 naming it. It has two layers:
 
+**Its documentation is at [dream-mindv2.github.io/std](https://dream-mindv2.github.io/std/)**, rebuilt on
+every push.
+
 - **Native modules**, written in C++ in the [VM](https://github.com/dream-mindv2/dream/blob/main/README.md#native-modules):
   `std.io`, `std.os`, `std.net`, `std.tls`, `std.ffi`, `std.math`,
   `std.crypto`, `std.tensor`, `std.vm`. These are the edges of the machine:
