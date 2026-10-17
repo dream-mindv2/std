@@ -924,36 +924,53 @@ macro compile p = compile_grammar p;
 // What follows runs while compiling: it reads syntax and writes syntax, the
 // tagged lists `dreams/src/ast.dr` defines.
 
+/// The span written syntax carries.
 priv let g_span = [0, 0];
+/// A name, as syntax.
 priv let g_name : :string -> :any;
 priv let g_name n = [:name, n, g_span];
+/// A call, as syntax.
 priv let g_call : :any -> [:any] -> :any;
 priv let g_call f args = [:apply, f, args, g_span];
+/// An integer literal, as syntax.
 priv let g_int : :integer -> :any;
 priv let g_int n = [:int, n, g_span];
+/// A string literal, as syntax.
 priv let g_str : :string -> :any;
 priv let g_str t = [:str, t, g_span];
+/// `()`, as syntax.
 priv let g_unit = [:unit, g_span];
+/// A binary operator, as syntax.
 priv let g_bin : :atom -> :any -> :any -> :any;
 priv let g_bin op a b = [:binary, op, a, b, g_span];
+/// An `if`, as syntax.
 priv let g_if : :any -> :any -> :any -> :any;
 priv let g_if c a b = [:if, c, a, b, g_span];
+/// A `match`, as syntax.
 priv let g_match : :any -> [:any] -> :any;
 priv let g_match e arms = [:match, e, arms, g_span];
+/// A match arm with no guard.
 priv let g_arm : :any -> :any -> :any;
 priv let g_arm pattern body = [pattern, (), body, g_span];
+/// A match arm with a guard.
 priv let g_guarded : :any -> :any -> :any -> :any;
 priv let g_guarded pattern guard body = [pattern, guard, body, g_span];
+/// A pattern binding a name.
 priv let g_bind : :string -> :any;
 priv let g_bind n = [:bind, n, g_span];
+/// The `_` pattern.
 priv let g_wild = [:wildcard, g_span];
+/// A block of statements.
 priv let g_block : [:any] -> :any;
 priv let g_block stmts = [:block, stmts, g_span];
+/// A local function, as a statement.
 priv let g_fun : :string -> [:string] -> :any -> :bool -> :any;
 priv let g_fun n params body is_rec = [:let, n, list.map (fn p -> [p, g_span]) params, body, is_rec, g_span];
+/// A local recursive function strict in all but its first parameter.
 priv let g_strict_fun : :string -> :string -> [:string] -> :any -> :any;
 priv let g_strict_fun n first rest body =
     [:let, n, list.cons [first, g_span] (list.map (fn p -> [p, g_span, (), :strict]) rest), body, true, g_span];
+/// A lambda, as syntax.
 priv let g_lambda : [:string] -> :any -> :any;
 priv let g_lambda params body = [:lambda, list.map (fn p -> [p, g_span]) params, body, g_span];
 /// `name = e` bound strictly, then `body`: a match's subject is evaluated where
@@ -974,17 +991,22 @@ mapping Gen {
 /// tests, or a caller that imported them by name.
 priv let member : Gen -> :string -> :any;
 priv let member g m = if Gen.alias g == "" { g_name m } else { [:field, g_name (Gen.alias g), m, g_span] };
+/// A call of a member of this module, as the caller names it.
 priv let helper : Gen -> :string -> [:any] -> :any;
 priv let helper g m args = g_call (member g m) args;
+/// The pattern `Reply.ok(..)`, as the caller names it.
 priv let reply_ok_p : Gen -> [:any] -> :any;
 priv let reply_ok_p g pats = [:record_p, [:field, member g "Reply", "ok", g_span], pats, g_span];
+/// The pattern `Reply.fail(..)`, as the caller names it.
 priv let reply_fail_p : Gen -> [:any] -> :any;
 priv let reply_fail_p g pats = [:record_p, [:field, member g "Reply", "fail", g_span], pats, g_span];
+/// `Reply.ok v n pr`, as the caller names it.
 priv let reply_ok : Gen -> :any -> :any -> :any -> :any;
 priv let reply_ok g v n pr = g_call [:field, member g "Reply", "ok", g_span] [v, n, pr];
 /// A name no caller can write, from where in the grammar it is made.
 priv let fresh : Gen -> :string -> :string;
 priv let fresh g label = "<parse " + Gen.path g + " " + label + ">";
+/// `g` one step further into the grammar, for the names made there.
 priv let deeper : Gen -> :string -> Gen;
 priv let deeper g step = Gen.set_path (Gen.path g + "." + step) g;
 
