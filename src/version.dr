@@ -25,8 +25,14 @@
 // call it. `mind` checks every dependency's requirement against the version of
 // what it fetched; a build script asks the same questions of its context.
 //
-// Nothing here raises. Parsing answers `[:ok, value]` or `[:error, why]`, the
-// shape `std.result` names.
+// Versions are ordered as semantic versioning orders them (`compare_versions`):
+// by number, a pre-release before its release, and pre-releases part by part,
+// numbers numerically -- so `rc.2` comes before `rc.10`, which comparing the
+// text gets backwards. A version list can be sorted, its newest taken, or its
+// newest that a requirement accepts (`newest_matching`), which is the question
+// a resolver and a downgrade check both ask.
+//
+// Nothing here raises. Parsing answers a `Result`.
 
 import std.list;
 import std.str;
@@ -79,18 +85,34 @@ let number s =
 let split_at : :string -> :string -> [:string];
 let split_at sep s = match str.split_once sep s { () => [s, ""], parts => parts };
 
-/// `[:ok, version]` or `[:error, why]`.
+/// Whether a pre-release is spelled as the standard allows: identifiers
+/// separated by `.`, none empty, each of ASCII letters, digits and `-`, and a
+/// numeric one without a leading zero. `""` is no pre-release, and fine.
+let valid_pre : :string -> :bool;
+let valid_pre p = {
+    let ident i = {
+        let allowed c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
+        let digits = str.all (fn c -> c >= '0' && c <= '9') i;
+        not (str.is_empty i) && str.all allowed i && not (digits && str.byte_length i > 1 && str.starts_with "0" i)
+    };
+    str.is_empty p || list.all ident (str.split "." p)
+};
+
+/// The version a text spells, or why it does not. A leading `v` or `V` is a
+/// tag's spelling and is accepted; build metadata after `+` is dropped.
 let parse : :string -> Result Version :string;
 let parse text = {
     let t = str.trim text;
-    let bare = if str.starts_with "v" t { str.slice 1 (str.byte_length t - 1) t } else { t };
+    let bare = if str.starts_with "v" t || str.starts_with "V" t { str.slice 1 (str.byte_length t - 1) t } else { t };
     let [core, rest] = split_at "-" (list.head (split_at "+" bare));
     let parts = map number (str.split "." core);
-    match parts {
-        [ma] if ma != () => Result.ok [ma, 0, 0, rest],
-        [ma, mi] if ma != () && mi != () => Result.ok [ma, mi, 0, rest],
-        [ma, mi, pa] if ma != () && mi != () && pa != () => Result.ok [ma, mi, pa, rest],
-        _ => Result.error ("`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0"),
+    let bad = Result.error ("`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0");
+    match [parts, valid_pre rest && not (str.ends_with "-" bare && str.is_empty rest)] {
+        [_, false] => bad,
+        [[ma], _] if ma != () => Result.ok [ma, 0, 0, rest],
+        [[ma, mi], _] if ma != () && mi != () => Result.ok [ma, mi, 0, rest],
+        [[ma, mi, pa], _] if ma != () && mi != () && pa != () => Result.ok [ma, mi, pa, rest],
+        _ => bad,
     }
 };
 
@@ -103,12 +125,40 @@ let show : Version -> :string;
 let show v = to_string (major v) + "." + to_string (minor v) + "." + to_string (patch v)
              + (if str.is_empty (pre v) { "" } else { "-" + pre v });
 
-/// `-1`, `0` or `1`. A pre-release comes before the release it leads up to,
-/// and pre-releases are compared by their text, which orders `rc.1` before
-/// `rc.2` and is as much as a build tool needs.
+/// The tag a version is usually released under: `v1.4.0`.
+let tag : Version -> :string;
+let tag v = "v" + show v;
+
+/// `-1`, `0` or `1`, as two numbers compare.
+priv let by : :integer -> :integer -> :integer;
+priv let by x y = if x < y { 0 - 1 } else if x > y { 1 } else { 0 };
+
+/// Two pre-releases, as the standard orders them: identifier by identifier,
+/// numbers numerically and before words, words by their bytes, and a shorter
+/// list first when it is a prefix of the longer -- `alpha < alpha.1 <
+/// alpha.beta < beta < beta.2 < beta.11 < rc.1`.
+let compare_pre : :string -> :string -> :integer;
+let compare_pre a b = {
+    let one x y = match [number x, number y] {
+        [(), ()] => compare x y,
+        [(), _] => 1,
+        [_, ()] => 0 - 1,
+        [m, n] => by m n,
+    };
+    let rec go xs ys =
+        match [xs, ys] {
+            [[], []] => 0,
+            [[], _] => 0 - 1,
+            [_, []] => 1,
+            [[x, ..xr], [y, ..yr]] => match one x y { 0 => go xr yr, c => c },
+        };
+    go (str.split "." a) (str.split "." b)
+};
+
+/// `-1`, `0` or `1`: by number, then a pre-release before the release it
+/// leads up to, then pre-releases by `compare_pre`.
 let compare_versions : Version -> Version -> :integer;
 let compare_versions a b = {
-    let by x y = if x < y { 0 - 1 } else if x > y { 1 } else { 0 };
     let numbers = fold (fn acc pair -> if acc != 0 { acc } else { by (list.head pair) (list.nth 1 pair) })
                             0 [[major a, major b], [minor a, minor b], [patch a, patch b]];
     if numbers != 0 { numbers }
@@ -117,10 +167,43 @@ let compare_versions a b = {
             [true, true] => 0,
             [true, false] => 1,
             [false, true] => 0 - 1,
-            _ => compare (pre a) (pre b),
+            _ => compare_pre (pre a) (pre b),
         }
     }
 };
+
+/// Whether `a` comes before `b`.
+let older : Version -> Version -> :bool;
+let older a b = compare_versions a b < 0;
+
+/// Whether `a` comes after `b`.
+let newer : Version -> Version -> :bool;
+let newer a b = compare_versions a b > 0;
+
+/// Whether it is a pre-release.
+let is_pre : Version -> :bool;
+let is_pre v = not (str.is_empty (pre v));
+
+/// Oldest first.
+let sorted : [Version] -> [Version];
+let sorted vs = list.sort_by older vs;
+
+/// The newest, or `()` for none.
+let newest : [Version] -> Version | :unit;
+let newest vs = fold (fn best v -> match best { () => v, b => if newer v b { v } else { b } }) () vs;
+
+/// The next release that breaks something: `1.4.2` to `2.0.0`. The
+/// pre-release, if any, is dropped.
+let bump_major : Version -> Version;
+let bump_major v = make (major v + 1) 0 0;
+/// The next release that adds something: `1.4.2` to `1.5.0`.
+let bump_minor : Version -> Version;
+let bump_minor v = make (major v) (minor v + 1) 0;
+/// The next release that fixes something: `1.4.2` to `1.4.3`. Of a
+/// pre-release it is the release it leads up to, `1.5.0-rc.1` to `1.5.0`, as
+/// the standard counts.
+let bump_patch : Version -> Version;
+let bump_patch v = if is_pre v { make (major v) (minor v) (patch v) } else { make (major v) (minor v) (patch v + 1) };
 
 // --- requirements ------------------------------------------------------------------
 
@@ -201,7 +284,13 @@ let matches req v = {
     pre_ok && list.all (fn c -> holds c v) req
 };
 
-/// Parse both and test: `[:ok, bool]`, or the first parse error.
+/// The newest of `vs` that `req` accepts, or `()` when none does: what a
+/// resolver picks from the versions a source offers.
+let newest_matching : Requirement -> [Version] -> Version | :unit;
+let newest_matching req vs = newest (list.filter (fn v -> matches req v) vs);
+
+/// Parse both and test: whether `version` meets `requirement`, or the first
+/// parse error.
 let satisfies : :string -> :string -> Result :bool :string;
 let satisfies requirement version =
     match [parse_requirement requirement, parse version] {
@@ -245,6 +334,7 @@ when test {
     let v s = parse_or_unit s;
     let ok r = match r { Result.ok(x) => x, _ => () };
     let sat r s = ok (satisfies r s);
+    let shown found = match found { () => (), w => show w };
 
     let tests = [
         test.case "a version may be short, or spelled as a tag"
@@ -258,6 +348,28 @@ when test {
                         [compare_versions (v "1.2.3") (v "1.10.0"), compare_versions (v "2.0.0") (v "1.99.99"),
                          compare_versions (v "1.2") (v "1.2.0"), compare_versions (v "1.0.0-rc.1") (v "1.0.0"),
                          compare_versions (v "1.0.0-rc.1") (v "1.0.0-rc.2")] ),
+        // The standard's own example list, shuffled: section 11.
+        test.case "pre-releases order part by part, numbers as numbers"
+            $( test.eq! ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2",
+                         "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0"]
+                        (list.map show (sorted (list.map v ["1.0.0-beta.11", "1.0.0", "1.0.0-alpha.beta", "1.0.0-rc.1",
+                                                            "1.0.0-alpha", "1.0.0-beta.2", "1.0.0-alpha.1", "1.0.0-beta"]))) ),
+        test.case "a pre-release must be spelled as the standard allows"
+            $( test.eq! [:ok, :error, :error, :error, :ok]
+                        (list.map (fn s -> match parse s { Result.ok(_) => :ok, Result.error(_) => :error })
+                                  ["1.0.0-rc.1", "1.0.0-rc..1", "1.0.0-rc.01", "1.0.0-", "V2.0.0-x-y.7"]) ),
+        test.case "the newest, and the newest a requirement takes"
+            $( test.eq! ["2.1.0", "1.9.4", ()]
+                        [shown (newest (list.map v ["1.2.0", "2.1.0", "1.9.4"])),
+                         shown (newest_matching (ok (parse_requirement "^1.2")) (list.map v ["1.2.0", "2.1.0", "1.9.4", "2.0.0-rc.1"])),
+                         shown (newest_matching (ok (parse_requirement "^3")) (list.map v ["1.2.0"]))] ),
+        test.case "older and newer"
+            $( test.eq! [true, false, true] [older (v "1.0.0") (v "1.0.1"), older (v "1.0.0") (v "1.0.0"),
+                                             newer (v "1.0.0") (v "1.0.0-rc.9")] ),
+        test.case "bumping drops the pre-release, and a patch of one is its release"
+            $( test.eq! ["2.0.0", "1.3.0", "1.2.4", "1.2.3", "v1.2.4"]
+                        [show (bump_major (v "1.2.3")), show (bump_minor (v "1.2.3")), show (bump_patch (v "1.2.3")),
+                         show (bump_patch (v "1.2.3-rc.1")), tag (bump_patch (v "1.2.3"))] ),
         test.case "a caret accepts what is compatible"
             $( test.eq! [true, true, false, false]
                         [sat "^1.2" "1.2.0", sat "^1.2" "1.9.4", sat "^1.2" "2.0.0", sat "^1.2" "1.1.9"] ),
