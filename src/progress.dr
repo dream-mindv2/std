@@ -145,6 +145,38 @@ let join_all! label ps = {
     values
 };
 
+/// `start!` called on each item, heaviest first by `weight`, and what each
+/// started joined as `join_all!` joins them, the answers in the items' own
+/// order. A phase of parts ends when its slowest part does. Started in the
+/// order they are listed, a slow part waits behind lighter ones whenever there
+/// are more parts than cores, and that wait is on the phase's critical path:
+/// a self-compile's longest parts each sat 100 to 280 ms in a queue. Longest
+/// first is the classic cure (Graham's rule for scheduling a list of jobs).
+let join_heaviest_first! : :string -> (a -> :integer) -> (a -> :process) -> [a] -> [:any];
+let join_heaviest_first! label weight start! items = {
+    let order = list.sort_on (fn ix -> 0 - weight (list.nth 1 ix)) (list.enumerate items);
+    let started = started_each! start! order [];
+    join_all! label (list.map (fn ip -> list.nth 1 ip) (list.sort_on list.head started))
+};
+
+/// `join_heaviest_first!`'s starts, one at a time and in order, each with
+/// the position its item had.
+priv let started_each! : (a -> :process) -> [[:integer, a]] -> [[:integer, :process]] -> [[:integer, :process]];
+priv let rec started_each! start! ixs !acc = match ixs {
+    [] => acc,
+    [[i, x], ..rest] => {
+        // Forced before it is started: numbered by `list.enumerate`, an item
+        // is a suspension of the zip that numbered it, holding every item
+        // after it, and `start!` handing it to `spawn!` copied them all into
+        // each process -- a self-compile went from 4.4 s to 19, and 2.4 GB
+        // to 9.
+        strict! x
+        let p = start! x;
+        strict! p
+        started_each! start! rest (list.cons [i, p] acc)
+    },
+};
+
 /// `join_all!`'s loop: each value forced as it is joined, the bar moved on.
 priv let joined! : Bar -> :integer -> [:process] -> [:any] -> [:any];
 priv let rec joined! bar !done ps !acc = match ps {
@@ -178,6 +210,8 @@ when test {
             $( test.eq! "[========================] 0/0" (line (Bar.new ()) 0 "" 80) ),
         test.case "join_all! answers in order"
             $( test.eq! [1, 2, 3] (join_all! "parts" [spawn! $( 1 ), spawn! $( 2 ), spawn! $( 3 )]) ),
+        test.case "join_heaviest_first! answers in the items' order"
+            $( test.eq! [10, 30, 20] (join_heaviest_first! "parts" (fn n -> n) (fn n -> spawn! $( n * 10 )) [1, 3, 2]) ),
         test.case "join_all! of nothing" $( test.eq! [] (join_all! "parts" []) ),
         test.case "an unlabelled bar"  $( test.eq! "[===========>            ] 1/2" (line (Bar.set_total 2 (Bar.new ())) 1 "" 80) ),
     ];
