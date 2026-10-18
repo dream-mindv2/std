@@ -7,6 +7,7 @@
 
 import std.agent;
 import std.array;
+import std.trunk;
 import std.atom;
 import std.binary;
 import std.binary.io as binary_io;
@@ -97,7 +98,7 @@ let version = "0.1.0";
 
 /// The modules this build provides.
 let modules : [:string];
-let modules = ["std.agent", "std.array", "std.atom", "std.binary", "std.binary.io", "std.binary.word", "std.build", "std.build.cc", "std.build.cc.cmake",
+let modules = ["std.agent", "std.array", "std.trunk", "std.atom", "std.binary", "std.binary.io", "std.binary.word", "std.build", "std.build.cc", "std.build.cc.cmake",
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
                "std.build.run", "std.build.tool", "std.char", "std.cli",

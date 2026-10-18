@@ -1,0 +1,219 @@
+// Trunks: one container, whose representation the runtime chooses.
+//
+// A trunk is a finite sequence -- that is all it means, and every
+// operation here answers what it would answer of a list of the same elements.
+// What it does not fix is how the elements are kept. A program says what it
+// does -- pushes at the end, prepends, reads a position, searches for an
+// element, looks a key up, replaces one -- and the VM keeps the trunk in
+// whatever serves that: a buffer that grows at both ends, read by position in
+// constant time; an index of its elements, made once searching has cost as
+// much as the trunk is long; an index of an association list's keys.
+// So the obvious program is the fast one: a loop that asks `contains` of a
+// trunk it keeps pushing to is linear, where the same loop over a list is
+// quadratic, and nobody had to choose a set.
+//
+// Trunks are values. Each operation answers a new trunk and leaves
+// the one it was given as it was. Used linearly -- each version used once to
+// make the next, which is how most functional code uses a container -- every
+// change is made in place, because the VM can tell; an older version still
+// read is still exactly what it was, and reading it costs a little more. The
+// representation is Baker's version tree; "Trunks" in
+// dream/docs/notes/trunks.md has the design and what it costs.
+//
+// An index answers only what a scan would, and forces nothing a scan would
+// not: it covers only elements a search already evaluated. Elements stay as
+// lazy as the program left them. `--stats` says what every trunk in a
+// run became.
+
+derive std.seq;
+import std.list;
+import std.vm;
+
+// --- what std.seq is told ---------------------------------------------------
+
+/// Combine every element into an accumulator, first to last.
+let fold : (b -> a -> b) -> b -> :trunk -> b;
+let fold f init c = list.fold f init (to_list c);
+
+let name : :any -> :string;
+let name c = "trunk";
+
+// --- making and taking apart -------------------------------------------------
+
+/// The trunk of a list's elements, in order. The list's spine is walked,
+/// so it must be finite; its elements are left as they are.
+let of : [a] -> :trunk;
+let of xs = vm.trunk_of xs;
+
+/// The trunk with nothing in it.
+let empty : :trunk;
+let empty = vm.trunk_of [];
+
+/// Its elements, in order.
+let to_list : :trunk -> [:any];
+let to_list c = vm.trunk_to_list c;
+
+/// How many elements. Constant time; `len c` is the same.
+let length : :trunk -> :integer;
+let length c = vm.trunk_len c;
+
+/// No elements?
+let is_empty : :trunk -> :bool;
+let is_empty c = vm.trunk_len c == 0;
+
+/// Is this a trunk?
+let is_trunk : :any -> :bool;
+let is_trunk v = type_of v == :trunk;
+
+// --- positions ----------------------------------------------------------------
+
+/// The element at position `i`, counted from 0; raises `:out_of_bounds` past
+/// the end. Constant time. `c.[i]` is the same.
+let at : :integer -> :trunk -> :any;
+let at i c = vm.trunk_at i c;
+
+/// The element at position `i`, if there is one.
+let get : :integer -> :trunk -> Option;
+let get i c = if i >= 0 && i < vm.trunk_len c { Option.some (vm.trunk_at i c) } else { Option.none };
+
+/// The first element; raises on an empty trunk.
+let first : :trunk -> :any;
+let first c = vm.trunk_at 0 c;
+
+/// The last element; raises on an empty trunk.
+let last : :trunk -> :any;
+let last c = vm.trunk_at (vm.trunk_len c - 1) c;
+
+/// The elements at `[from, to)`, clamped to the trunk.
+let slice : :integer -> :integer -> :trunk -> :trunk;
+let slice from to c = vm.trunk_slice from to c;
+
+/// Every element but the first; the empty trunk stays empty.
+let rest : :trunk -> :trunk;
+let rest c = vm.trunk_slice 1 (vm.trunk_len c) c;
+
+/// Every element but the first `n`.
+let drop : :integer -> :trunk -> :trunk;
+let drop n c = vm.trunk_slice n (vm.trunk_len c) c;
+
+/// The first `n` elements.
+let take : :integer -> :trunk -> :trunk;
+let take n c = vm.trunk_slice 0 n c;
+
+// --- changing ------------------------------------------------------------------
+
+/// `c` with `x` after its last element.
+let push : a -> :trunk -> :trunk;
+let push x c = vm.trunk_push x c;
+
+/// `c` with `x` before its first element.
+let cons : a -> :trunk -> :trunk;
+let cons x c = vm.trunk_cons x c;
+
+/// `c` with the element at `i` replaced by `x`; raises past the end.
+let set : :integer -> a -> :trunk -> :trunk;
+let set i x c = vm.trunk_set i x c;
+
+/// `a`'s elements, then `b`'s.
+let concat : :trunk -> :trunk -> :trunk;
+let concat a b = vm.trunk_concat a b;
+
+// --- searching -----------------------------------------------------------------
+
+/// Is some element `== x`? Evaluates elements from the first until one is.
+let contains : a -> :trunk -> :bool;
+let contains x c = vm.trunk_contains x c;
+
+/// The position of the first element `== x`.
+let index_of : a -> :trunk -> Option;
+let index_of x c = match vm.trunk_index_of x c {
+    -1 => Option.none,
+    i => Option.some i,
+};
+
+/// How many elements are `== x`. Evaluates every element.
+let occurrences : a -> :trunk -> :integer;
+let occurrences x c = vm.trunk_count x c;
+
+// --- as an association list -------------------------------------------------------
+//
+// A trunk of `[key, value]` lists is an association list, and these are
+// its two questions. What is searched for is the first element that is a list
+// whose first item is `== key`; anything else is passed over.
+
+/// The value paired with `key`, from the first pair that has it.
+let lookup : k -> :trunk -> Option;
+let lookup key c = match vm.trunk_lookup key c {
+    -1 => Option.none,
+    i => Option.some ((vm.trunk_at i c).[1]),
+};
+
+/// `c` with the first pair for `key` replaced by `[key, value]`, or with
+/// `[key, value]` pushed when there is none.
+let put : k -> v -> :trunk -> :trunk;
+let put key value c = vm.trunk_put key value c;
+
+// --- over the elements ---------------------------------------------------------------
+
+/// `f` of each element, as a trunk.
+let map : (a -> b) -> :trunk -> :trunk;
+let map f c = vm.trunk_of (list.map f (vm.trunk_to_list c));
+
+/// The elements `keep` says yes to, in order.
+let filter : (a -> :bool) -> :trunk -> :trunk;
+let filter keep c = vm.trunk_of (list.filter keep (vm.trunk_to_list c));
+
+when test {
+    import std.test;
+
+    let c3 = of [1, 2, 3];
+    // An element that raises when it is evaluated, to show it never is.
+    let boom n = 1 / n;
+    let pairs = of [["a", 1], ["b", 2]];
+
+    let tests = [
+        test.case "of and to_list"          $( test.eq! [1, 2, 3] (to_list c3) ),
+        test.case "length and len"          $( test.eq! [3, 3] [length c3, len c3] ),
+        test.case "empty"                   $( test.eq! [] (to_list empty) ),
+        test.case "at and .[ ]"             $( test.eq! [2, 3] [at 1 c3, c3.[2]] ),
+        test.case "get past the end"        $( test.eq! Option.none (get 9 c3) ),
+        test.case "push"                    $( test.eq! [1, 2, 3, 4] (to_list (push 4 c3)) ),
+        test.case "cons"                    $( test.eq! [0, 1, 2, 3] (to_list (cons 0 c3)) ),
+        test.case "an old version is as it was"
+            $( test.eq! [[1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 5]] [to_list c3, to_list (push 4 c3), to_list (push 5 c3)] ),
+        test.case "set leaves the old version"
+            $( { let d = set 1 9 c3; test.eq! [[1, 9, 3], [1, 2, 3]] [to_list d, to_list c3] } ),
+        test.case "a chain of versions, each read"
+            $( { let a = of [1]; let b = push 2 a; let c = set 0 7 b; let d = rest c;
+                 test.eq! [[1], [1, 2], [7, 2], [2]] [to_list a, to_list b, to_list c, to_list d] } ),
+        test.case "rest, drop, take, slice" $( test.eq! [[2, 3], [3], [1, 2], [2]] [to_list (rest c3), to_list (drop 2 c3), to_list (take 2 c3), to_list (slice 1 2 c3)] ),
+        test.case "concat"                  $( test.eq! [1, 2, 3, 1, 2, 3] (to_list (concat c3 c3)) ),
+        test.case "contains"                $( test.eq! [true, false] [contains 2 c3, contains 7 c3] ),
+        test.case "contains across 1 and 1.0" $( test.true! (contains 2.0 c3) ),
+        test.case "index_of"                $( test.eq! [Option.some 2, Option.none] [index_of 3 c3, index_of 8 c3] ),
+        test.case "occurrences"             $( test.eq! 2 (occurrences 1 (of [1, 2, 1])) ),
+        test.case "lookup"                  $( test.eq! [Option.some 2, Option.none] [lookup "b" pairs, lookup "z" pairs] ),
+        test.case "put replaces"            $( test.eq! [["a", 5], ["b", 2]] (to_list (put "a" 5 pairs)) ),
+        test.case "put adds"                $( test.eq! [["a", 1], ["b", 2], ["c", 3]] (to_list (put "c" 3 pairs)) ),
+        test.case "equality is the sequence's" $( test.true! (rest (of [0, 1, 2, 3]) == of [1, 2, 3]) ),
+        test.case "a trunk is not a list" $( test.false! (c3 == [1, 2, 3]) ),
+        test.case "printed"                 $( test.eq! "trunk[1, 2, 3]" (to_string c3) ),
+        test.case "type_of"                 $( test.eq! :trunk (type_of c3) ),
+        test.case "seq's sum and maximum"   $( test.eq! [6, 3] [sum c3, maximum c3] ),
+        test.case "map and filter"          $( test.eq! [[2, 4, 6], [2]] [to_list (map (fn x -> x * 2) c3), to_list (filter (fn x -> x % 2 == 0) c3)] ),
+        test.case "elements stay lazy"      $( test.eq! 3 (length (of [1, boom 0, 3])) ),
+        test.case "a search forces only what a scan would"
+            $( test.true! (contains 1 (of [1, boom 0])) ),
+        test.case "an index answers as the scan did"
+            $( { let big = list.fold (fn acc i -> push i acc) empty (list.range 0 200);
+                 let found = list.map (fn i -> contains i big) (list.range 0 400);
+                 test.eq! [200, 200] [list.length (list.filter (fn b -> b) found), list.length (list.filter (fn b -> not b) found)] } ),
+        test.case "a queue, pushed at one end and taken from the other"
+            $( { let q = list.fold (fn acc i -> rest (push i acc)) (of [0]) (list.range 1 100);
+                 test.eq! [99] (to_list q) } ),
+        test.case "an association list kept by put"
+            $( { let words = ["a", "b", "a", "c", "a", "b"];
+                 let counts = list.fold (fn acc w -> put w (Option.unwrap_or 0 (lookup w acc) + 1) acc) empty words;
+                 test.eq! [["a", 3], ["b", 2], ["c", 1]] (to_list counts) } ),
+    ];
+}
