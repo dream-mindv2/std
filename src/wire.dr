@@ -29,6 +29,7 @@
 // | 11   | integer | four bytes of length, then that many bytes of  |
 // |      |         | two's complement, little-endian                |
 // | 12   | tensor  | rank byte, u32 axes, then little-endian doubles |
+// | 14   | trunk   | four bytes of count, then that many values     |
 //
 // **An integer is one of two tags.** Eight bytes hold every integer most
 // programs meet, and every one this format carried before Dream had bignums,
@@ -363,6 +364,10 @@ priv let rec read buf at = match _str_byte buf at {
     10 => read_map buf (at + 1),
     11 => read_bigint buf (at + 1),
     12 => read_tensor buf (at + 1),
+    14 => match read_seq buf (at + 1) {
+              ()          => (),
+              [xs, next]  => [vm.trunk_of xs, next],
+          },
     _  => (),
 };
 
@@ -466,6 +471,11 @@ when test {
         test.case "empty map"   $( test.true! (trip %{}) ),
 
         // the kinds stay apart, which is the whole reason for this format
+        test.case "a trunk comes back a trunk"
+            $( test.eq! [:trunk, [1, "x", [2]]] (match decode (encode (vm.trunk_of [1, "x", [2]])) {
+                   Result.ok(t) => [type_of t, vm.trunk_to_list t],
+                   e => [e, ()],
+               }) ),
         test.case "an array does not come back a list"
             $( test.eq! :array (type_of (Result.unwrap_or () (decode (encode (_array_of_list [1]))))) ),
         test.case "an atom does not come back a string"

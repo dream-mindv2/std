@@ -88,8 +88,11 @@ mod keeper {
     import std.sql;
     import std.error;
     import std.list;
+    import std.trunk;
 
-    mapping State { opener, size : :integer, workers : [:any] = [], idle : [:any] = [], waiting : [:any] = [] }
+    // `waiting` is a queue: callers join at the back and are served from the
+    // front, which as a list was a copy of the queue per caller queued.
+    mapping State { opener, size : :integer, workers : [:any] = [], idle : [:any] = [], waiting : :trunk = trunk.empty }
     /// The state arrives already built by `start!`.
     let init! : :any -> :any;
     let init! state = state;
@@ -112,7 +115,7 @@ mod keeper {
                 worker.cast! w [:work, work!, from]
                 noreply (State.set_workers (list.cons w (State.workers state)) state)
             },
-            [] => noreply (State.set_waiting (State.waiting state + [[work!, from]]) state),
+            [] => noreply (State.set_waiting (trunk.push [work!, from] (State.waiting state)) state),
         },
         :stats => reply %{ :size => State.size state, :workers => len (State.workers state),
             :idle => len (State.idle state), :busy => len (State.workers state) - len (State.idle state),
@@ -130,12 +133,14 @@ mod keeper {
     /// A worker that finished takes the oldest queued work, or goes idle.
     let handle_cast! : :any -> :any -> :any;
     let handle_cast! message state = match message {
-        [:idle, w] => match State.waiting state {
-            [[work!, from], ..rest] => {
+        [:idle, w] => {
+            let queue = State.waiting state;
+            if trunk.is_empty queue { noreply (State.set_idle (list.cons w (State.idle state)) state) }
+            else {
+                let [work!, from] = trunk.first queue;
                 worker.cast! w [:work, work!, from]
-                noreply (State.set_waiting rest state)
-            },
-            [] => noreply (State.set_idle (list.cons w (State.idle state)) state),
+                noreply (State.set_waiting (trunk.rest queue) state)
+            }
         },
         _ => noreply state,
     };
@@ -146,7 +151,7 @@ mod keeper {
     let terminate! reason state = {
         let failure = error.new :sql_error %{ :code => :pool_closed, :message => "the pool is stopping", :sql => "" };
         strict! failure
-        strict! (map (fn [work!, from] -> reply_to! from (err failure)) (State.waiting state))
+        strict! (map (fn [work!, from] -> reply_to! from (err failure)) (trunk.to_list (State.waiting state)))
         strict! (map worker.stop! (State.workers state))
     };
 }

@@ -28,6 +28,7 @@
 import std.error;
 import std.io;
 import std.list;
+import std.trunk;
 import std.map;
 import std.num;
 import std.proc;
@@ -163,7 +164,10 @@ mapping Stream {
     pieces : [:string] = []
     size : :integer = 0
     window : :integer = 65535
-    pending : [:any] = []
+    // Data not yet sent, `[piece, end]` each: a queue, joined at the back
+    // and sent from the front, which as a list copied every piece waiting
+    // each time one more was queued.
+    pending : :trunk = trunk.empty
     caller : :any = ()
     ref : :any = ()
     sink : :bool = false
@@ -530,7 +534,7 @@ priv let respond_whole! c id resp = {
 priv let queue! : :map -> :integer -> :string -> :bool -> :map;
 priv let queue! c id piece end = match (Conn.streams c).[id else ()] {
     () => c,
-    s => flush! (put_stream c id (Stream.set_pending (Stream.pending s + [[piece, end]]) s)),
+    s => flush! (put_stream c id (Stream.set_pending (trunk.push [piece, end] (Stream.pending s)) s)),
 };
 
 /// Send what is waiting, stream by stream, as the windows allow.
@@ -541,9 +545,9 @@ priv let flush! c = fold (fn cc id -> flush_stream! cc id) c (map.keys (Conn.str
 priv let flush_stream! : :map -> :integer -> :map;
 priv let rec flush_stream! c id = match (Conn.streams c).[id else ()] {
     () => c,
-    s => match Stream.pending s {
-        [] => c,
-        [[piece, end], ..rest] => {
+    s => match trunk.get 0 (Stream.pending s) {
+        Option.none => c,
+        Option.some([piece, end]) => {
             let room = list.minimum [Conn.send_window c, Stream.window s, Conn.max_frame c];
             if len piece == 0 && end {
                 write! c (frame data_frame 1 id "")
@@ -555,7 +559,8 @@ priv let rec flush_stream! c id = match (Conn.streams c).[id else ()] {
                 write! c (frame data_frame (if last { 1 } else { 0 }) id (str.slice 0 take piece))
                 let left = str.slice take (len piece - take) piece;
                 let s2 = s |> Stream.set_window (Stream.window s - take)
-                           |> Stream.set_pending (if take == len piece { rest } else { [left, end] :: rest });
+                           |> Stream.set_pending (if take == len piece { trunk.rest (Stream.pending s) }
+                                                  else { trunk.set 0 [left, end] (Stream.pending s) });
                 let c2 = Conn.set_send_window (Conn.send_window c - take) c |> (fn cc -> put_stream cc id s2);
                 if last { finished! c2 id } else { flush_stream! c2 id }
             }
@@ -566,7 +571,7 @@ priv let rec flush_stream! c id = match (Conn.streams c).[id else ()] {
 /// This end has finished sending on stream `id`: a server is done with it;
 /// a client now waits for the answer.
 priv let finished! : :map -> :integer -> :map;
-priv let finished! c id = if Conn.role c == :server { drop_stream c id } else { put_stream c id (Stream.set_pending [] (stream_of c id)) };
+priv let finished! c id = if Conn.role c == :server { drop_stream c id } else { put_stream c id (Stream.set_pending trunk.empty (stream_of c id)) };
 
 /// A client's request: a new stream, its headers, and its body or the
 /// promise of one in pieces.

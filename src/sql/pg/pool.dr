@@ -37,6 +37,7 @@ import std.sql.pg.errors;
 mod keeper {
     derive std.server;
     import std.list;
+    import std.trunk;
     import std.sql.pg.db;
 
     mapping State {
@@ -44,7 +45,9 @@ mod keeper {
         size : :integer
         idle : [:any] = []
         open : :integer = 0
-        waiting : [:any] = []
+        // A queue, joined at the back and served from the front: as a list,
+        // a copy of the queue per caller queued.
+        waiting : :trunk = trunk.empty
     }
 
     /// The state arrives already built by `start!`.
@@ -60,7 +63,7 @@ mod keeper {
             [conn, ..rest] => reply [:conn, conn] (State.set_idle rest state),
             [] if State.open state < State.size state =>
                 reply [:open, State.config state] (State.set_open (State.open state + 1) state),
-            [] => noreply (State.set_waiting (State.waiting state + [from]) state),
+            [] => noreply (State.set_waiting (trunk.push from (State.waiting state)) state),
         },
         :stats => reply %{ :size => State.size state, :open => State.open state,
                            :idle => len (State.idle state), :waiting => len (State.waiting state) } state,
@@ -72,18 +75,21 @@ mod keeper {
     /// straight to the longest waiter when there is one: a connection as it
     /// is, and a lost one as permission to open its replacement.
     let handle_cast! : :any -> :any -> :any;
-    let handle_cast! message state = match [message, State.waiting state] {
-        [[:checkin, conn], [first, ..rest]] => {
-            reply_to! first [:conn, conn]
-            noreply (State.set_waiting rest state)
-        },
-        [[:checkin, conn], []] => noreply (State.set_idle (list.cons conn (State.idle state)) state),
-        [:lost, [first, ..rest]] => {
-            reply_to! first [:open, State.config state]
-            noreply (State.set_waiting rest state)
-        },
-        [:lost, []] => noreply (State.set_open (State.open state - 1) state),
-        _ => noreply state,
+    let handle_cast! message state = {
+        let queue = State.waiting state;
+        match [message, trunk.is_empty queue] {
+            [[:checkin, conn], false] => {
+                reply_to! (trunk.first queue) [:conn, conn]
+                noreply (State.set_waiting (trunk.rest queue) state)
+            },
+            [[:checkin, conn], true] => noreply (State.set_idle (list.cons conn (State.idle state)) state),
+            [:lost, false] => {
+                reply_to! (trunk.first queue) [:open, State.config state]
+                noreply (State.set_waiting (trunk.rest queue) state)
+            },
+            [:lost, true] => noreply (State.set_open (State.open state - 1) state),
+            _ => noreply state,
+        }
     };
 
     /// Close the idle connections. Those checked out belong to their callers
@@ -237,14 +243,15 @@ priv let on_transaction! body! conn = db.transaction! conn body!;
 
 when test {
     import std.test;
+    import std.trunk;
 
     let full : :any;
-    let full = keeper.State.make %{} 2 [] 2 [];
+    let full = keeper.State.make %{} 2 [] 2 trunk.empty;
 
     let tests = [
         test.case "an idle connection is handed out first"
             $( test.eq! [[:conn, :a], [:b]]
-                        (match keeper.answer! :checkout (keeper.State.make %{} 2 [:a, :b] 2 []) {
+                        (match keeper.answer! :checkout (keeper.State.make %{} 2 [:a, :b] 2 trunk.empty) {
                              [v, s] => [v, keeper.State.idle s],
                          }) ),
         test.case "with room and nothing idle, the caller is told to open one"
