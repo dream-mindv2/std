@@ -424,6 +424,16 @@ let encode v = vm.wire_encode v;
 let decode : :string -> Result :any :string;
 let decode text = vm.wire_decode text;
 
+/// A value as one message in the packed form: every part that occurs more
+/// than once, by content, written once and referred to after, counts and
+/// integers variable-length. A compiler's state packs to about a quarter of
+/// `encode`'s bytes, and reads back faster and shared, the parts it shared
+/// one value again. It is canonical too -- the bytes follow the value, not
+/// how it was built or shared -- and `decode` reads it, telling the two
+/// forms apart by the first byte. dream/src/pack.cpp is the format.
+let pack : :any -> :string;
+let pack v = vm.wire_pack v;
+
 // --- tests ---------------------------------------------------------------------
 
 when test {
@@ -452,6 +462,19 @@ when test {
                 byte 12 + byte 2 + count 4294967295 + count 4294967295,
                 byte 12 + byte 1 + count 2 + tensor.to_bytes (tensor.ones [1])]) ),
         // every kind, exactly
+        test.case "pack round-trips every kind"
+            $( { let v = [(), true, 42, -7, 3.5, "a string", :atom, 'c', [1, [2, 3]], #[1, 2], %{ "k" => [1] },
+                          123456789012345678901234567890, vm.trunk_of [1, 2]];
+                 test.eq! (Result.ok v) (decode (pack v)) } ),
+        test.case "pack writes a shared part once"
+            $( { let part = list.range 0 200;
+                 test.true! (len (pack [part, part, part]) * 2 < len (encode [part, part, part])) } ),
+        test.case "pack follows the value, not its sharing"
+            $( { let xs = list.range 0 50; test.eq! (pack [list.range 0 50, list.range 0 50]) (pack [xs, xs]) } ),
+        test.case "pack keeps 1 and 1.0 apart"
+            $( test.eq! (Result.ok [1, 1.0, [1], [1.0]]) (decode (pack [1, 1.0, [1], [1.0]])) ),
+        test.case "a packed message cut short is refused"
+            $( test.false! (Result.is_ok (decode (str.slice 0 5 (pack [1, 2, 3, "four"])))) ),
         test.case "unit"        $( test.true! (trip ()) ),
         test.case "true"        $( test.true! (trip true) ),
         test.case "false"       $( test.true! (trip false) ),
