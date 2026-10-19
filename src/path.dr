@@ -48,10 +48,12 @@
 // a tar header, say, or one read from a Windows manifest. The two families
 // are both pure data, so both are tested everywhere.
 //
-// The few answers that need the process -- where it is standing, where home
-// is -- are the `!` ones at the end. None of them asks the file system
-// whether anything exists; `std.file` is for that.
+// The answers that need the process -- where it is standing, where home
+// is -- are the `!` ones at the end. The Dream installation lookup may
+// inspect the disk; creating directories belongs to `std.file`.
 
+import std.error;
+import std.install;
 import std.list;
 import std.macros;
 import std.num;
@@ -552,13 +554,171 @@ let relative! from to = relative (absolute! from) (absolute! to);
 let same_file! : :string -> :string -> :bool;
 let same_file! a b = folded (style ()) (absolute! a) == folded (style ()) (absolute! b);
 
+/// An absolute directory from the environment. Empty and relative values
+/// are ignored; in particular an XDG override containing `~` is not absolute.
+priv let env_dir! : :string -> :string | :unit;
+priv let env_dir! name = match os.env! name {
+    () => (),
+    p => if is_absolute p { slashes p } else { () },
+};
+
 /// The home directory, or `()`: `$HOME`, and on Windows `$USERPROFILE` first,
-/// which is what Windows itself sets.
+/// then `$HOMEDRIVE` + `$HOMEPATH`, then `$HOME`. Only absolute paths count.
 let home! : :unit -> :string | :unit;
 let home! () = match style () {
-    :windows => match os.env! "USERPROFILE" { () => os.env! "HOME", h => h },
-    _ => os.env! "HOME",
+    :windows => match env_dir! "USERPROFILE" {
+        () => match [os.env! "HOMEDRIVE", os.env! "HOMEPATH"] {
+            [(), _] => env_dir! "HOME",
+            [_, ()] => env_dir! "HOME",
+            [d, p] if windows.is_absolute (d + p) => windows.slashes (d + p),
+            _ => env_dir! "HOME",
+        },
+        h => h,
+    },
+    _ => env_dir! "HOME",
 };
+
+/// The home directory; the same answer as `home!`.
+let home_dir! : :unit -> :string | :unit;
+let home_dir! () = home! ();
+
+/// A directory below home, or `()` when home is unavailable.
+priv let under_home! : :string -> :string | :unit;
+priv let under_home! suffix = match home! () {
+    () => (),
+    h => join h suffix,
+};
+
+/// An environment override, falling back to a directory below home.
+priv let user_dir! : :string -> :string -> :string | :unit;
+priv let user_dir! name suffix = match env_dir! name {
+    () => under_home! suffix,
+    p => p,
+};
+
+/// The base directory for persistent user data. Unix: `$XDG_DATA_HOME` or
+/// `~/.local/share`; macOS: `~/Library/Application Support`; Windows:
+/// `$APPDATA` or `~/AppData/Roaming`. Returns `()` if no base is available.
+/// These helpers name directories; they do not create or check them.
+let data_dir! : :unit -> :string | :unit;
+let data_dir! () = match os.platform () {
+    :windows => user_dir! "APPDATA" "AppData/Roaming",
+    :macos => under_home! "Library/Application Support",
+    _ => user_dir! "XDG_DATA_HOME" ".local/share",
+};
+
+/// The base directory for user settings. Unix: `$XDG_CONFIG_HOME` or
+/// `~/.config`; macOS and Windows: the same base as `data_dir!`.
+let config_dir! : :unit -> :string | :unit;
+let config_dir! () = match os.platform () {
+    :windows => data_dir! (),
+    :macos => data_dir! (),
+    _ => user_dir! "XDG_CONFIG_HOME" ".config",
+};
+
+/// The base directory for disposable cached data. Unix: `$XDG_CACHE_HOME`
+/// or `~/.cache`; macOS: `~/Library/Caches`; Windows: `$LOCALAPPDATA` or
+/// `~/AppData/Local`.
+let cache_dir! : :unit -> :string | :unit;
+let cache_dir! () = match os.platform () {
+    :windows => user_dir! "LOCALAPPDATA" "AppData/Local",
+    :macos => under_home! "Library/Caches",
+    _ => user_dir! "XDG_CACHE_HOME" ".cache",
+};
+
+/// The base directory for persistent history, logs and other local state.
+/// Unix: `$XDG_STATE_HOME` or `~/.local/state`; macOS: `data_dir!`;
+/// Windows: `$LOCALAPPDATA` or `~/AppData/Local`.
+let state_dir! : :unit -> :string | :unit;
+let state_dir! () = match os.platform () {
+    :windows => user_dir! "LOCALAPPDATA" "AppData/Local",
+    :macos => data_dir! (),
+    _ => user_dir! "XDG_STATE_HOME" ".local/state",
+};
+
+/// `$XDG_RUNTIME_DIR` on Unix, or `()` when unavailable (always `()` on
+/// Windows). There is no fallback: a shared temporary directory does not
+/// promise the private, login-scoped lifetime of a runtime directory.
+/// Ownership and permissions are the caller's to check with `std.file`.
+let runtime_dir! : :unit -> :string | :unit;
+let runtime_dir! () = match os.platform () {
+    :windows => (),
+    _ => env_dir! "XDG_RUNTIME_DIR",
+};
+
+/// The temporary directory. Unix: `$TMPDIR` or `/tmp`; Windows: `$TEMP`,
+/// then `$TMP`, then `Temp` below `cache_dir!`, or `()` without a base.
+/// Overrides must be absolute. No directory or unique file is created.
+let temp_dir! : :unit -> :string | :unit;
+let temp_dir! () = match os.platform () {
+    :windows => match env_dir! "TEMP" {
+        () => match env_dir! "TMP" {
+            () => match cache_dir! () { () => (), p => join p "Temp" },
+            p => p,
+        },
+        p => p,
+    },
+    _ => match env_dir! "TMPDIR" { () => "/tmp", p => p },
+};
+
+/// The first Dream installation directory, using the same lookup as the
+/// installed tools (`std.install.dirs!`): `$MINDV2_PATH`, the VM's packaged
+/// installation, or `~/.mindv2`. Without an existing installation, answers
+/// `~/.mindv2` even before it exists, or `()` without home. Relative paths
+/// are made absolute and quoted tildes are expanded. Does not create it.
+let dream_dir! : :unit -> :string | :unit;
+let dream_dir! () = match install.dirs! () {
+    [] => under_home! ".mindv2",
+    [dir, .._] => {
+        let expanded = slashes (expand_home! dir);
+        if expanded == "~" || str.starts_with "~/" expanded { () }
+        else { absolute! expanded }
+    },
+};
+
+/// The absolute parent directory of the installed image `dream -x name`
+/// would run. Searches every installation directory for `name` and then
+/// `name.dream`, ignoring images in the working directory. Returns `()`
+/// when no installed image is found. Does not create anything.
+let program_dir! : :string -> :string | :unit;
+let program_dir! name = match install.image! name {
+    () => (),
+    image => dirname (absolute! image),
+};
+
+/// Dream's shared data directory: `dream_dir! ()` joined with `data`, or
+/// `()` when its base is unavailable. Does not create or inspect it.
+let dream_data_dir! : :unit -> :string | :unit;
+let dream_data_dir! () = match dream_dir! () {
+    () => (),
+    dir => join dir "data",
+};
+
+/// A program's persistent data: `dream_data_dir! ()` joined with `program`,
+/// or `()` when its base is unavailable. The name must be one component:
+/// nonempty, with no `/`, `\`, `:`, or NUL, and no trailing dot or space
+/// (Windows strips those). Invalid names raise `:bad_argument`.
+/// For example, `program_data_dir! "my-tool"` is normally
+/// `~/.mindv2/data/my-tool`. No directories are created.
+let program_data_dir! : :string -> :string | :unit;
+let program_data_dir! program = {
+    if not (is_program_name program) {
+        error.raise_as! :bad_argument "a program data directory needs a single nonempty program name"
+    }
+    match dream_data_dir! () {
+        () => (),
+        dir => join dir program,
+    }
+};
+
+/// Whether a program name is one nonempty component, with no separators,
+/// drive or NUL, and no trailing dot or space. Used for installed program
+/// names and their data directories.
+let is_program_name : :string -> :bool;
+let is_program_name program =
+    program != "" && str.find "/" program < 0 && str.find "\\" program < 0
+    && str.find ":" program < 0 && str.find "\0" program < 0
+    && not (str.ends_with "." program) && not (str.ends_with " " program);
 
 /// A leading `~` means the home directory.
 ///

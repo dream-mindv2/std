@@ -179,6 +179,64 @@ whatever the system; `path.join` and the rest answer for the running one.
 `dreams/tests/paths.py` holds the module to Python's `posixpath`, `ntpath`
 and `pathlib` and to glibc's libgen over thousands of generated paths.
 
+The directory helpers read the running process's environment each time and
+return an absolute path with `/` separators, or `()` when unavailable:
+
+| Function | Unix | macOS | Windows |
+|---|---|---|---|
+| `home_dir! ()` (also `home! ()`) | `$HOME` | `$HOME` | `$USERPROFILE`, then `$HOMEDRIVE` + `$HOMEPATH`, then `$HOME` |
+| `data_dir! ()` | `$XDG_DATA_HOME` or `~/.local/share` | `~/Library/Application Support` | `$APPDATA` or `~/AppData/Roaming` |
+| `config_dir! ()` | `$XDG_CONFIG_HOME` or `~/.config` | Same as data | Same as data |
+| `cache_dir! ()` | `$XDG_CACHE_HOME` or `~/.cache` | `~/Library/Caches` | `$LOCALAPPDATA` or `~/AppData/Local` |
+| `state_dir! ()` | `$XDG_STATE_HOME` or `~/.local/state` | Same as data | Same as cache |
+| `runtime_dir! ()` | `$XDG_RUNTIME_DIR` or `()` | `$XDG_RUNTIME_DIR` or `()` | `()` |
+| `temp_dir! ()` | `$TMPDIR` or `/tmp` | `$TMPDIR` or `/tmp` | `$TEMP`, then `$TMP`, then `Temp` below cache |
+
+Empty and relative environment values are ignored, including literal `~`
+overrides: [XDG requires absolute paths](https://specifications.freedesktop.org/basedir/0.8/).
+macOS uses [Apple's Library folders](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/MacOSXDirectories/MacOSXDirectories.html),
+and Windows uses [the user's AppData folders](https://learn.microsoft.com/en-us/windows/deployment/usmt/usmt-recognized-environment-variables).
+The config and state mappings on macOS, and the state and cache mappings on
+Windows, share a base deliberately; add your application's subdirectory with
+`path.join`. These functions neither create directories nor check their
+existence or permissions. A runtime directory has no temporary-directory
+fallback. `expand_home!` and `from_env!` remain available for paths that accept
+a quoted tilde.
+
+Dream-specific data follows the same installation lookup as the installed
+tools: the first directory from `std.install.dirs! ()` (`MINDV2_PATH`, the
+VM's packaged installation, or `~/.mindv2`). With no existing installation,
+the base is `~/.mindv2` even before it exists. An empty installation list
+and no home directory return `()`.
+
+| Path only | Create parents and return the same path | Location |
+|---|---|---|
+| `path.dream_dir! ()` | — | Installation base |
+| `path.dream_data_dir! ()` | `file.ensure_dream_data_dir! ()` | `<base>/data` |
+| `path.program_data_dir! "my-tool"` | `file.ensure_program_data_dir! "my-tool"` | `<base>/data/my-tool` |
+
+`path.program_dir! "mind"` returns the absolute parent directory of the
+installed image that `dream -x mind` would run, or `()` if no image is found.
+It searches all installation directories, including `.dream` suffixes, and
+ignores working-directory images. For a name such as `tools/my-tool`, it
+returns the directory containing that image (`<installation>/tools`).
+
+The program name must be one nonempty component, without `/`, `\`, `:`,
+NUL, or a trailing dot or space. Invalid names raise `:bad_argument`.
+Ensuring a directory is safe to repeat and preserves its contents. Missing
+bases return `()`; filesystem errors, including an installation that cannot
+be written, propagate. No other directory is silently substituted.
+
+`path.temp_dir! ()` locates the temporary directory. `file.temp_file! ()`
+and `file.temp_dir! ()` create fresh entries there and return their paths.
+`file.temp_file_in! dir prefix` and `file.temp_dir_in! dir prefix` choose a
+parent and name prefix. Creation is exclusive with random names, so existing
+entries are never reused. Unix permissions are at most 0600 for files and
+0700 for directories; Windows inherits the parent's ACL. Call
+`file.remove_all!` when finished. For an open read-write file, use
+`io.temp_file! dir prefix`, which returns `[path, handle]`; close the handle
+before removing the file.
+
 A local variable named like a module hides it: `let f path = path.join ..`
 reads a member of the string. The compiler warns about that now, but the
 cure is a different name for the local (`dir`, `file_name`, `dest`).

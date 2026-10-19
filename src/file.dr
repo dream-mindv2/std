@@ -116,6 +116,64 @@ let mkdir_all! path = match path {
 let copy! : :string -> :string -> :unit;
 let copy! from to = io.copy! from to;
 
+/// Make a discovered directory and its parents, preserving an unavailable
+/// base as `()`. Existing directories succeed; filesystem errors propagate.
+priv let ensured_dir! : (:string | :unit) -> :string | :unit;
+priv let ensured_dir! dir = match dir {
+    () => (),
+    name => {
+        mkdir_all! name
+        name
+    },
+};
+
+/// Create Dream's shared data directory and return its path, or `()` when
+/// no base is available. See `path.dream_data_dir!` for its location.
+let ensure_dream_data_dir! : :unit -> :string | :unit;
+let ensure_dream_data_dir! () = ensured_dir! (paths.dream_data_dir! ());
+
+/// Create this program's persistent data directory and return its path.
+/// Repeated calls preserve existing contents. Returns `()` without a base;
+/// invalid names and filesystem failures raise, as `path.program_data_dir!`
+/// and `mkdir_all!` do.
+let ensure_program_data_dir! : :string -> :string | :unit;
+let ensure_program_data_dir! program = ensured_dir! (paths.program_data_dir! program);
+
+/// Create an empty temporary file in `dir`, with a random name beginning
+/// with `prefix`, and return its path. Creation is exclusive: an existing
+/// file or symbolic link is never overwritten. The file is closed before
+/// returning; use `io.temp_file! dir prefix` for `[path, read_write_handle]`.
+/// The parent must exist, and `prefix` must contain no separators or drive.
+/// Permissions on Unix are at most 0600. Remove the file when finished.
+let temp_file_in! : :string -> :string -> :string;
+let temp_file_in! dir prefix = {
+    let [name, handle] = io.temp_file! dir prefix;
+    io.close! handle
+    name
+};
+
+/// Create a temporary directory in `dir` and return its path. The name
+/// begins with `prefix`; the parent must exist. Unix permissions are at
+/// most 0700; Windows inherits the parent's ACL. Remove it with `remove_all!`.
+let temp_dir_in! : :string -> :string -> :string;
+let temp_dir_in! dir prefix = io.temp_dir! dir prefix;
+
+priv let temp_base! : :unit -> :string;
+priv let temp_base! () = match paths.temp_dir! () {
+    () => raise! [:not_found, "no temporary directory is available"],
+    dir => dir,
+};
+
+/// Create an empty, closed file in `path.temp_dir! ()` and return its path.
+/// It has a fresh random name beginning with `dream-`; the caller removes it.
+let temp_file! : :unit -> :string;
+let temp_file! () = temp_file_in! (temp_base! ()) "dream-";
+
+/// Create a fresh directory in `path.temp_dir! ()` and return its path.
+/// The caller removes the directory and its contents with `remove_all!`.
+let temp_dir! : :unit -> :string;
+let temp_dir! () = temp_dir_in! (temp_base! ()) "dream-";
+
 /// A name for a scratch file no other writer is using: this OS process's id
 /// and this green process's. The first alone is not enough, since one VM runs
 /// many processes, and two of them replacing the same file at once each
