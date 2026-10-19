@@ -158,6 +158,8 @@ let temp_file_in! dir prefix = {
 let temp_dir_in! : :string -> :string -> :string;
 let temp_dir_in! dir prefix = io.temp_dir! dir prefix;
 
+/// The directory a temporary file or directory goes in when none is named:
+/// the platform's, or a raise when there is none to be had.
 priv let temp_base! : :unit -> :string;
 priv let temp_base! () = match paths.temp_dir! () {
     () => raise! [:not_found, "no temporary directory is available"],

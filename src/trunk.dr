@@ -35,6 +35,7 @@ import std.vm;
 let fold : (b -> a -> b) -> b -> :trunk -> b;
 let fold f init c = list.fold f init (to_list c);
 
+/// What a trunk is called, in `std.seq`'s error messages and `describe`.
 let name : :any -> :string;
 let name c = "trunk";
 
