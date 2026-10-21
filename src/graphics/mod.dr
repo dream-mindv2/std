@@ -1,0 +1,115 @@
+// Application UI values and the driver-independent update loop.
+// Importing this module never opens a display or loads a graphics library.
+import std.json;
+import std.list;
+import std.map;
+
+/// Stable keys identify controls across renders. Keep them stable while a
+/// control exists so the renderer preserves focus, selection and IME state.
+mapping Node {
+    tag : :string = "div"
+    key : :string = ""
+    text : :string = ""
+    attrs : %{:string => :any} = %{}
+    style : %{:string => :string} = %{}
+    events : %{:string => :string} = %{}
+    children : [:any] = []
+}
+
+mapping Window {
+    title : :string = "Dream"
+    width : :integer = 960
+    height : :integer = 640
+}
+
+/// An event name is application data, never source code. Event values and
+/// command replies use JSON's data vocabulary across the sandbox boundary.
+mapping Event {
+    name : :string = ""
+    key : :string = ""
+    value : json.Value = ()
+}
+
+/// Each driver implements these effects. The default explicitly reports that
+/// this VM has no graphics host, including on servers without a display.
+mapping Driver {
+    open : :any = fn options -> Result.error :graphics_unavailable
+    render : :any = ()
+    next : :any = ()
+    close : :any = fn u -> ()
+}
+
+let available! : :unit -> :bool;
+let available! u = false;
+
+let open! : Window -> Result :unit :atom;
+let open! options = Result.error :graphics_unavailable;
+
+let element : :string -> :string -> [Node] -> Node;
+let element tag key children = Node.new () |> Node.set_tag tag |> Node.set_key key
+    |> Node.set_children children;
+
+let text : :string -> Node;
+let text value = Node.new () |> Node.set_tag "#text" |> Node.set_text value;
+
+let attribute : :string -> :any -> Node -> Node;
+let attribute name value node = Node.set_attrs ((Node.attrs node).[name => value]) node;
+
+let styled : %{:string => :string} -> Node -> Node;
+let styled declarations node = Node.set_style (map.merge (Node.style node) declarations) node;
+
+let on : :string -> :string -> Node -> Node;
+let on event message node = Node.set_events ((Node.events node).[event => message]) node;
+
+let column : :string -> [Node] -> Node;
+let column key children = element "div" key children
+    |> styled %{ "display" => "flex", "flex-direction" => "column" };
+
+let row : :string -> [Node] -> Node;
+let row key children = element "div" key children
+    |> styled %{ "display" => "flex", "flex-direction" => "row" };
+
+let button : :string -> :string -> :string -> Node;
+let button key label message = element "button" key [text label]
+    |> attribute "type" "button" |> on "click" message;
+
+/// Native label association and input semantics are retained by the driver.
+let input : :string -> :string -> :string -> Node;
+let input key value message = element "input" key []
+    |> attribute "id" key |> attribute "value" value |> on "input" message;
+
+let label : :string -> :string -> Node;
+let label key caption = element "label" (key + "-label") [text caption]
+    |> attribute "for" key;
+
+/// `update!` may call explicitly granted backend commands through its driver.
+/// `view` remains pure. A close event stops the loop; cleanup runs on failure.
+let run_with! : Driver -> Window -> a -> (Event -> a -> a) -> (a -> Node) -> Result a :atom;
+let run_with! driver options initial update! view = {
+    let open_driver! = Driver.open driver;
+    let render! = Driver.render driver;
+    let next! = Driver.next driver;
+    let close! = Driver.close driver;
+    let? opened = open_driver! options;
+    let rec loop! !model = {
+        render! (view model)
+        let event = next! ();
+        if Event.name event == "close" { Result.ok model }
+        else { loop! (update! event model) }
+    };
+    defer! { close! () }
+    loop! initial
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "headless open is explicit and harmless" $(test.eq! (Result.error :graphics_unavailable)
+            (open! (Window.new ()))),
+        test.case "buttons retain browser semantics" $(test.eq! ["button", "button", "increment"]
+            { let b = button "add" "Add" "increment";
+              [Node.tag b, (Node.attrs b).["type"], (Node.events b).["click"]] }),
+        test.case "styles compose" $(test.eq! "flex"
+            ((Node.style (row "r" [] |> styled %{"gap" => "8px"})).["display"]))
+    ];
+}

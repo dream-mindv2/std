@@ -1,0 +1,14 @@
+import std.graphics as ui;
+import std.graphics.browser;
+
+let main! = {
+    browser.open! (ui.Window.new ())
+    browser.render! (ui.element "p" "test" [ui.text "Testing native backend…"])
+    browser.invoke! "echoed" "echo" 9007199254740993
+    let response = browser.next! ();
+    let value = ui.Event.value response;
+    if ui.Event.name response != "echoed" || value.["ok"] != true || value.["value"] != 9007199254740993 {
+        raise! "graphics backend roundtrip failed"
+    }
+    browser.close! ()
+};

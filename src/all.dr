@@ -34,6 +34,8 @@ import std.console;
 import std.error;
 import std.file;
 import std.foreign;
+import std.graphics;
+import std.graphics.backend;
 import std.http;
 import std.http.h2;
 import std.http.hpack;

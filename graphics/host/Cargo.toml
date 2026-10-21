@@ -1,0 +1,15 @@
+[package]
+name = "dream-graphics-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tao = "=0.37.1"
+wry = "=0.57.0"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

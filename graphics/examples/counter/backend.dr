@@ -1,0 +1,6 @@
+import std.graphics.backend;
+
+let echo! count = count;
+let main! = backend.serve! %{
+    "echo" => backend.command! :integer :integer echo!
+};

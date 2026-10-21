@@ -1,0 +1,108 @@
+// Explicit command capabilities for a native Dream backend. Standard output
+// belongs to this protocol; application logs belong on standard error.
+import std.console;
+import std.io;
+import std.json;
+import std.str;
+import std.streams;
+import std.types;
+
+mapping Command {
+    input : :any = json.Value
+    output : :any = json.Value
+    handle : :any = ()
+}
+
+let command! : :any -> :any -> (:any -> :any) -> Command;
+let command! input output handle! = Command.new () |> Command.set_input input
+    |> Command.set_output output |> Command.set_handle handle!;
+
+priv let response reply ok value = %{
+    "name" => reply, "key" => "", "payload" => json.encode (if ok {
+        %{ "ok" => true, "value" => value }
+    } else { %{ "ok" => false, "error" => value } })
+};
+
+/// No reflection, shell dispatch, dynamic atoms, or implicit filesystem access.
+/// Only a named entry in `commands` can run, after its input schema accepts.
+let dispatch! : %{:string => Command} -> json.Value -> json.Value;
+let dispatch! commands request = {
+    if type_of request != :map { response "" false "invalid_request" }
+    else {
+        let reply = request.["reply" else ()];
+        let name = request.["command" else ()];
+        let payload = request.["payload" else ()];
+        if type_of reply != :string || type_of name != :string
+           || type_of payload != :string || len reply > 256 || len name > 256
+           || request.["type" else ()] != "invoke" {
+            response "" false "invalid_request"
+        } else {
+            match commands.[name else ()] {
+                () => response reply false "permission_denied",
+                command => {
+                    let decoded = json.decode payload;
+                    let value = Result.unwrap_or () decoded;
+                    if Result.is_error decoded || not (types.accepts (Command.input command) value) {
+                        response reply false "invalid_arguments"
+                    } else {
+                        let handle! = Command.handle command;
+                        try! {
+                            let answer = handle! value;
+                            strict! answer
+                            if types.accepts (Command.output command) answer && types.accepts json.Value answer {
+                                response reply true answer
+                            } else { response reply false "invalid_result" }
+                        } catch e { response reply false "command_failed" }
+                    }
+                },
+            }
+        }
+    }
+};
+
+let serve! : %{:string => Command} -> :unit;
+let serve! commands = {
+    let input = io.stdin! ();
+    let output = io.stdout! ();
+    let rec loop! u = match console.read_line_from! 1048576 input {
+        () => (),
+        line => {
+            let answer = match json.decode line {
+                Result.ok(request) => dispatch! commands request,
+                Result.error(reason) => response "" false "invalid_json",
+            };
+            let encoded = json.encode answer;
+            if str.byte_length encoded > 1048576 {
+                raise! (_error_new :graphics_protocol "response exceeds message limit")
+            }
+            streams.write_all! output (encoded + "\n")
+            loop! ()
+        },
+    };
+    loop! ()
+};
+
+when test {
+    import std.test;
+    let echo! value = value;
+    let tests = [
+        test.case "commands are denied unless explicitly registered" $(test.eq!
+            (response "answer" false "permission_denied")
+            (dispatch! %{} %{"type" => "invoke", "reply" => "answer", "command" => "exec", "payload" => "\"id\""})),
+        test.case "command schemas reject invalid arguments" $({
+            let cmd = command! :integer :integer echo!;
+            test.eq! (response "r" false "invalid_arguments")
+                (dispatch! %{"echo" => cmd} %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "\"bad\""})
+        }),
+        test.case "allowed command replies preserve data" $({
+            let cmd = command! :integer :integer echo!;
+            test.eq! (response "r" true 42)
+                (dispatch! %{"echo" => cmd} %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "42"})
+        }),
+        test.case "backend preserves integers beyond JavaScript precision" $({
+            let cmd = command! :integer :integer echo!;
+            test.eq! (response "r" true 9007199254740993)
+                (dispatch! %{"echo" => cmd} %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "9007199254740993"})
+        })
+    ];
+}

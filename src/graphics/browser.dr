@@ -1,0 +1,40 @@
+// Compile with --host-module dream.graphics.bridge. This driver runs inside
+// the browser VM; the native compiler and ordinary std do not import it.
+import dream.graphics.bridge;
+import std.graphics;
+import std.json;
+
+priv let send! : :any -> :unit;
+let send! value = bridge.send! (json.encode value);
+
+let open! : graphics.Window -> Result :unit :atom;
+let open! options = { send! %{ "type" => "open", "options" => options }; Result.ok () };
+
+let render! : graphics.Node -> :unit;
+let render! node = send! %{ "type" => "render", "node" => node };
+
+let next! : :unit -> graphics.Event;
+let next! u = {
+    let value = Result.unwrap! (json.decode (bridge.next! ()));
+    graphics.Event.new () |> graphics.Event.set_name value.["name"]
+        |> graphics.Event.set_key value.["key" else ""]
+        |> graphics.Event.set_value (match value.["payload" else ()] {
+            () => value.["value" else ()],
+            encoded => Result.unwrap! (json.decode encoded),
+        })
+};
+
+let close! : :unit -> :unit;
+let close! u = send! %{ "type" => "close" };
+
+let driver! : :unit -> graphics.Driver;
+let driver! u = graphics.Driver.new () |> graphics.Driver.set_open open!
+    |> graphics.Driver.set_render render! |> graphics.Driver.set_next next!
+    |> graphics.Driver.set_close close!;
+
+/// Asynchronous capability request. Replies arrive as events named by `reply`.
+/// The backend must explicitly register the command and validate its payload.
+let invoke! : :string -> :string -> json.Value -> :unit;
+let invoke! reply command value = send! %{
+    "type" => "invoke", "reply" => reply, "command" => command, "payload" => json.encode value
+};

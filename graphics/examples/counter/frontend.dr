@@ -1,0 +1,36 @@
+import std.graphics as ui;
+import std.graphics.browser;
+
+mapping Model {
+    count : :integer = 0
+    status : :string = "Ready"
+}
+
+let update! event model = match ui.Event.name event {
+    "increment" => Model.set_count (Model.count model + 1) model,
+    "decrement" => Model.set_count (Model.count model - 1) model,
+    "save" => {
+        browser.invoke! "saved" "echo" (Model.count model)
+        Model.set_status "Waiting for backend…" model
+    },
+    "saved" => Model.set_status (to_string (ui.Event.value event)) model,
+    _ => model,
+};
+
+let view model = ui.column "app" [
+    ui.element "h1" "heading" [ui.text "Dream graphics"],
+    ui.element "p" "intro" [ui.text "The frontend and backend are written in Dream."],
+    ui.element "output" "count" [ui.text (to_string (Model.count model))]
+        |> ui.attribute "aria-live" "polite"
+        |> ui.styled %{"font-size" => "48px"},
+    ui.row "actions" [
+        ui.button "subtract" "−" "decrement" |> ui.attribute "aria-label" "Decrease count",
+        ui.button "add" "+" "increment" |> ui.attribute "aria-label" "Increase count",
+        ui.button "save" "Call Dream backend" "save"
+    ] |> ui.styled %{"gap" => "12px"},
+    ui.element "p" "status" [ui.text (Model.status model)] |> ui.attribute "role" "status"
+] |> ui.styled %{"padding" => "32px", "gap" => "16px", "max-width" => "720px"};
+
+let main! = ui.run_with! (browser.driver! ())
+    (ui.Window.new () |> ui.Window.set_title "Dream counter")
+    (Model.new ()) update! view;
