@@ -55,6 +55,15 @@ let login! user password = {
     :ok
 };
 
+/// Connect, say who the server thinks this is, and close.
+let with_conn! : :any -> :any;
+let with_conn! target = {
+    let conn = db.connect! target;
+    let who = db.scalar! conn "SELECT current_user";
+    db.close! conn
+    who
+};
+
 let refused! : :any -> :unit -> :any;
 let refused! target u = db.connect! target;
 
@@ -506,7 +515,15 @@ let main! = test.main_of! [
     ["pg live: std.sql", standard.tests (as! "postgres" ())],
     ["pg live: logging in", [
         test.case "trust" $( login! "postgres" () ),
-        test.case "cleartext password" $( login! "u_clear" "clearpass" ),
+        test.case "cleartext password, only when the network is said to be trusted" $( {
+            // Without TLS, which `prefer` would have found here, so asked for.
+            let plain = (as! "u_clear" "clearpass").[:ssl_mode => :disable];
+            test.eq! :unsupported_authentication (condition_of! (refused! plain))
+            test.eq! "u_clear" (with_conn! (as! "u_clear" "clearpass"))
+            let conn = db.connect! (plain.[:cleartext_password => true]);
+            test.eq! "u_clear" (db.scalar! conn "SELECT current_user")
+            db.close! conn
+        } ),
         test.case "md5" $( login! "u_md5" "md5pass" ),
         test.case "SCRAM-SHA-256" $( login! "u_scram" "scrampass" ),
         test.case "a wrong or missing password" $( wrong_password! () ),

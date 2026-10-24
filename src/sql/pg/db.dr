@@ -278,7 +278,13 @@ let config_of conn = Conn.config conn;
 priv let authenticate! : Conn -> :unit;
 priv let rec authenticate! conn = match receive! conn {
     wire.Message.authentication(0, _) => (),
+    // The password as it is: only inside TLS, unless the configuration says
+    // the network is trusted (`cleartext_password`).
     wire.Message.authentication(3, _) => {
+        if tls_info! conn == () && not (config.Config.cleartext_password (Conn.config conn)) {
+            errors.fail! :unsupported_authentication
+                "the server asks for the password in the clear on a connection without TLS; set cleartext_password to allow it"
+        }
         write! conn (wire.password (password! conn))
         authenticate! conn
     },

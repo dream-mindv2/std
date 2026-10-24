@@ -61,6 +61,11 @@ mapping Config {
     /// A client certificate and key: a PKCS#12 file, and its password.
     ssl_identity : :string | :unit = ()
     ssl_password : :string = ""
+    /// Whether the password may be sent as it is when the server asks for it
+    /// that way and the connection has no TLS. Off, because `sslmode=prefer`
+    /// is a request an attacker on the path can answer "no" to, and then ask
+    /// for the password in the clear; MD5 and SCRAM never send it.
+    cleartext_password : :bool = false
 }
 
 /// How much TLS a connection insists on; see the head of this file.

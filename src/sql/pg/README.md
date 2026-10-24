@@ -287,6 +287,14 @@ reported by what was wrong: `:certificate_untrusted`, `:certificate_expired`,
 `:certificate_revoked`, `:hostname_mismatch`. `db.tls_info! conn` says what
 a connection negotiated, or `()` for plain text.
 
+A cleartext password is sent only inside TLS. `prefer`, the default, falls
+back to plain text when the server does not offer TLS -- and so does it when
+someone between the two answers for the server -- so a server asking for the
+password in the clear on a plain connection is refused
+(`:unsupported_authentication`) unless the `Config` says the network is
+trusted: `:cleartext_password => true`. MD5 and SCRAM never send the password
+itself.
+
 ## Through `std.sql`
 
 `driver.open!` takes the same configuration as `db.connect!`, and
