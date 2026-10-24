@@ -33,7 +33,7 @@ let dispatch! commands request = {
         let name = request.["command" else ()];
         let payload = request.["payload" else ()];
         if type_of reply != :string || type_of name != :string
-           || type_of payload != :string || len reply > 256 || len name > 256
+           || type_of payload != :string || reply == "" || name == "" || len reply > 256 || len name > 256
            || request.["type" else ()] != "invoke" {
             response "" false "invalid_request"
         } else {
@@ -103,6 +103,23 @@ when test {
             let cmd = command! :integer :integer echo!;
             test.eq! (response "r" true 9007199254740993)
                 (dispatch! %{"echo" => cmd} %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "9007199254740993"})
-        })
+        }),
+        test.case "handler failures become data" $({
+            let fail! value = raise! "private implementation error";
+            test.eq! (response "r" false "command_failed")
+                (dispatch! %{"fail" => command! :integer :integer fail!}
+                    %{"type" => "invoke", "reply" => "r", "command" => "fail", "payload" => "1"})
+        }),
+        test.case "invalid output is rejected" $({
+            let wrong! value = "wrong type";
+            test.eq! (response "r" false "invalid_result")
+                (dispatch! %{"wrong" => command! :integer :integer wrong!}
+                    %{"type" => "invoke", "reply" => "r", "command" => "wrong", "payload" => "1"})
+        }),
+        test.case "malformed command payloads are rejected" $(test.eq! (response "r" false "invalid_arguments")
+            (dispatch! %{"echo" => command! :integer :integer echo!}
+                %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "{"})),
+        test.case "empty reply names are rejected" $(test.eq! (response "" false "invalid_request")
+            (dispatch! %{} %{"type" => "invoke", "reply" => "", "command" => "echo", "payload" => "1"}))
     ];
 }

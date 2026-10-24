@@ -1,14 +1,16 @@
+// The desktop webview's whole path: the Wasm frontend asks the native backend,
+// an integer past JavaScript's exact range goes there and back, and the
+// program ends itself.
 import std.graphics as ui;
 import std.graphics.browser;
+import std.graphics.html;
 
-let main! = {
-    browser.open! (ui.Window.new ())
-    browser.render! (ui.element "p" "test" [ui.text "Testing native backend…"])
-    browser.invoke! "echoed" "echo" 9007199254740993
-    let response = browser.next! ();
-    let value = ui.Event.value response;
-    if ui.Event.name response != "echoed" || value.["ok"] != true || value.["value"] != 9007199254740993 {
-        raise! "graphics backend roundtrip failed"
-    }
-    browser.close! ()
-};
+union Msg { echoed(answer : Result :any :string) }
+
+let main! = browser.run! (ui.App.new () |> ui.App.set_init ()
+    |> ui.App.set_start (fn model -> { browser.invoke! "echo" 9007199254740993 Msg.echoed; model })
+    |> ui.App.set_view (fn model -> html.p [] [html.text "Testing the native backend…"])
+    |> ui.App.set_update (fn msg model -> match msg {
+        Msg.echoed(Result.ok(9007199254740993)) => { ui.quit! (); model },
+        Msg.echoed(other) => raise! ("graphics backend roundtrip failed: " + to_string other),
+    }));

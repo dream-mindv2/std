@@ -1,0 +1,5 @@
+// A frontend that fails stops the desktop application with its error.
+import std.graphics as ui;
+import std.graphics.browser;
+
+let main! = browser.run! (ui.App.new () |> ui.App.set_start (fn model -> raise! "intentional frontend failure"));

@@ -1,0 +1,110 @@
+// Drawing on a canvas, as values.
+//
+//     import std.graphics.canvas as cv;
+//
+//     let board model = cv.view [html.key "board", html.on_pointer_down Msg.press] 400 300 [
+//         cv.clear "#101820",
+//         cv.fill "tomato" (cv.circle (Model.x model) (Model.y model) 12),
+//         cv.stroke "white" 2 (cv.line 0 150 400 150),
+//         cv.rotate 0.3 [cv.fill "gold" (cv.rect 50 50 40 40)],
+//         cv.text_with "bold 16px system-ui" "white" "left" 10 24 ("Score " + to_string score),
+//     ];
+//
+// A drawing is a list of operations, made fresh by `view` like any other part
+// of the tree, and the page replays it whenever it changes -- so an animation
+// is a `frame` subscription moving the model and nothing else. The canvas is
+// sized in CSS pixels and drawn at the screen's density, so it is sharp on
+// every display without the program knowing the ratio. A pointer event's `x`
+// and `y` are in the same pixels as the drawing.
+//
+// Operations are JSON maps, which is what the page reads; each function here
+// makes one, and `group` nests them under a transform or an opacity that ends
+// with the group. Colours and fonts are CSS's (`std.graphics.css.rgb`), and
+// `path` takes SVG path data, so a shape drawn elsewhere can be pasted in.
+import std.graphics.{element, Attr, Node};
+import std.list;
+
+/// A canvas `width` by `height` CSS pixels, showing `drawing`.
+let view : [Attr] -> :integer -> :integer -> [:any] -> Node;
+let view attrs width height drawing =
+    Node.set_draw drawing (element "canvas"
+        (list.append [Attr.attribute "width" width, Attr.attribute "height" height] attrs) []);
+
+// --- shapes --------------------------------------------------------------------
+
+let rect : :any -> :any -> :any -> :any -> :any;
+let rect x y w h = %{ "kind" => "rect", "x" => x, "y" => y, "w" => w, "h" => h };
+/// A rectangle whose corners are rounded by `r`.
+let rounded : :any -> :any -> :any -> :any -> :any -> :any;
+let rounded x y w h r = %{ "kind" => "rounded", "x" => x, "y" => y, "w" => w, "h" => h, "r" => r };
+let circle : :any -> :any -> :any -> :any;
+let circle x y r = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => r, "ry" => r };
+let ellipse : :any -> :any -> :any -> :any -> :any;
+let ellipse x y rx ry = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => rx, "ry" => ry };
+/// An arc of the circle at `x`, `y`, from angle `from` to `to`, in radians.
+let arc : :any -> :any -> :any -> :any -> :any -> :any;
+let arc x y r from to = %{ "kind" => "arc", "x" => x, "y" => y, "r" => r, "from" => from, "to" => to };
+let line : :any -> :any -> :any -> :any -> :any;
+let line x1 y1 x2 y2 = %{ "kind" => "polyline", "points" => [[x1, y1], [x2, y2]] };
+/// Points joined in order, `[[x, y], ..]`, left open.
+let polyline : [[:any]] -> :any;
+let polyline points = %{ "kind" => "polyline", "points" => points };
+/// Points joined in order and closed.
+let polygon : [[:any]] -> :any;
+let polygon points = %{ "kind" => "polygon", "points" => points };
+/// SVG path data: `path "M 0 0 L 10 10 Z"`.
+let path : :string -> :any;
+let path d = %{ "kind" => "path", "d" => d };
+
+// --- operations ----------------------------------------------------------------
+
+/// Paint the whole canvas `color`.
+let clear : :string -> :any;
+let clear color = %{ "op" => "clear", "color" => color };
+let fill : :string -> :any -> :any;
+let fill color shape = %{ "op" => "fill", "color" => color, "shape" => shape };
+/// Outline `shape` with a line `width` pixels wide.
+let stroke : :string -> :any -> :any -> :any;
+let stroke color width shape = %{ "op" => "stroke", "color" => color, "width" => width, "shape" => shape };
+/// Fill, then outline.
+let paint : :string -> :string -> :any -> :any -> :any;
+let paint fill_color stroke_color width shape = %{ "op" => "paint", "fill" => fill_color,
+    "color" => stroke_color, "width" => width, "shape" => shape };
+/// Text at `x`, `y` (its baseline's start), in 16px system-ui.
+let text : :any -> :any -> :string -> :any;
+let text x y s = text_with "16px system-ui" "currentColor" "left" x y s;
+/// Text in a CSS `font`, a colour, aligned `left`, `center` or `right` of `x`.
+let text_with : :string -> :string -> :string -> :any -> :any -> :string -> :any;
+let text_with font color align x y s = %{ "op" => "text", "font" => font, "color" => color,
+    "align" => align, "x" => x, "y" => y, "text" => s };
+/// An image the application ships (`build.py --asset`), by its path, drawn
+/// into `w` by `h` at `x`, `y`. It appears once it has loaded.
+let image : :string -> :any -> :any -> :any -> :any -> :any;
+let image src x y w h = %{ "op" => "image", "src" => src, "x" => x, "y" => y, "w" => w, "h" => h };
+
+/// `drawing`, under any of `translate`, `rotate`, `scale` and `alpha` together.
+let group : %{:string => :any} -> [:any] -> :any;
+let group settings drawing = %{ "op" => "group", "settings" => settings, "drawing" => drawing };
+let translate : :any -> :any -> [:any] -> :any;
+let translate x y drawing = group %{ "translate" => [x, y] } drawing;
+/// Clockwise, in radians, about the origin -- `translate` there first to turn
+/// something about its own centre.
+let rotate : :any -> [:any] -> :any;
+let rotate radians drawing = group %{ "rotate" => radians } drawing;
+let scale : :any -> :any -> [:any] -> :any;
+let scale sx sy drawing = group %{ "scale" => [sx, sy] } drawing;
+/// Opacity from 0.0 to 1.0.
+let alpha : :any -> [:any] -> :any;
+let alpha a drawing = group %{ "alpha" => a } drawing;
+
+when test {
+    import std.test;
+    import std.graphics;
+    let tests = [
+        test.case "a canvas carries its drawing to the page" $({
+            let w = graphics.describe (view [Attr.key "c"] 100 50 [clear "black", fill "red" (circle 5 5 2)]);
+            test.eq! ["canvas", 100, 2] [w.["t"], (w.["a"]).["width"], len (w.["d"])]
+        }),
+        test.case "groups nest" $(test.eq! "group" ((rotate 1.5 [fill "red" (rect 0 0 1 1)]).["op"]))
+    ];
+}

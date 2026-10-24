@@ -1,36 +1,56 @@
+// The smallest std.graphics program: a model, its messages, a view.
+//
+//     python3 mind/std/graphics/build.py --vm build-dream/bin/dream \
+//         --compiler build/dreams.dream --runtime build-browser \
+//         --frontend mind/std/graphics/examples/counter/frontend.dr \
+//         --backend mind/std/graphics/examples/counter/backend.dr --out /tmp/counter
 import std.graphics as ui;
 import std.graphics.browser;
+import std.graphics.css;
+import std.graphics.html;
 
 mapping Model {
     count : :integer = 0
     status : :string = "Ready"
 }
 
-let update! event model = match ui.Event.name event {
-    "increment" => Model.set_count (Model.count model + 1) model,
-    "decrement" => Model.set_count (Model.count model - 1) model,
-    "save" => {
-        browser.invoke! "saved" "echo" (Model.count model)
-        Model.set_status "Waiting for backend…" model
+union Msg {
+    increment
+    decrement
+    save
+    saved(answer : Result :any :string)
+}
+
+let update! : Msg -> Model -> Model;
+let update! msg model = match msg {
+    Msg.increment => Model.set_count (Model.count model + 1) model,
+    Msg.decrement => Model.set_count (Model.count model - 1) model,
+    Msg.save => {
+        browser.invoke! "echo" (Model.count model) Msg.saved
+        Model.set_status "Waiting for the backend…" model
     },
-    "saved" => Model.set_status (to_string (ui.Event.value event)) model,
-    _ => model,
+    Msg.saved(Result.ok(n)) => Model.set_status ("The backend says " + to_string n) model,
+    Msg.saved(Result.error(why)) => Model.set_status ("No backend: " + why) model,
 };
 
-let view model = ui.column "app" [
-    ui.element "h1" "heading" [ui.text "Dream graphics"],
-    ui.element "p" "intro" [ui.text "The frontend and backend are written in Dream."],
-    ui.element "output" "count" [ui.text (to_string (Model.count model))]
-        |> ui.attribute "aria-live" "polite"
-        |> ui.styled %{"font-size" => "48px"},
-    ui.row "actions" [
-        ui.button "subtract" "−" "decrement" |> ui.attribute "aria-label" "Decrease count",
-        ui.button "add" "+" "increment" |> ui.attribute "aria-label" "Increase count",
-        ui.button "save" "Call Dream backend" "save"
-    ] |> ui.styled %{"gap" => "12px"},
-    ui.element "p" "status" [ui.text (Model.status model)] |> ui.attribute "role" "status"
-] |> ui.styled %{"padding" => "32px", "gap" => "16px", "max-width" => "720px"};
+let view : Model -> ui.Node;
+let view model = html.main [html.class "counter"] [
+    html.h1 [] [html.text "Dream graphics"],
+    html.p [] [html.text "The frontend and backend are written in Dream."],
+    html.output [html.aria "live" "polite"] [html.text (to_string (Model.count model))],
+    html.div [html.class "actions"] [
+        html.button [html.on_click Msg.decrement, html.aria "label" "Decrease count"] [html.text "−"],
+        html.button [html.on_click Msg.increment, html.aria "label" "Increase count"] [html.text "+"],
+        html.button [html.on_click Msg.save] [html.text "Call Dream backend"],
+    ],
+    html.p [html.role "status"] [html.text (Model.status model)],
+];
 
-let main! = ui.run_with! (browser.driver! ())
-    (ui.Window.new () |> ui.Window.set_title "Dream counter")
-    (Model.new ()) update! view;
+let styles = [
+    css.rule ".counter" %{ "padding" => "32px", "display" => "grid", "gap" => "16px", "max-width" => "720px" },
+    css.rule ".counter output" %{ "font-size" => "48px" },
+    css.rule ".actions" %{ "display" => "flex", "gap" => "12px" },
+];
+
+let main! = browser.run! (ui.App.new () |> ui.title "Dream counter" |> ui.App.set_init (Model.new ())
+    |> ui.App.set_update update! |> ui.App.set_view view |> ui.App.set_styles styles);

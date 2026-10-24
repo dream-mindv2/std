@@ -28,6 +28,8 @@ reference as a site, every example in it run.
 | [docs/build.md](docs/build.md) | build scripts and `std.build`: plans, steps, caching, goals, checks, and C/C++ with any compiler |
 | [docs/console.md](docs/console.md) | `std.console`: output, prompts, formatting, colour and logging |
 | [docs/binary.md](docs/binary.md) | `std.binary`: custom binary layouts, integers, floats, bit fields, bounds, and IO |
+| [docs/widgets.md](docs/widgets.md) | `std.graphics.widgets`: interfaces of screens, cards, buttons, fields, tabs, tables and dialogs, finished as written -- no HTML, CSS or JavaScript |
+| [docs/graphics.md](docs/graphics.md) | `std.graphics`: user interfaces in Dream -- HTML, CSS and canvas as values, run in a browser or a desktop window, with JavaScript and CSS of an application's own beside them |
 | [docs/notes/ml.md](docs/notes/ml.md) | the design behind `std.ml`: autodiff, layers, losses, optimizers, datasets |
 | [src/sql/pg/README.md](src/sql/pg/README.md) | the PostgreSQL client |
 
@@ -89,6 +91,7 @@ learn.
 | | |
 |---|---|
 | `console` | printing, prompts, formatting, colour and logging, over `std.io` |
+| `graphics`, `.widgets`, `.html`, `.css`, `.canvas`, `.browser`, `.backend` | user interfaces: a model, typed messages and a view; a widget kit with its own design ([widgets](docs/widgets.md)); elements, stylesheets and drawing as values; the page's effects; a native backend's commands ([guide](docs/graphics.md)) |
 | `path` | paths as text, POSIX's and Windows' rules both: drives, shares, `dirname`, extensions, `normalize`, `relative` ([below](#paths)) |
 | `file` | whole files, and the directories they go in |
 | `streams` | writing all of a string through a writer that may take less |

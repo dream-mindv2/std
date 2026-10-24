@@ -1,0 +1,4 @@
+/* A stylesheet written by hand, linked before the program's own, which wins a tie. */
+progress-ring { display: inline-block; color: CanvasText; }
+.remove { border: none; background: none; font-size: 1.25rem; opacity: .5; }
+.remove:hover { opacity: 1; }

@@ -1,40 +1,264 @@
-// Compile with --host-module dream.graphics.bridge. This driver runs inside
-// the browser VM; the native compiler and ordinary std do not import it.
-import dream.graphics.bridge;
-import std.graphics;
+// The page: std.graphics's driver for a browser tab, or for the desktop
+// webview `dream --graphics` opens, and the effects a page can do.
+//
+//     import std.graphics as ui;
+//     import std.graphics.browser;
+//
+//     let update! msg model = match msg {
+//         Msg.load => { browser.get_json! "/api/items" Msg.loaded; model },
+//         Msg.loaded(Result.ok(items)) => Model.set_items items model,
+//         Msg.loaded(Result.error(why)) => Model.set_problem why model,
+//     };
+//     let main! = browser.run! app;
+//
+// A program runs in a Web Worker on the browser VM, so it never blocks the
+// page, and reaches the page only through `std.browser`: two natives that
+// carry JSON text, one each way. Everything below is a message in that
+// protocol, and `web/main.mjs` the other half. Nothing here can name a DOM
+// node's methods, evaluate code or write markup: the page renders the data it
+// is sent, after checking it.
+//
+// **Effects answer later.** Each call that asks the page for something takes
+// the function that turns the answer into a message -- usually a union
+// constructor, `Msg.loaded` -- and returns at once. The answer arrives in
+// the loop's mailbox and goes to `update!` like any event, so a program can
+// have any number outstanding. Call them from `update!` or `start!`: the loop
+// keeps the function, in its own process (`expect!`). Another process that
+// wants one sends the loop a message asking for it.
+//
+// **Breaking out.** `js!` calls a function the application's own JavaScript
+// registered (`build.py --js`); `ui.on_port` hears what that JavaScript sends;
+// a custom element is `ui.element "my-widget" [html.prop "data" value] []`.
+// docs/graphics.md, "Breaking out", says what the JavaScript side sees.
+import std.browser as bridge;
+import std.error;
+import std.graphics.{App, Driver, Handler, Input, Window, after_render!, deliver!, expect!, run_with!,
+                     validate_window};
 import std.json;
+import std.list;
+import std.proc;
+import std.str;
+import std.vm;
 
-priv let send! : :any -> :unit;
-let send! value = bridge.send! (json.encode value);
+/// Run `app` on this page until its window closes, and answer its last model.
+let run! : App -> Result :any :atom;
+let run! app = run_with! (driver! ()) app;
 
-let open! : graphics.Window -> Result :unit :atom;
-let open! options = { send! %{ "type" => "open", "options" => options }; Result.ok () };
+let driver! : :unit -> Driver;
+let driver! u = Driver.new ()
+    |> Driver.set_open open!
+    |> Driver.set_render (fn patch -> bridge.send! ("{\"type\":\"render\",\"patch\":" + patch + "}"))
+    |> Driver.set_subscribe (fn subs -> bridge.send! ("{\"type\":\"subscribe\",\"subs\":" + subs + "}"))
+    |> Driver.set_styles (fn text -> if text != "" { post! %{ "type" => "styles", "css" => text } } else { () })
+    |> Driver.set_close (fn u -> post! %{ "type" => "close" });
 
-let render! : graphics.Node -> :unit;
-let render! node = send! %{ "type" => "render", "node" => node };
-
-let next! : :unit -> graphics.Event;
-let next! u = {
-    let value = Result.unwrap! (json.decode (bridge.next! ()));
-    graphics.Event.new () |> graphics.Event.set_name value.["name"]
-        |> graphics.Event.set_key value.["key" else ""]
-        |> graphics.Event.set_value (match value.["payload" else ()] {
-            () => value.["value" else ()],
-            encoded => Result.unwrap! (json.decode encoded),
-        })
+/// The window's title and size, then a process that reads the page and hands
+/// each event to this one. The bridge has one reader, so the order the page
+/// sent events in is the order the loop sees them.
+let open! : Window -> Result :unit :atom;
+let open! options = {
+    let? checked = validate_window options;
+    post! %{ "type" => "open", "options" => checked }
+    let me = self! ();
+    spawn! $( forward! me )
+    Result.ok ()
 };
 
-let close! : :unit -> :unit;
-let close! u = send! %{ "type" => "close" };
-
-let driver! : :unit -> graphics.Driver;
-let driver! u = graphics.Driver.new () |> graphics.Driver.set_open open!
-    |> graphics.Driver.set_render render! |> graphics.Driver.set_next next!
-    |> graphics.Driver.set_close close!;
-
-/// Asynchronous capability request. Replies arrive as events named by `reply`.
-/// The backend must explicitly register the command and validate its payload.
-let invoke! : :string -> :string -> json.Value -> :unit;
-let invoke! reply command value = send! %{
-    "type" => "invoke", "reply" => reply, "command" => command, "payload" => json.encode value
+priv let rec forward! ui_process = {
+    match input_of (bridge.next! ()) {
+        Result.ok(input) => deliver! ui_process input,
+        Result.error(why) => raise! (error.new :graphics_protocol why),
+    }
+    forward! ui_process
 };
+
+/// One message from the page, as the loop's `Input`.
+let input_of : :string -> Result Input :string;
+let input_of text = {
+    let? m = json.decode text;
+    match m.["type" else ""] {
+        "dom" => Result.ok (Input.dom m.["id"] m.["event"] m.["value" else ()]),
+        "sub" => Result.ok (Input.sub m.["id"] m.["value" else ()]),
+        "port" => Result.ok (Input.port m.["name"] m.["value" else ()]),
+        "reply" => Result.ok (Input.reply m.["id"] (answer_of m)),
+        "close" => Result.ok Input.close,
+        other => Result.error ("unknown page message " + to_string other),
+    }
+};
+
+/// A reply is `ok` with a `value` or not with an `error`; the backend's
+/// arrives as JSON text in `payload`, so an integer JavaScript cannot hold
+/// exactly is still exact here.
+priv let answer_of m = {
+    let reply = match m.["payload" else ()] {
+        () => m,
+        text => Result.unwrap_or %{ "ok" => false, "error" => "invalid_result" } (json.decode text),
+    };
+    if reply.["ok" else false] == true { Result.ok reply.["value" else ()] }
+    else { Result.error (to_text reply.["error" else "failed"]) }
+};
+
+priv let to_text v = if type_of v == :string { v } else { json.encode v };
+
+priv let post! value = bridge.send! (json.encode value);
+
+/// Ask the page's `service` for something, the answer becoming `f answer`.
+priv let request! service args f = {
+    let id = vm.unique! ();
+    expect! id (Handler.reading f)
+    post! %{ "type" => "request", "id" => id, "service" => service, "args" => args }
+};
+
+/// The same where no answer is wanted: request 0 is never answered.
+priv let tell! service args = post! %{ "type" => "request", "id" => 0, "service" => service, "args" => args };
+
+// --- the network ---------------------------------------------------------------
+
+/// An HTTP request, made by the page's `fetch`. The page's content security
+/// policy decides where it may go: the application's own origin, and any
+/// origin given to `build.py --connect`.
+mapping Request {
+    url : :string = ""
+    method : :string = "GET"
+    headers : %{:string => :string} = %{}
+    body : :string = ""
+}
+
+/// What came back. `ok` is a 2xx status; `body` is the text.
+mapping Response {
+    status : :integer = 0
+    ok : :bool = false
+    headers : %{:string => :string} = %{}
+    body : :string = ""
+}
+
+/// The whole exchange: any status is an answer, and only a request that could
+/// not be made (no network, refused by policy) is an error.
+let fetch! : Request -> (Result Response :string -> :any) -> :unit;
+let fetch! request f = request! "fetch" request f;
+
+/// The body of a successful GET, or why there is none.
+let get! : :string -> (Result :string :string -> :any) -> :unit;
+let get! url f = fetch! (Request.new () |> Request.set_url url) (fn r -> f (body_of r));
+
+/// The same, parsed as JSON.
+let get_json! : :string -> (Result json.Value :string -> :any) -> :unit;
+let get_json! url f = get! url (fn r -> f (Result.and_then json.decode r));
+
+/// POST `value` as JSON and parse the JSON answer (`()` for an empty one).
+let post_json! : :string -> json.Value -> (Result json.Value :string -> :any) -> :unit;
+let post_json! url value f = fetch! (Request.new () |> Request.set_url url |> Request.set_method "POST"
+        |> Request.set_headers %{ "content-type" => "application/json" } |> Request.set_body (json.encode value))
+    (fn r -> f (Result.and_then (fn body -> if body == "" { Result.ok () } else { json.decode body }) (body_of r)));
+
+priv let body_of r = match r {
+    Result.ok(response) => if Response.ok response { Result.ok (Response.body response) }
+        else { Result.error ("HTTP " + to_string (Response.status response)) },
+    Result.error(why) => Result.error why,
+};
+
+// --- storage -------------------------------------------------------------------
+
+/// Keep `value` under `key` in the page's local storage, as JSON, where it
+/// outlives the page. In the desktop webview each run starts empty.
+let save! : :string -> json.Value -> :unit;
+let save! key value = tell! "storage.set" %{ "key" => key, "value" => json.encode value };
+
+/// What was saved under `key`: `Option.some value`, or `Option.none`.
+let load! : :string -> (Option json.Value -> :any) -> :unit;
+let load! key f = request! "storage.get" %{ "key" => key } (fn r -> f (match r {
+    Result.ok(text) => if text == () { Option.none } else {
+        match json.decode text { Result.ok(v) => Option.some v, _ => Option.none }
+    },
+    _ => Option.none,
+}));
+
+let forget! : :string -> :unit;
+let forget! key = tell! "storage.remove" %{ "key" => key };
+
+// --- the page --------------------------------------------------------------------
+
+/// Go to `url` within the application, as a link would, without leaving the
+/// page: `ui.on_url` hears it, which is how a program routes.
+let navigate! : :string -> :unit;
+let navigate! url = tell! "navigate" %{ "url" => url, "replace" => false };
+/// The same, replacing the current entry in the history.
+let replace_url! : :string -> :unit;
+let replace_url! url = tell! "navigate" %{ "url" => url, "replace" => true };
+let back! : :unit -> :unit;
+let back! u = tell! "back" ();
+
+let set_title! : :string -> :unit;
+let set_title! title = tell! "title" %{ "title" => title };
+
+// What acts on a node waits for the render the update is making
+// (`after_render!`), so `focus!` can name a field that update brought into
+// being.
+
+/// Give the keyboard to the node with this key.
+let focus! : :string -> :unit;
+let focus! key = after_render! (fn u -> tell! "focus" %{ "key" => key });
+let blur! : :string -> :unit;
+let blur! key = after_render! (fn u -> tell! "blur" %{ "key" => key });
+/// Scroll the node with this key into view.
+let scroll_to! : :string -> :unit;
+let scroll_to! key = after_render! (fn u -> tell! "scroll" %{ "key" => key });
+/// The node's box on the page: `%{"x", "y", "width", "height"}` in CSS pixels.
+let measure! : :string -> (Result :any :string -> :any) -> :unit;
+let measure! key f = {
+    let id = vm.unique! ();
+    expect! id (Handler.reading f)
+    after_render! (fn u -> post! %{ "type" => "request", "id" => id, "service" => "measure", "args" => %{ "key" => key } })
+};
+
+/// Put text on the clipboard. Browsers allow it only while handling a click
+/// or a key, so call this from the `update!` for one.
+let copy! : :string -> :unit;
+let copy! text = tell! "clipboard" %{ "text" => text };
+
+/// Send `message` to the loop after `ms` milliseconds. Ordinary Dream: a
+/// process that sleeps, then sends -- which is all a timer is.
+let after! : :integer -> :any -> :unit;
+let after! ms message = {
+    let me = self! ();
+    spawn! $( { proc.sleep! ms; send! me message; () } )
+    ()
+};
+
+// --- breaking out ------------------------------------------------------------------
+
+/// Call `name`, a function the application's JavaScript registered with
+/// `dream.handle`, with `args`; its answer (or what it threw) becomes `f`'s.
+let js! : :string -> json.Value -> (Result json.Value :string -> :any) -> :unit;
+let js! name args f = request! "js" %{ "name" => name, "args" => args } f;
+
+/// The same, for a function whose answer nothing needs.
+let js_do! : :string -> json.Value -> :unit;
+let js_do! name args = tell! "js" %{ "name" => name, "args" => args };
+
+/// Run `command`, which the native backend registered (`std.graphics.backend`),
+/// with `value`. In a browser tab there is no backend, and the answer is
+/// `Result.error "backend_unavailable"`.
+let invoke! : :string -> json.Value -> (Result json.Value :string -> :any) -> :unit;
+let invoke! command value f = request! "backend" %{ "command" => command, "payload" => json.encode value } f;
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "page events become inputs" $({
+            test.eq! (Result.ok (Input.dom [0, "a"] "click" ())) (input_of "{\"type\":\"dom\",\"id\":[0,\"a\"],\"event\":\"click\",\"value\":null}")
+            test.eq! (Result.ok Input.close) (input_of "{\"type\":\"close\"}")
+            test.true! (Result.is_error (input_of "{\"type\":\"other\"}"))
+        }),
+        test.case "replies are results" $({
+            test.eq! (Result.ok (Input.reply 3 (Result.ok 5))) (input_of "{\"type\":\"reply\",\"id\":3,\"ok\":true,\"value\":5}")
+            test.eq! (Result.ok (Input.reply 3 (Result.error "nope"))) (input_of "{\"type\":\"reply\",\"id\":3,\"ok\":false,\"error\":\"nope\"}")
+        }),
+        test.case "a backend's integers stay exact" $(test.eq!
+            (Result.ok (Input.reply 1 (Result.ok 9007199254740993)))
+            (input_of "{\"type\":\"reply\",\"id\":1,\"payload\":\"{\\\"ok\\\":true,\\\"value\\\":9007199254740993}\"}")),
+        test.case "a GET fails on a status that is not 2xx" $(test.eq! [Result.ok "x", Result.error "HTTP 404"]
+            [body_of (Result.ok (Response.new () |> Response.set_ok true |> Response.set_body "x")),
+             body_of (Result.ok (Response.new () |> Response.set_status 404))])
+    ];
+}

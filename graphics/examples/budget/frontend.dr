@@ -1,0 +1,266 @@
+// A budget, written with std.graphics.widgets alone: no HTML, no CSS, no
+// JavaScript. Tabs, cards, a table, a form that checks itself, a dialog
+// before anything is deleted, toasts that go away on their own, a budget on a
+// slider, dark mode as a setting, and everything kept in the browser.
+//
+//     just graphics-app /tmp/budget mind/std/graphics/examples/budget/frontend.dr
+//     just graphics-serve /tmp/budget
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.widgets as w;
+import std.list;
+import std.num;
+import std.str;
+
+mapping Expense {
+    id : :integer = 0
+    title : :string = ""
+    cents : :integer = 0
+    category : :string = "Food"
+    monthly : :bool = false
+}
+
+mapping Toast {
+    id : :integer = 0
+    tone : :atom = :success
+    text : :string = ""
+}
+
+mapping Model {
+    loading : :bool = true
+    tab : :string = "overview"
+    expenses : [Expense] = []
+    next : :integer = 1
+    budget : :integer = 1200
+    dark : :bool = false
+    search : :string = ""
+    title : :string = ""
+    amount : :any = ()
+    category : :string = "Food"
+    monthly : :bool = false
+    tried : :bool = false
+    confirming : :integer = 0
+    toasts : [Toast] = []
+}
+
+union Msg {
+    loaded(saved : Option :any)
+    tab(name : :string)
+    search(text : :string)
+    title(text : :string)
+    amount(value : :any)
+    category(name : :string)
+    monthly(on : :bool)
+    add
+    ask_remove(id : :integer)
+    remove
+    keep
+    budget(dollars : :any)
+    dark(on : :bool)
+    dismiss(id : :integer)
+}
+
+let categories : [:string];
+let categories = ["Food", "Home", "Travel", "Fun", "Other"];
+
+/// `123456` cents as `$1,234.56`.
+let money : :integer -> :string;
+let money cents = {
+    let sign = if cents < 0 { "-" } else { "" };
+    let c = if cents < 0 { 0 - cents } else { cents };
+    sign + "$" + thousands (c / 100) + "." + str.pad_start 2 "0" (to_string (c % 100))
+};
+
+let thousands : :integer -> :string;
+let rec thousands n = if n < 1000 { to_string n }
+    else { thousands (n / 1000) + "," + str.pad_start 3 "0" (to_string (n % 1000)) };
+
+let spent : Model -> :integer;
+let spent model = list.fold_strict (fn total e -> total + Expense.cents e) 0 (Model.expenses model);
+
+// --- what is kept ------------------------------------------------------------------
+
+let saved : Model -> :any;
+let saved model = %{
+    "budget" => Model.budget model, "dark" => Model.dark model, "next" => Model.next model,
+    "expenses" => list.map (fn e -> %{ "id" => Expense.id e, "title" => Expense.title e, "cents" => Expense.cents e,
+        "category" => Expense.category e, "monthly" => Expense.monthly e }) (Model.expenses model),
+};
+
+let restore : :any -> Model -> Model;
+let restore m model = model
+    |> Model.set_budget m.["budget" else 1200] |> Model.set_dark m.["dark" else false] |> Model.set_next m.["next" else 1]
+    |> Model.set_expenses (list.map (fn e -> Expense.new () |> Expense.set_id e.["id"] |> Expense.set_title e.["title"]
+        |> Expense.set_cents e.["cents"] |> Expense.set_category e.["category"] |> Expense.set_monthly e.["monthly"])
+        (m.["expenses" else []]));
+
+/// The first visit has something to look at.
+let sample : Model -> Model;
+let sample model = list.fold (fn m e -> add_expense e m) model [
+    Expense.new () |> Expense.set_title "Groceries" |> Expense.set_cents 8640 |> Expense.set_category "Food",
+    Expense.new () |> Expense.set_title "Rent" |> Expense.set_cents 65000 |> Expense.set_category "Home" |> Expense.set_monthly true,
+    Expense.new () |> Expense.set_title "Train tickets" |> Expense.set_cents 4250 |> Expense.set_category "Travel",
+];
+
+let add_expense : Expense -> Model -> Model;
+let add_expense e model = model
+    |> Model.set_expenses (list.append (Model.expenses model) [Expense.set_id (Model.next model) e])
+    |> Model.set_next (Model.next model + 1);
+
+let keep! : Model -> Model;
+let keep! model = { browser.save! "budget" (saved model); model };
+
+/// A toast now, gone in four seconds.
+let toast! : :atom -> :string -> Model -> Model;
+let toast! t s model = {
+    let id = Model.next model;
+    browser.after! 4000 (Msg.dismiss id)
+    model |> Model.set_next (id + 1)
+          |> Model.set_toasts (list.append (Model.toasts model) [Toast.new () |> Toast.set_id id |> Toast.set_tone t |> Toast.set_text s])
+};
+
+// --- the form ----------------------------------------------------------------------
+
+let title_problem : Model -> :string;
+let title_problem model = if str.trim (Model.title model) == "" { "Say what it was for" } else { "" };
+
+let amount_problem : Model -> :string;
+let amount_problem model = match Model.amount model {
+    () => "Enter an amount",
+    n => if n <= 0 { "The amount must be more than zero" } else { "" },
+};
+
+let valid : Model -> :bool;
+let valid model = title_problem model == "" && amount_problem model == "";
+
+// --- update ------------------------------------------------------------------------
+
+let update! : Msg -> Model -> Model;
+let update! msg model = match msg {
+    Msg.loaded(Option.some(m)) => restore m model |> Model.set_loading false,
+    Msg.loaded(Option.none) => sample model |> Model.set_loading false,
+    Msg.tab(t) => Model.set_tab t model,
+    Msg.search(s) => Model.set_search s model,
+    Msg.title(t) => Model.set_title t model,
+    Msg.amount(a) => Model.set_amount a model,
+    Msg.category(c) => Model.set_category c model,
+    Msg.monthly(b) => Model.set_monthly b model,
+    Msg.add => if not (valid model) { Model.set_tried true model } else {
+        let e = Expense.new () |> Expense.set_title (str.trim (Model.title model))
+            |> Expense.set_cents (cents_of (Model.amount model)) |> Expense.set_category (Model.category model)
+            |> Expense.set_monthly (Model.monthly model);
+        model |> add_expense e |> keep!
+              |> Model.set_title "" |> Model.set_amount () |> Model.set_monthly false |> Model.set_tried false
+              |> Model.set_tab "overview" |> toast! :success ("Added " + Expense.title e)
+    },
+    Msg.ask_remove(id) => Model.set_confirming id model,
+    Msg.keep => Model.set_confirming 0 model,
+    Msg.remove => {
+        let gone = list.filter (fn e -> Expense.id e == Model.confirming model) (Model.expenses model);
+        model |> Model.set_expenses (list.filter (fn e -> Expense.id e != Model.confirming model) (Model.expenses model))
+              |> Model.set_confirming 0 |> keep!
+              |> toast! :info ("Removed " + list.first_or "it" (list.map Expense.title gone))
+    },
+    Msg.budget(d) => keep! (Model.set_budget d model),
+    Msg.dark(b) => keep! (Model.set_dark b model),
+    Msg.dismiss(id) => Model.set_toasts (list.filter (fn t -> Toast.id t != id) (Model.toasts model)) model,
+};
+
+/// Dollars as typed, as whole cents.
+let cents_of : :any -> :integer;
+let cents_of a = num.round (a * 100);
+
+/// What was kept arrives as a message; until it does, the screen says so.
+let start! : Model -> Model;
+let start! model = { browser.load! "budget" Msg.loaded; model };
+
+// --- the view ----------------------------------------------------------------------
+
+let stat : :string -> :string -> ui.Node -> ui.Node;
+let stat label value extra = w.card [w.caption label, w.title value, extra] |> w.gap 1;
+
+let overview : Model -> ui.Node;
+let overview model = {
+    let total = spent model;
+    let budget_cents = Model.budget model * 100;
+    let left = budget_cents - total;
+    let fraction = if budget_cents == 0 { 1 } else { total * 1.0 / budget_cents };
+    let query = str.lower (Model.search model);
+    let shown = list.filter (fn e -> query == "" || str.contains_str query (str.lower (Expense.title e))) (Model.expenses model);
+    w.column [
+        w.grid 3 [
+            stat "Spent this month" (money total) (w.progress fraction |> w.tone (if fraction > 1 { :danger } else { :accent })),
+            stat "Budget" (money budget_cents) (w.caption "Change it in Settings"),
+            stat "Left" (money left) (if left < 0 { w.badge "Over" |> w.tone :danger } else { w.badge "On track" |> w.tone :success }),
+        ],
+        if fraction > 1 { w.notice :danger ("You are " + money (0 - left) + " over budget.") }
+        else if fraction > 0.8 { w.notice :warning "You have used most of this month's budget." }
+        else { ui.nothing },
+        w.card [
+            w.row [w.heading "Expenses", w.spacer,
+                   w.search_field "Search expenses" (Model.search model) Msg.search |> w.placeholder "Search"
+                       |> w.quiet_label |> w.width "14rem"],
+            if shown == [] { w.empty "No expenses" (if query == "" { "Add one, and it appears here." } else { "Nothing matches “" + Model.search model + "”." }) }
+            else {
+                w.table ["What", "Category", "Amount", ""] (list.map (fn e -> [
+                    w.row [w.strong (Expense.title e), if Expense.monthly e { w.badge "Monthly" |> w.tone :accent } else { ui.nothing }],
+                    w.badge (Expense.category e),
+                    w.text (money (Expense.cents e)),
+                    w.icon_button "trash" ("Remove " + Expense.title e) (Msg.ask_remove (Expense.id e)) |> w.ghost |> w.small,
+                ]) shown)
+            },
+        ],
+    ]
+};
+
+let add_form : Model -> ui.Node;
+let add_form model = {
+    let shown problem = if Model.tried model { problem } else { "" };
+    w.card [
+        w.heading "Add an expense",
+        w.text_field "What was it for?" (Model.title model) Msg.title |> w.placeholder "Coffee with Sam"
+            |> w.on_enter Msg.add |> w.error (shown (title_problem model)) |> w.key "title",
+        w.grid 2 [
+            w.number_field "Amount, in dollars" (Model.amount model) Msg.amount |> w.on_enter Msg.add
+                |> w.error (shown (amount_problem model)),
+            w.select "Category" categories (Model.category model) Msg.category,
+        ],
+        w.checkbox "This comes every month" (Model.monthly model) Msg.monthly,
+        w.row [w.spacer, w.button "Cancel" (Msg.tab "overview") |> w.ghost,
+               w.button_with "plus" "Add expense" Msg.add |> w.primary],
+    ]
+};
+
+let settings : Model -> ui.Node;
+let settings model = w.card [
+    w.heading "Settings",
+    w.slider "Monthly budget, in dollars" 100 5000 50 (Model.budget model) Msg.budget,
+    w.divider,
+    w.switch "Dark mode" (Model.dark model) Msg.dark,
+    w.caption "Everything here is kept in this browser.",
+];
+
+let view : Model -> ui.Node;
+let view model = w.page [
+    w.screen [
+        w.row [w.title "Budget", w.spacer,
+               w.tabs [["overview", "Overview"], ["add", "Add"], ["settings", "Settings"]] (Model.tab model) Msg.tab],
+        if Model.loading model { w.center [w.spinner, w.caption "Loading…"] |> w.padding 7 }
+        else {
+            match Model.tab model {
+                "add" => add_form model,
+                "settings" => settings model,
+                _ => overview model,
+            }
+        },
+    ],
+    w.dialog (Model.confirming model != 0) "Remove this expense?"
+        [w.text "It goes from this month's total. There is no undo."]
+        [w.button "Keep it" Msg.keep, w.button "Remove" Msg.remove |> w.danger]
+        Msg.keep,
+    w.toasts (list.map (fn t -> w.toast (Toast.tone t) (Toast.text t) (Msg.dismiss (Toast.id t)) |> w.key ("toast-" + to_string (Toast.id t)))
+        (Model.toasts model)),
+] |> w.mode (if Model.dark model { :dark } else { :light });
+
+let main! = w.run! (ui.App.new () |> ui.title "Budget" |> ui.App.set_init (Model.new ())
+    |> ui.App.set_start start! |> ui.App.set_update update! |> ui.App.set_view view);

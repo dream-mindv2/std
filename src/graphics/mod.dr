@@ -1,115 +1,822 @@
-// Application UI values and the driver-independent update loop.
-// Importing this module never opens a display or loads a graphics library.
+// A user interface as Dream values: a model, the messages that change it, and
+// a view of it as a tree of nodes.
+//
+//     union Msg { add, edit(text : :string) }
+//
+//     let update! msg model = match msg {
+//         Msg.add => Model.set_count (Model.count model + 1) model,
+//         Msg.edit(t) => Model.set_name t model,
+//     };
+//     let view model = html.div [html.class "counter"] [
+//         html.button [html.on_click Msg.add] [ui.text "Add one"],
+//         html.input [html.value (Model.name model), html.on_input Msg.edit] [],
+//     ];
+//     let main! = browser.run! (ui.App.new () |> ui.App.set_init (Model.new ())
+//         |> ui.App.set_update update! |> ui.App.set_view view);
+//
+// **A handler is any Dream value.** A node says what an event means -- a
+// message, or a function from the event's value to one (`Handler`) -- and the
+// message is whatever the program likes, usually a union constructor, so the
+// checker sees every message `update!` must handle. None of that crosses into
+// the page. The loop keeps the tree it last rendered, each node with an id
+// (the way to it, by keys and positions), and the page answers with nothing
+// but `[id, event name, value]`. A function cannot be sent to JavaScript, and
+// now nothing has to be. Nor is the tree sent twice: a render sends what
+// changed (`diff`).
+//
+// **One mailbox.** The loop is an ordinary process reading its mailbox. What
+// the page reports arrives there (`deliver!`), and so does the answer to every
+// effect the program asked for (`expect!`), and so does anything else any
+// process sends it -- which is a message for `update!`, as written. A ticker is
+// `spawn!` and `proc.sleep!`; a worker that finishes sends its answer; nothing
+// about the UI needs a timer or a thread of its own.
+//
+// **Effects are calls.** `update!` may be impure, and asking for something --
+// a fetch, the stored value of a key, the backend -- is a call from it
+// (`std.graphics.browser`) that names the message its answer becomes. The
+// answer arrives later, like any other message. `view` stays pure.
+//
+// **Drivers.** What renders and where events come from is a `Driver`, so this
+// module never opens a display or loads a library: `std.graphics.browser` is
+// the page (in the browser, or the desktop webview `dream --graphics` opens),
+// and a test is a driver made of `send!`s.
+import std.array;
 import std.json;
 import std.list;
 import std.map;
+import std.str;
+import std.vm;
 
-/// Stable keys identify controls across renders. Keep them stable while a
-/// control exists so the renderer preserves focus, selection and IME state.
+// --- the tree ---------------------------------------------------------------
+
+/// What an event does: send a message, or make one from the event's value
+/// (the text of an input, a key, a pointer's position). A function that
+/// answers `()` sends nothing, which is how a key handler ignores most keys.
+union Handler {
+    message(value : :any)
+    reading(f : :any)
+}
+
+/// One node. `key` is the identity a control keeps across renders -- give
+/// every item of a list that can reorder one, and the page keeps its focus,
+/// selection and IME state while it moves. Without a key a node is known by
+/// its position. `props` are set as JavaScript properties rather than
+/// attributes (a custom element's data, `scrollTop`); `draw` is a canvas's
+/// drawing (`std.graphics.canvas`). `text` is a text node's, and literal.
 mapping Node {
     tag : :string = "div"
     key : :string = ""
     text : :string = ""
     attrs : %{:string => :any} = %{}
+    props : %{:string => :any} = %{}
     style : %{:string => :string} = %{}
-    events : %{:string => :string} = %{}
+    classes : [:string] = []
+    events : %{:string => Handler} = %{}
+    draw : [:any] = []
     children : [:any] = []
+    memo : :any = ()
 }
 
+/// What a node is given, in the order written: `element "a" [Attr.attribute
+/// "href" "/x", Attr.class "nav"] [..]`. `std.graphics.html` has a function
+/// for each that is worth a name. `none` is nothing, for a conditional.
+union Attr {
+    attribute(name : :string, value : :any)
+    property(name : :string, value : :any)
+    style(name : :string, value : :string)
+    class(name : :string)
+    key(value : :string)
+    on(event : :string, handler : Handler)
+    none
+}
+
+let element : :string -> [Attr] -> [Node] -> Node;
+let element tag attrs children =
+    list.fold (fn node a -> with a node) (Node.new () |> Node.set_tag tag |> Node.set_children children) attrs;
+
+/// Text, shown as written: it is never parsed as markup.
+let text : :string -> Node;
+let text value = Node.new () |> Node.set_tag "#text" |> Node.set_text value;
+
+/// Nothing at all, for a view that shows a child only sometimes.
+let nothing : Node;
+let nothing = Node.new () |> Node.set_tag "#none";
+
+/// One attribute applied to a node, which is what `element` folds.
+let with : Attr -> Node -> Node;
+let with a node = match a {
+    Attr.attribute(name, value) => Node.set_attrs ((Node.attrs node).[name => value]) node,
+    Attr.property(name, value) => Node.set_props ((Node.props node).[name => value]) node,
+    Attr.style(name, value) => Node.set_style ((Node.style node).[name => value]) node,
+    Attr.class(name) => Node.set_classes (list.append (Node.classes node) [name]) node,
+    Attr.key(k) => Node.set_key k node,
+    Attr.on(event, handler) => Node.set_events ((Node.events node).[event => handler]) node,
+    Attr.none => node,
+};
+
+/// `a` when `condition` holds, nothing otherwise: `ui.only done (html.class "done")`.
+let only : :bool -> Attr -> Attr;
+let only condition a = if condition { a } else { Attr.none };
+
+// The pipeline spelling of the same, for a node already made.
+let attribute : :string -> :any -> Node -> Node;
+let attribute name value node = with (Attr.attribute name value) node;
+
+let styled : %{:string => :string} -> Node -> Node;
+let styled declarations node = Node.set_style (map.merge (Node.style node) declarations) node;
+
+let on : :string -> :any -> Node -> Node;
+let on event message node = with (Attr.on event (Handler.message message)) node;
+
+let keyed : :string -> Node -> Node;
+let keyed k node = Node.set_key k node;
+
+/// The node `f` makes of `value`, which a render does not make again -- nor
+/// compare, nor send -- while `f` and `value` are the ones it had the render
+/// before: a row of a long table, or the table. `f` should be a named
+/// function, since a lambda or a partial application (`row model`) is a new
+/// function each render and never the one it was; `lazy2` takes two values
+/// for that. Its key is the lazy node's own (`keyed`), because the one `f`
+/// gives could only be read by making the node.
+let lazy : (a -> Node) -> a -> Node;
+let lazy f value = {
+    let made = f value;
+    Node.new () |> Node.set_tag "#lazy" |> Node.set_memo [f, value, fn u -> made]
+};
+
+let lazy2 : (a -> b -> Node) -> a -> b -> Node;
+let lazy2 f a b = {
+    let made = f a b;
+    Node.new () |> Node.set_tag "#lazy" |> Node.set_memo [f, [a, b], fn u -> made]
+};
+
+/// What a node shows: a lazy node's node, made now if it was not before.
+/// `nothing` made lazily still holds its place, as empty text.
+priv let rec shown node = if Node.tag node != "#lazy" { node } else {
+    let [f, value, made] = Node.memo node;
+    let n = Node.set_key (Node.key node) (shown (made ()));
+    if Node.tag n == "#none" { text "" |> Node.set_key (Node.key node) } else { n }
+};
+
+/// Two lazy nodes that would make the same node.
+priv let same_memo old new = Node.tag old == "#lazy" && Node.tag new == "#lazy" && {
+    let [f, value, _] = Node.memo old;
+    let [g, given, _] = Node.memo new;
+    f == g && value == given
+};
+
+// --- subscriptions ----------------------------------------------------------
+
+/// Something outside the tree that sends messages while the program asks for
+/// it: `subscriptions model` is asked after every update, and the page starts
+/// what is new and stops what has gone. Each is known by what it watches, so
+/// a ticker asked for twice in a row keeps ticking rather than restarting.
+///
+/// `every ms` sends the time (ms since the epoch) every `ms` milliseconds;
+/// `frame` the time of each animation frame (ms on the page's clock), which is
+/// what a game or an animation runs on; `key_down`/`key_up` a key anywhere on
+/// the page (the map an `on_key_down` gets); `resize` the window's
+/// `%{"width", "height"}`, once at once and then on each change; `url` the
+/// location `%{"path", "query", "hash", "href"}`, once at once and then on each
+/// navigation, which is routing; `visible` whether the page is showing; and
+/// `port name` whatever the program's own JavaScript sends under that name.
+union Sub {
+    every(ms : :integer, handler : Handler)
+    frame(handler : Handler)
+    key_down(handler : Handler)
+    key_up(handler : Handler)
+    resize(handler : Handler)
+    url(handler : Handler)
+    visible(handler : Handler)
+    port(name : :string, handler : Handler)
+}
+
+let every : :integer -> (:integer -> :any) -> Sub;
+let every ms f = Sub.every ms (Handler.reading f);
+let on_frame : (:float -> :any) -> Sub;
+let on_frame f = Sub.frame (Handler.reading f);
+let on_key_down : (:any -> :any) -> Sub;
+let on_key_down f = Sub.key_down (Handler.reading f);
+let on_key_up : (:any -> :any) -> Sub;
+let on_key_up f = Sub.key_up (Handler.reading f);
+let on_resize : (:any -> :any) -> Sub;
+let on_resize f = Sub.resize (Handler.reading f);
+let on_url : (:any -> :any) -> Sub;
+let on_url f = Sub.url (Handler.reading f);
+let on_visible : (:bool -> :any) -> Sub;
+let on_visible f = Sub.visible (Handler.reading f);
+let on_port : :string -> (:any -> :any) -> Sub;
+let on_port name f = Sub.port name (Handler.reading f);
+
+/// The page's name for a subscription, and what it watches.
+let sub_wire : Sub -> json.Value;
+let sub_wire s = match s {
+    Sub.every(ms, _) => %{ "id" => "every:" + to_string ms, "kind" => "every", "ms" => ms },
+    Sub.frame(_) => %{ "id" => "frame", "kind" => "frame" },
+    Sub.key_down(_) => %{ "id" => "keydown", "kind" => "keydown" },
+    Sub.key_up(_) => %{ "id" => "keyup", "kind" => "keyup" },
+    Sub.resize(_) => %{ "id" => "resize", "kind" => "resize" },
+    Sub.url(_) => %{ "id" => "url", "kind" => "url" },
+    Sub.visible(_) => %{ "id" => "visible", "kind" => "visible" },
+    Sub.port(name, _) => %{ "id" => "port:" + name, "kind" => "port", "name" => name },
+};
+
+priv let sub_handler : Sub -> Handler;
+let sub_handler s = match s {
+    Sub.every(_, h) => h, Sub.frame(h) => h, Sub.key_down(h) => h, Sub.key_up(h) => h,
+    Sub.resize(h) => h, Sub.url(h) => h, Sub.visible(h) => h, Sub.port(_, h) => h,
+};
+
+// --- the program ------------------------------------------------------------
+
+/// Window dimensions are logical pixels, from 1 to 16384. Titles are at most
+/// 4096 UTF-8 bytes and cannot contain NUL. In a browser tab the size is the
+/// tab's; the title is the document's.
 mapping Window {
     title : :string = "Dream"
     width : :integer = 960
     height : :integer = 640
 }
 
-/// An event name is application data, never source code. Event values and
-/// command replies use JSON's data vocabulary across the sandbox boundary.
-mapping Event {
-    name : :string = ""
-    key : :string = ""
-    value : json.Value = ()
+let validate_window : Window -> Result Window :atom;
+let validate_window options = if Window.width options < 1 || Window.width options > 16384
+    || Window.height options < 1 || Window.height options > 16384
+    || str.byte_length (Window.title options) > 4096 || str.contains_str "\0" (Window.title options) {
+    Result.error :invalid_window
+} else { Result.ok options };
+
+/// A whole program. `init` is the first model; `start!` runs once the page is
+/// open, and is where a program asks for what it starts with (stored state, a
+/// first fetch); `update!` answers the model after a message and may ask for
+/// effects; `view` and `subscriptions` are pure functions of the model;
+/// `closing!` runs when the window is closed, before the loop ends, which is
+/// the moment to save. `styles` is the program's stylesheet: a list of
+/// `std.graphics.css` rules, or the text of one.
+mapping App {
+    window : Window = Window.new ()
+    init : :any = ()
+    start : :any = fn model -> model
+    update : :any = fn message model -> model
+    view : :any = fn model -> nothing
+    subscriptions : :any = fn model -> []
+    styles : :any = ""
+    closing : :any = fn model -> model
 }
 
-/// Each driver implements these effects. The default explicitly reports that
-/// this VM has no graphics host, including on servers without a display.
+/// `App.set_title`, since the title is the setting most programs change.
+let title : :string -> App -> App;
+let title t app = App.set_window (Window.set_title t (App.window app)) app;
+
+/// What the page tells the loop. A driver makes these and hands them to the
+/// loop's process with `deliver!`.
+union Input {
+    dom(id : [:any], event : :string, value : :any)
+    sub(id : :string, value : :any)
+    port(name : :string, value : :any)
+    reply(id : :integer, answer : :any)
+    close
+}
+
+// Records are nominal, so no message a program sends can be taken for one of
+// these: a value is an `Incoming` only if this module's `Incoming.make` made it.
+// `deliver!` and `expect!` are the way in.
+group Incoming { input }
+group Expecting { id, handler }
+group Later { action }
+group Quit { reason }
+
+/// Hand the loop running in `ui` something its page did.
+let deliver! : :process -> Input -> :unit;
+let deliver! ui input = { send! ui (Incoming.make input); () };
+
+/// Say, from the loop's own process (`update!` or `start!`), that the answer
+/// to request `id` is to become a message through `handler`. A driver's
+/// effect calls this before it sends the request, so the answer cannot arrive
+/// first. `vm.unique! ()` is a good id.
+let expect! : :integer -> Handler -> :unit;
+let expect! id handler = { send! (self! ()) (Expecting.make id handler); () };
+
+/// Run `action!` once the view this update makes has been sent to the page --
+/// for an effect on a node the update is only now creating, such as focusing
+/// a field that appears. From the loop's own process, as `expect!`.
+let after_render! : (:unit -> :any) -> :unit;
+let after_render! action! = { send! (self! ()) (Later.make action!); () };
+
+/// End the program from `update!`, as closing its window would: `closing!`
+/// runs, the driver closes, and `run_with!` answers the model.
+let quit! : :unit -> :unit;
+let quit! u = { send! (self! ()) (Quit.make ()); () };
+
+/// The effects a driver provides. `open` is called once, in the loop's
+/// process, and answers whether there is a page; the rest send it what the
+/// loop has decided: what the view changed (`diff`, or the whole tree first,
+/// `describe`), the subscriptions (`sub_wire`),
+/// the program's stylesheet as text. `close` is called once, however the
+/// loop ends, if `open` succeeded.
 mapping Driver {
     open : :any = fn options -> Result.error :graphics_unavailable
-    render : :any = ()
-    next : :any = ()
+    render : :any = fn tree -> ()
+    subscribe : :any = fn subs -> ()
+    styles : :any = fn text -> ()
     close : :any = fn u -> ()
 }
 
+/// No graphics host: what a program without a page has.
 let available! : :unit -> :bool;
 let available! u = false;
 
 let open! : Window -> Result :unit :atom;
 let open! options = Result.error :graphics_unavailable;
 
-let element : :string -> :string -> [Node] -> Node;
-let element tag key children = Node.new () |> Node.set_tag tag |> Node.set_key key
-    |> Node.set_children children;
+// --- rendering --------------------------------------------------------------
 
-let text : :string -> Node;
-let text value = Node.new () |> Node.set_tag "#text" |> Node.set_text value;
+// The page is sent what changed, not the tree. The loop keeps the tree it last
+// rendered and compares the next one against it (`diff`). A subtree equal to
+// the one it replaces is one `==`, done by the VM, and becomes "keep the old
+// children from i, n of them"; most are equal, since a handler is usually a
+// message or a constructor and those compare equal, while a closure written
+// in the view compares by identity and only costs that node a closer look. So
+// a keystroke in a field above a long table sends the field, and the table is
+// walked by nothing slower than that comparison. Sending the whole tree, a
+// 2,000-row table (14,000 nodes) was 1.9 MB and 380 ms of Dream a render; a
+// change to one row is now about 100 bytes and 16 ms ("Renders are patches"
+// in dream/docs/notes/browser-vm.md).
+//
+// Identity is decided here, among siblings: a keyed child is matched to the
+// old child with its key, wherever it was, and keeps its element; an unkeyed
+// one to the old child at its position, if that one has no key either. A
+// keyed node moved to another parent is a new element there. A patch is
+// applied to what the page shows, which is what the patches before it made, so
+// none may be dropped (main.mjs queues them rather than keeping the last).
 
-let attribute : :string -> :any -> Node -> Node;
-let attribute name value node = Node.set_attrs ((Node.attrs node).[name => value]) node;
-
-let styled : %{:string => :string} -> Node -> Node;
-let styled declarations node = Node.set_style (map.merge (Node.style node) declarations) node;
-
-let on : :string -> :string -> Node -> Node;
-let on event message node = Node.set_events ((Node.events node).[event => message]) node;
-
-let column : :string -> [Node] -> Node;
-let column key children = element "div" key children
-    |> styled %{ "display" => "flex", "flex-direction" => "column" };
-
-let row : :string -> [Node] -> Node;
-let row key children = element "div" key children
-    |> styled %{ "display" => "flex", "flex-direction" => "row" };
-
-let button : :string -> :string -> :string -> Node;
-let button key label message = element "button" key [text label]
-    |> attribute "type" "button" |> on "click" message;
-
-/// Native label association and input semantics are retained by the driver.
-let input : :string -> :string -> :string -> Node;
-let input key value message = element "input" key []
-    |> attribute "id" key |> attribute "value" value |> on "input" message;
-
-let label : :string -> :string -> Node;
-let label key caption = element "label" (key + "-label") [text caption]
-    |> attribute "for" key;
-
-/// `update!` may call explicitly granted backend commands through its driver.
-/// `view` remains pure. A close event stops the loop; cleanup runs on failure.
-let run_with! : Driver -> Window -> a -> (Event -> a -> a) -> (a -> Node) -> Result a :atom;
-let run_with! driver options initial update! view = {
-    let open_driver! = Driver.open driver;
-    let render! = Driver.render driver;
-    let next! = Driver.next driver;
-    let close! = Driver.close driver;
-    let? opened = open_driver! options;
-    let rec loop! !model = {
-        render! (view model)
-        let event = next! ();
-        if Event.name event == "close" { Result.ok model }
-        else { loop! (update! event model) }
+/// A node as the page reads it: `t` its tag, and then only what it has -- `k`
+/// key, `i` the id its events are reported by, `x` text, `a` attributes (its
+/// classes joined into `class`), `p` properties, `s` style, `e` event names,
+/// `d` a drawing, `c` children. `at` is the node's id, reversed.
+priv let fields at node = {
+    let classes = Node.classes node;
+    let attrs = match classes {
+        [] => Node.attrs node,
+        cs => (Node.attrs node).["class" => str.join_str " " (match (Node.attrs node).["class" else ()] {
+            () => cs,
+            given => list.cons given cs,
+        })],
     };
-    defer! { close! () }
-    loop! initial
+    let events = Node.events node;
+    %{ "t" => Node.tag node } |> put "k" (Node.key node) |> put "x" (Node.text node) |> put "a" attrs
+        |> put "p" (Node.props node) |> put "s" (Node.style node) |> put "e" (map.sorted_keys events)
+        |> put "d" (Node.draw node) |> put "i" (if map.is_empty events { [] } else { list.reverse at })
 };
+
+/// A field is left out when it is empty, which is what the page assumes.
+priv let put name value m = if value == "" || value == [] || value == %{} { m } else { m.[name => value] };
+
+/// A node's id is the way to it from the root: each step the key of a keyed
+/// node and the position of any other. A keyed row that moves keeps its id
+/// and so does everything in it, and an event is routed by walking the tree
+/// it names (`target`), which looks at the siblings on the way and nothing
+/// else -- no table of every handler is built, a render at a time, for the
+/// one event that may come.
+priv let step !i node = if Node.key node == "" { i } else { Node.key node };
+
+/// The whole of a tree, as the first render sends it.
+let describe : Node -> json.Value;
+let describe node = describe_at [step 0 node] (shown node);
+
+priv let rec describe_at at node =
+    fields at node |> put "c" (describe_children at 0 (live (Node.children node)) []);
+
+priv let rec describe_children at !i nodes !out = match nodes {
+    [] => list.reverse out,
+    [n, ..rest] => describe_children at (i + 1) rest (list.cons (describe_at (list.cons (step i n) at) (shown n)) out),
+};
+
+/// The node an id names in `tree`, if it is there.
+let target : Node -> [:any] -> Option Node;
+let target tree id = match id {
+    [first, ..rest] => if first == step 0 tree { descend (shown tree) rest } else { Option.none },
+    _ => Option.none,
+};
+
+priv let rec descend node id = match id {
+    [] => Option.some node,
+    [s, ..rest] => {
+        let kids = live (Node.children node);
+        let found = if type_of s == :string { list.find (fn c -> Node.key c == s) kids }
+            else if s >= 0 && s < len kids { list.nth s kids } else { () };
+        match found {
+            () => Option.none,
+            n => if step s n == s { descend (shown n) rest } else { Option.none },
+        }
+    },
+};
+
+/// The handlers of the node an id names, by event.
+let handlers_at : Node -> [:any] -> %{:string => Handler};
+let handlers_at tree id = Option.map Node.events (target tree id) |> Option.unwrap_or %{};
+
+/// What rendering one tree where another was changes. A patch is the node
+/// kept, as the page applies it: `t` and the other fields when its own
+/// changed (all of them, an absent one being empty), `c` when its children
+/// did -- each an old child kept as it was, a run `[from, count]` of them; one
+/// patched, with `o` its old position; or a new node, described whole.
+union Change {
+    same
+    patch(entry : json.Value)
+    replace(entry : json.Value)
+}
+
+let diff : Node -> Node -> Change;
+let diff last next = if same_memo last next { Change.same } else {
+    let old = shown last;
+    let new = shown next;
+    if Node.tag old == Node.tag new && Node.key old == Node.key new { diff_at [step 0 new] old new }
+    else { Change.replace (describe new) }
+};
+
+priv let diff_at at old new = if old == new { Change.same } else {
+    let own = fields at new;
+    let olds = live (Node.children old);
+    let news = live (Node.children new);
+    let kids = diff_children at olds news;
+    match [own == fields at old, unchanged kids (len olds) (len news)] {
+        [true, true] => Change.same,
+        [true, false] => Change.patch %{ "c" => kids },
+        [false, true] => Change.patch own,
+        [false, false] => Change.patch (own.["c" => kids]),
+    }
+};
+
+priv let unchanged entries n_old n_new = n_old == n_new && (n_old == 0 || entries == [[0, n_old]]);
+
+/// Children whose keys are where they were -- the usual case, a list that
+/// grew at its end aside -- are matched position by position; otherwise by key.
+priv let diff_children at olds news =
+    if list.map Node.key olds == list.map Node.key news { in_place at 0 olds news [] }
+    else { by_key at (key_index olds) (array.of_list olds) 0 news [] };
+
+priv let rec in_place at !i olds news !out = match [olds, news] {
+    [[o, ..os], [n, ..ns]] => in_place at (i + 1) os ns (child at i (Option.some [i, o]) n out),
+    _ => list.reverse out,
+};
+
+priv let rec by_key at index olds !i news !out = match news {
+    [] => list.reverse out,
+    [n, ..ns] => {
+        let found = if Node.key n == "" {
+            if i < len olds && Node.key olds.[i] == "" { Option.some [i, olds.[i]] } else { Option.none }
+        } else {
+            match index.[Node.key n else ()] { () => Option.none, j => Option.some [j, olds.[j]] }
+        };
+        by_key at index olds (i + 1) ns (child at i found n out)
+    },
+};
+
+priv let key_index olds = list.fold (fn m entry -> {
+    let [j, o] = entry;
+    if Node.key o == "" { m } else { m.[Node.key o => j] }
+}) %{} (list.enumerate olds);
+
+/// One new child, given the old one it is matched to, if any.
+priv let child at i found n out = {
+    let here = list.cons (step i n) at;
+    match found {
+        Option.some(entry) => {
+            let [j, was] = entry;
+            if same_memo was n { keep j out } else {
+                let o = shown was;
+                let s = shown n;
+                if Node.tag o != Node.tag s { list.cons (describe_at here s) out } else {
+                    match diff_at here o s {
+                        Change.same => keep j out,
+                        Change.patch(e) => list.cons (e.["o" => j]) out,
+                        Change.replace(e) => list.cons e out,
+                    }
+                }
+            }
+        },
+        Option.none => list.cons (describe_at here (shown n)) out,
+    }
+};
+
+/// Old child `j` kept, joined to the run before it when it follows it.
+priv let keep j out = match out {
+    [[from, n], ..rest] => if from + n == j { list.cons [from, n + 1] rest } else { list.cons [j, 1] out },
+    _ => list.cons [j, 1] out,
+};
+
+/// `nothing` is dropped where it stands, so it takes no position: a child
+/// shown sometimes does not move its siblings' identity.
+priv let live nodes = list.filter (fn n -> Node.tag n != "#none") nodes;
+
+/// What a handler makes of an event's value; `()` is no message.
+let message_of : Handler -> :any -> :any;
+let message_of handler value = match handler {
+    Handler.message(m) => m,
+    Handler.reading(f) => f value,
+};
+
+// --- the loop ---------------------------------------------------------------
+
+mapping Loop {
+    model = ()
+    subs = %{}
+    sub_text = ""
+    tree = ()
+    pending = %{}
+    later = []
+}
+
+/// Run `app` on `driver` until its window closes, and answer the last model.
+/// The driver is closed however the loop ends, a failure included.
+let run_with! : Driver -> App -> Result :any :atom;
+let run_with! driver app = {
+    let? window = validate_window (App.window app);
+    let open_driver! = Driver.open driver;
+    let close! = Driver.close driver;
+    let? opened = open_driver! window;
+    defer! { close! () }
+    let styles = App.styles app;
+    let styles! = Driver.styles driver;
+    styles! (if type_of styles == :string { styles } else { css_text styles })
+    let start! = App.start app;
+    let first = start! (App.init app);
+    strict! first
+    // Forced here, as a statement: inside `Result.ok` the loop would be a
+    // suspension, run by whoever looked at the answer -- after `defer!` had
+    // closed the driver it renders to.
+    let last = loop! driver app (show! driver app (Loop.new () |> Loop.set_model first));
+    strict! last
+    Result.ok last
+};
+
+/// A stylesheet given as rules rather than text: each is already text by the
+/// time it gets here (`std.graphics.css.rule` answers a string), so this is a
+/// join, and `css` stays a module a program imports only when it wants it.
+priv let css_text rules = str.join_str "\n" rules;
+
+/// `state` is strict: everything in it was made by effects (a render, a
+/// subscription sent), which must have happened before the loop waits again.
+priv let rec loop! driver app !state = {
+    match recv! () {
+        Expecting(id, handler) => loop! driver app (Loop.set_pending ((Loop.pending state).[id => handler]) state),
+        Quit(_) => {
+            let closing! = App.closing app;
+            closing! (Loop.model state)
+        },
+        Later(action!) => loop! driver app (settle! driver app (Loop.set_later (list.cons action! (Loop.later state)) state)),
+        Incoming(input) => match input {
+            Input.close => {
+                let closing! = App.closing app;
+                closing! (Loop.model state)
+            },
+            _ => loop! driver app (settle! driver app (step! driver app state input)),
+        },
+        message => loop! driver app (settle! driver app (apply! driver app state message)),
+    }
+};
+
+/// Render once the mailbox is empty: a burst of input (a key held down, a
+/// pointer moving) is folded into one view rather than one per event, and the
+/// page would only draw the last anyway. A DOM event is routed by the tree the
+/// page last showed, since that is what the person acted on.
+priv let settle! driver app state = if vm.mailbox_size! () > 0 { state } else { render! driver app state };
+
+priv let rec step! driver app state input = match input {
+    Input.dom(id, event, value) => match (handlers_at (Loop.tree state) id).[event else ()] {
+        () => state,
+        h => apply! driver app state (message_of h value),
+    },
+    Input.sub(id, value) => match (Loop.subs state).[id else ()] {
+        () => state,
+        hs => apply_all! driver app state hs value,
+    },
+    Input.port(name, value) => step! driver app state (Input.sub ("port:" + name) value),
+    Input.reply(id, answer) => match (Loop.pending state).[id else ()] {
+        () => state,
+        h => apply! driver app (Loop.set_pending (map.remove id (Loop.pending state)) state) (message_of h answer),
+    },
+    Input.close => state,
+};
+
+priv let rec apply_all! driver app !state handlers value = match handlers {
+    [] => state,
+    [h, ..rest] => apply_all! driver app (apply! driver app state (message_of h value)) rest value,
+};
+
+/// One message, then the subscriptions of the model it made -- at once rather
+/// than at the next render, so a ticker the new model no longer asks for has
+/// stopped before the next tick is routed.
+priv let apply! driver app state message = if message == () { state } else {
+    let update! = App.update app;
+    let next = update! message (Loop.model state);
+    strict! next
+    subscribe! driver app (Loop.set_model next state)
+};
+
+/// Each kind of thing the page is sent is sent only when its text differs from
+/// what was sent last.
+priv let subscribe! driver app state = {
+    let subscriptions = App.subscriptions app;
+    let subs = subscriptions (Loop.model state);
+    let sub_text = json.encode (list.map sub_wire subs);
+    let send! = Driver.subscribe driver;
+    if sub_text != Loop.sub_text state { send! sub_text }
+    state |> Loop.set_sub_text sub_text
+        |> Loop.set_subs (list.fold (fn table s -> {
+               let id = (sub_wire s).["id"];
+               table.[id => list.append (table.[id else []]) [sub_handler s]]
+           }) %{} subs)
+};
+
+priv let render! driver app state = {
+    let view = App.view app;
+    let tree = view (Loop.model state);
+    let send! = Driver.render driver;
+    let change = match Loop.tree state { () => Change.replace (describe tree), last => diff last tree };
+    match change {
+        Change.same => (),
+        Change.patch(e) => send! (json.encode (e.["o" => 0])),
+        Change.replace(e) => send! (json.encode e),
+    }
+    run_later! (list.reverse (Loop.later state))
+    state |> Loop.set_tree tree |> Loop.set_later []
+};
+
+priv let rec run_later! actions = match actions {
+    [] => (),
+    [action!, ..rest] => { action! (); run_later! rest },
+};
+
+priv let show! driver app state = render! driver app (subscribe! driver app state);
 
 when test {
     import std.test;
+
+    union Msg { add, named(text : :string) }
+
+    let row i label = element "li" [Attr.key (to_string i)] [text label];
+    let unmade : :integer -> Node;
+    let unmade n = %{}.["made"];
+
+    /// A driver whose page is this test: everything the loop sends the page
+    /// comes back to `me` as `[:what, value]`.
+    let recording! me = Driver.new ()
+        |> Driver.set_open (fn options -> { send! me [:opened, Window.title options]; Result.ok () })
+        |> Driver.set_render (fn tree -> send! me [:render, tree])
+        |> Driver.set_subscribe (fn subs -> send! me [:subscribe, subs])
+        |> Driver.set_close (fn u -> send! me [:closed, ()]);
+
+    let counter = App.new () |> title "Counter" |> App.set_init 0
+        |> App.set_update (fn msg model -> match msg { Msg.add => model + 1, Msg.named(t) => model + len t })
+        |> App.set_view (fn model -> element "div" [] [
+               element "button" [Attr.key "add", Attr.on "click" (Handler.message Msg.add)] [text (to_string model)],
+               element "input" [Attr.on "input" (Handler.reading Msg.named)] []
+           ]);
+
+    /// Drive the loop in a process of its own, and collect what it sent.
+    let drive! app inputs = {
+        let me = self! ();
+        let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
+        list.each! (fn i -> deliver! ui i) inputs
+        let rec collect! acc = match recv! () {
+            [:done, result] => [result, list.reverse acc],
+            m => collect! (list.cons m acc),
+        };
+        collect! []
+    };
+
     let tests = [
         test.case "headless open is explicit and harmless" $(test.eq! (Result.error :graphics_unavailable)
             (open! (Window.new ()))),
-        test.case "buttons retain browser semantics" $(test.eq! ["button", "button", "increment"]
-            { let b = button "add" "Add" "increment";
-              [Node.tag b, (Node.attrs b).["type"], (Node.events b).["click"]] }),
-        test.case "styles compose" $(test.eq! "flex"
-            ((Node.style (row "r" [] |> styled %{"gap" => "8px"})).["display"]))
+        test.case "attributes apply in the order written" $({
+            let b = element "button" [Attr.class "a", Attr.attribute "type" "button", Attr.class "b",
+                                      Attr.style "color" "red", Attr.none] [];
+            test.eq! [["a", "b"], "button", "red"] [Node.classes b, (Node.attrs b).["type"], (Node.style b).["color"]]
+        }),
+        test.case "classes join with a class attribute" $({
+            let w = describe (element "p" [Attr.attribute "class" "x", Attr.class "y"] []);
+            test.eq! "x y" (w.["a"]).["class"]
+        }),
+        test.case "handlers stay in Dream; the page gets event names and ids" $({
+            let tree = element "div" [] [
+                element "button" [Attr.key "go", Attr.on "click" (Handler.message Msg.add)] [],
+                element "input" [Attr.on "input" (Handler.reading Msg.named)] []
+            ];
+            let kids = (describe tree).["c"];
+            test.eq! [[0, "go"], ["click"], [0, 1], ["input"]]
+                [(kids.[0]).["i"], (kids.[0]).["e"], (kids.[1]).["i"], (kids.[1]).["e"]]
+            test.eq! (Msg.named "hi") (message_of ((handlers_at tree [0, 1]).["input"]) "hi")
+            test.eq! [%{}, %{}] [handlers_at tree [0, 5], handlers_at tree [0, "gone"]]
+        }),
+        test.case "nothing takes no position" $({
+            let w = describe (element "div" [] [nothing, element "i" [Attr.on "click" (Handler.message Msg.add)] []]);
+            test.eq! [[0, 0]] (list.map (fn c -> c.["i"]) w.["c"])
+        }),
+        test.case "an unchanged tree is no render, closures in it included" $({
+            let v = fn u -> element "ul" [] (list.map (fn i -> element "li"
+                [Attr.key (to_string i), Attr.on "click" (Handler.reading (fn e -> i))] [text (to_string i)]) (list.range 0 3));
+            test.eq! Change.same (diff (v ()) (v ()))
+        }),
+        test.case "a change is sent with runs of what was kept" $(test.eq!
+            (Change.patch %{ "c" => [[0, 1], %{ "o" => 1, "c" => [%{ "o" => 0, "t" => "#text", "x" => "B" }] }, [2, 2]] })
+            (diff (element "ul" [] [row 0 "a", row 1 "b", row 2 "c", row 3 "d"])
+                  (element "ul" [] [row 0 "a", row 1 "B", row 2 "c", row 3 "d"]))),
+        test.case "keyed children are matched by key, wherever they went" $(test.eq!
+            (Change.patch %{ "c" => [[2, 1], [0, 1], %{ "t" => "li", "k" => "3", "c" => [%{ "t" => "#text", "x" => "d" }] }] })
+            (diff (element "ul" [] [row 0 "a", row 1 "b", row 2 "c"]) (element "ul" [] [row 2 "c", row 0 "a", row 3 "d"]))),
+        test.case "a node's own change sends all its fields, and a new root is whole" $({
+            test.eq! (Change.patch %{ "t" => "p", "a" => %{ "class" => "on" } })
+                (diff (element "p" [] []) (element "p" [Attr.class "on"] []))
+            test.eq! (Change.replace %{ "t" => "div" }) (diff (element "p" [] []) (element "div" [] []))
+        }),
+        test.case "a lazy node is not made while what makes it is unchanged" $({
+            // `unmade` fails if it is ever called: the second render must not.
+            test.eq! Change.same (diff (element "ul" [] [lazy unmade 1 |> keyed "a"]) (element "ul" [] [lazy unmade 1 |> keyed "a"]))
+            test.eq! %{ "t" => "ul", "c" => [%{ "t" => "li", "k" => "r", "c" => [%{ "t" => "#text", "x" => "b" }] }] }
+                (describe (element "ul" [] [lazy2 row 3 "b" |> keyed "r"]))
+            test.eq! (Change.patch %{ "c" => [%{ "o" => 0, "c" => [%{ "o" => 0, "t" => "#text", "x" => "c" }] }] })
+                (diff (element "ul" [] [lazy2 row 3 "b" |> keyed "r"]) (element "ul" [] [lazy2 row 3 "c" |> keyed "r"]))
+        }),
+        test.case "invalid window dimensions are explicit" $(test.eq! (Result.error :invalid_window)
+            (validate_window (Window.new () |> Window.set_width 0))),
+        test.case "events become typed messages, and the loop answers its last model" $({
+            let [result, sent] = drive! counter [Input.dom [0, "add"] "click" (), Input.dom [0, 1] "input" "abc",
+                                                 Input.dom [0, "missing"] "click" (), Input.close];
+            test.eq! (Result.ok 4) result
+            test.eq! [:opened, "Counter"] (list.head sent)
+            test.eq! [:closed, ()] (list.last sent)
+        }),
+        test.case "a message from any process is a message for update!" $({
+            let me = self! ();
+            let app = counter |> App.set_start (fn model -> { send! (self! ()) Msg.add; model });
+            let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
+            proc_wait! me
+            deliver! ui Input.close
+            let rec result! u = match recv! () { [:done, r] => r, _ => result! () };
+            test.eq! (Result.ok 1) (result! ())
+        }),
+        test.case "an expected reply becomes its message once" $({
+            // As a driver's effect does it: expect first, then the request, whose
+            // answer -- here at once, and then a stray second one -- comes after.
+            let app = counter |> App.set_start (fn model -> {
+                expect! 7 (Handler.reading Msg.named)
+                deliver! (self! ()) (Input.reply 7 "four")
+                deliver! (self! ()) (Input.reply 7 "again")
+                deliver! (self! ()) Input.close
+                model
+            });
+            let [result, _] = drive! app [];
+            test.eq! (Result.ok 4) result
+        }),
+        test.case "subscriptions are sent when they change and route by id" $({
+            let app = counter |> App.set_subscriptions (fn model -> if model < 2 { [every 100 (fn t -> Msg.add)] } else { [] });
+            let [result, sent] = drive! app [Input.sub "every:100" 1, Input.sub "every:100" 2, Input.sub "every:100" 3, Input.close];
+            test.eq! (Result.ok 2) result
+            test.eq! [[:subscribe, "[{\"id\":\"every:100\",\"kind\":\"every\",\"ms\":100}]"], [:subscribe, "[]"]]
+                (list.filter (fn m -> list.head m == :subscribe) sent)
+        }),
+        test.case "after_render! runs once the view it waits for is sent" $({
+            let me = self! ();
+            let app = counter |> App.set_update (fn msg model -> {
+                after_render! (fn u -> send! me [:after, model + 1])
+                model + 1
+            });
+            let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
+            deliver! ui (Input.dom [0, "add"] "click" ())
+            let rec seen! acc = match recv! () {
+                [:render, tree] => seen! (list.cons (if str.contains_str "\"1\"" tree { :render_1 } else { :render }) acc),
+                [:after, n] => list.reverse (list.cons [:after, n] acc),
+                _ => seen! acc,
+            };
+            test.eq! [:render, :render_1, [:after, 1]] (seen! [])
+            deliver! ui Input.close
+        }),
+        test.case "quit! ends the loop from update!" $({
+            let app = counter |> App.set_update (fn msg model -> { quit! (); model + 10 });
+            let [result, sent] = drive! app [Input.dom [0, "add"] "click" ()];
+            test.eq! [Result.ok 10, [:closed, ()]] [result, list.last sent]
+        }),
+        test.case "a failure in update! still closes the driver" $({
+            let me = self! ();
+            let app = counter |> App.set_update (fn msg model -> raise! "update failed");
+            let ui = spawn! $( {
+                let r = try! { run_with! (recording! me) app } catch e { :failed };
+                send! me [:done, r]; ()
+            } );
+            deliver! ui (Input.dom [0, "add"] "click" ())
+            let rec result! seen = match recv! () {
+                [:done, r] => [r, seen],
+                [:closed, _] => result! true,
+                _ => result! seen,
+            };
+            test.eq! [:failed, true] (result! false)
+        }),
+        test.case "unavailable driver returns without rendering" $(test.eq! (Result.error :graphics_unavailable)
+            (run_with! (Driver.new ()) counter))
     ];
+
+    /// Wait until the loop in the test above has rendered once, so the close
+    /// arrives after the message its `start!` sent itself.
+    let rec proc_wait! me = match recv! () { [:render, _] => (), _ => proc_wait! me };
 }

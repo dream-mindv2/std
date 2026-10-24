@@ -1,0 +1,290 @@
+// HTML as Dream functions: one per element, one per attribute and event worth
+// a name, each a thin spelling of `std.graphics.element` and `Attr`.
+//
+//     import std.graphics.html;
+//
+//     html.form [html.class "new-todo", html.on_submit Msg.add] [
+//         html.label [html.label_for "title"] [html.text "What needs doing?"],
+//         html.input [html.id "title", html.value draft, html.on_input Msg.draft],
+//         html.button [html.input_type "submit"] [html.text "Add"],
+//     ]
+//
+// Every element takes its attributes and then its children, so a view reads as
+// the markup it makes. The few that can have no children -- `input`, `img`,
+// `br`, `hr` -- take only attributes, or nothing. Anything not named here is
+// `element "tag" [..] [..]` and `attr "name" value`, and an element whose name
+// has a hyphen is a custom element, which the program's own JavaScript may
+// define (docs/graphics.md, "Breaking out").
+//
+// Events name the message they send. Those with a value worth reading take a
+// function of it instead: `on_input Msg.edit` sends `Msg.edit text`; a key
+// handler gets the key as a map (`"key"`, `"code"`, `"alt"`, `"ctrl"`,
+// `"shift"`, `"meta"`, `"repeat"`, and `"in_field"` when it went to something
+// that takes text); a pointer handler its position on the
+// element (`"x"`, `"y"`, `"button"`, ..); `on_submit_with` the form's fields by
+// name. A function that answers `()` sends nothing.
+import std.graphics.{element, text as text_node, nothing as nothing_node, Attr, Handler, Node};
+import std.list;
+
+let text : :string -> Node;
+let text value = text_node value;
+let nothing : Node;
+let nothing = nothing_node;
+
+// --- elements ----------------------------------------------------------------
+
+let div : [Attr] -> [Node] -> Node;
+let div attrs children = element "div" attrs children;
+let span : [Attr] -> [Node] -> Node;
+let span attrs children = element "span" attrs children;
+let p : [Attr] -> [Node] -> Node;
+let p attrs children = element "p" attrs children;
+let h1 : [Attr] -> [Node] -> Node;
+let h1 attrs children = element "h1" attrs children;
+let h2 : [Attr] -> [Node] -> Node;
+let h2 attrs children = element "h2" attrs children;
+let h3 : [Attr] -> [Node] -> Node;
+let h3 attrs children = element "h3" attrs children;
+let h4 : [Attr] -> [Node] -> Node;
+let h4 attrs children = element "h4" attrs children;
+let main : [Attr] -> [Node] -> Node;
+let main attrs children = element "main" attrs children;
+let section : [Attr] -> [Node] -> Node;
+let section attrs children = element "section" attrs children;
+let article : [Attr] -> [Node] -> Node;
+let article attrs children = element "article" attrs children;
+let header : [Attr] -> [Node] -> Node;
+let header attrs children = element "header" attrs children;
+let footer : [Attr] -> [Node] -> Node;
+let footer attrs children = element "footer" attrs children;
+let nav : [Attr] -> [Node] -> Node;
+let nav attrs children = element "nav" attrs children;
+let aside : [Attr] -> [Node] -> Node;
+let aside attrs children = element "aside" attrs children;
+let a : [Attr] -> [Node] -> Node;
+let a attrs children = element "a" attrs children;
+let strong : [Attr] -> [Node] -> Node;
+let strong attrs children = element "strong" attrs children;
+let em : [Attr] -> [Node] -> Node;
+let em attrs children = element "em" attrs children;
+let small : [Attr] -> [Node] -> Node;
+let small attrs children = element "small" attrs children;
+let code : [Attr] -> [Node] -> Node;
+let code attrs children = element "code" attrs children;
+let pre : [Attr] -> [Node] -> Node;
+let pre attrs children = element "pre" attrs children;
+let ul : [Attr] -> [Node] -> Node;
+let ul attrs children = element "ul" attrs children;
+let ol : [Attr] -> [Node] -> Node;
+let ol attrs children = element "ol" attrs children;
+let li : [Attr] -> [Node] -> Node;
+let li attrs children = element "li" attrs children;
+let table : [Attr] -> [Node] -> Node;
+let table attrs children = element "table" attrs children;
+let thead : [Attr] -> [Node] -> Node;
+let thead attrs children = element "thead" attrs children;
+let tbody : [Attr] -> [Node] -> Node;
+let tbody attrs children = element "tbody" attrs children;
+let tr : [Attr] -> [Node] -> Node;
+let tr attrs children = element "tr" attrs children;
+let th : [Attr] -> [Node] -> Node;
+let th attrs children = element "th" attrs children;
+let td : [Attr] -> [Node] -> Node;
+let td attrs children = element "td" attrs children;
+let form : [Attr] -> [Node] -> Node;
+let form attrs children = element "form" attrs children;
+let fieldset : [Attr] -> [Node] -> Node;
+let fieldset attrs children = element "fieldset" attrs children;
+let legend : [Attr] -> [Node] -> Node;
+let legend attrs children = element "legend" attrs children;
+let label : [Attr] -> [Node] -> Node;
+let label attrs children = element "label" attrs children;
+/// A button's type is `button` unless the program says otherwise, so a button
+/// inside a form does not submit it by accident; `input_type "submit"` wins,
+/// since attributes apply in order.
+let button : [Attr] -> [Node] -> Node;
+let button attrs children = element "button" (list.cons (Attr.attribute "type" "button") attrs) children;
+let textarea : [Attr] -> Node;
+let textarea attrs = element "textarea" attrs [];
+let select : [Attr] -> [Node] -> Node;
+let select attrs children = element "select" attrs children;
+let option : [Attr] -> [Node] -> Node;
+let option attrs children = element "option" attrs children;
+let progress : [Attr] -> [Node] -> Node;
+let progress attrs children = element "progress" attrs children;
+let output : [Attr] -> [Node] -> Node;
+let output attrs children = element "output" attrs children;
+let details : [Attr] -> [Node] -> Node;
+let details attrs children = element "details" attrs children;
+let summary : [Attr] -> [Node] -> Node;
+let summary attrs children = element "summary" attrs children;
+let dialog : [Attr] -> [Node] -> Node;
+let dialog attrs children = element "dialog" attrs children;
+let input : [Attr] -> Node;
+let input attrs = element "input" attrs [];
+let img : [Attr] -> Node;
+let img attrs = element "img" attrs [];
+let br : Node;
+let br = element "br" [] [];
+let hr : Node;
+let hr = element "hr" [] [];
+
+
+// --- attributes --------------------------------------------------------------
+
+let attr : :string -> :any -> Attr;
+let attr name value = Attr.attribute name value;
+/// A JavaScript property rather than an attribute: what a custom element reads
+/// its data from, and the live state of a control (`scrollTop`, `indeterminate`).
+let prop : :string -> :any -> Attr;
+let prop name value = Attr.property name value;
+let key : :string -> Attr;
+let key k = Attr.key k;
+let id : :string -> Attr;
+let id v = Attr.attribute "id" v;
+let class : :string -> Attr;
+let class name = Attr.class name;
+/// Each name whose condition holds: `classes [["todo", true], ["done", finished]]`.
+let classes : [[:any]] -> [Attr];
+let classes pairs = list.map (fn pair -> Attr.class (list.head pair))
+    (list.filter (fn pair -> list.nth 1 pair == true) pairs);
+let style : :string -> :string -> Attr;
+let style name value = Attr.style name value;
+let href : :string -> Attr;
+let href v = Attr.attribute "href" v;
+let src : :string -> Attr;
+let src v = Attr.attribute "src" v;
+let alt : :string -> Attr;
+let alt v = Attr.attribute "alt" v;
+let title : :string -> Attr;
+let title v = Attr.attribute "title" v;
+let placeholder : :string -> Attr;
+let placeholder v = Attr.attribute "placeholder" v;
+/// A control's value. The page keeps what is being typed while an IME is
+/// composing, so a model that echoes the input back never fights the person.
+let value : :any -> Attr;
+let value v = Attr.attribute "value" v;
+let checked : :bool -> Attr;
+let checked v = Attr.attribute "checked" v;
+let disabled : :bool -> Attr;
+let disabled v = Attr.attribute "disabled" v;
+let selected : :bool -> Attr;
+let selected v = Attr.attribute "selected" v;
+let hidden : :bool -> Attr;
+let hidden v = Attr.attribute "hidden" v;
+let readonly : :bool -> Attr;
+let readonly v = Attr.attribute "readonly" v;
+let required : :bool -> Attr;
+let required v = Attr.attribute "required" v;
+let autofocus : :bool -> Attr;
+let autofocus v = Attr.attribute "autofocus" v;
+let open : :bool -> Attr;
+let open v = Attr.attribute "open" v;
+let input_type : :string -> Attr;
+let input_type v = Attr.attribute "type" v;
+let name : :string -> Attr;
+let name v = Attr.attribute "name" v;
+let label_for : :string -> Attr;
+let label_for v = Attr.attribute "for" v;
+let min : :any -> Attr;
+let min v = Attr.attribute "min" v;
+let max : :any -> Attr;
+let max v = Attr.attribute "max" v;
+let step : :any -> Attr;
+let step v = Attr.attribute "step" v;
+let rows : :integer -> Attr;
+let rows v = Attr.attribute "rows" v;
+let width : :any -> Attr;
+let width v = Attr.attribute "width" v;
+let height : :any -> Attr;
+let height v = Attr.attribute "height" v;
+let tabindex : :integer -> Attr;
+let tabindex v = Attr.attribute "tabindex" v;
+let role : :string -> Attr;
+let role v = Attr.attribute "role" v;
+/// `aria "label" "Close"` is `aria-label="Close"`.
+let aria : :string -> :any -> Attr;
+let aria name v = Attr.attribute ("aria-" + name) v;
+/// `data "id" "7"` is `data-id="7"`, which the program's own CSS and
+/// JavaScript can read.
+let data : :string -> :any -> Attr;
+let data name v = Attr.attribute ("data-" + name) v;
+
+// --- events ------------------------------------------------------------------
+
+/// Any event by name, sending `message`.
+let on : :string -> :any -> Attr;
+let on event message = Attr.on event (Handler.message message);
+/// Any event by name, sending what `f` makes of its value.
+let on_value : :string -> (:any -> :any) -> Attr;
+let on_value event f = Attr.on event (Handler.reading f);
+
+let on_click : :any -> Attr;
+let on_click message = on "click" message;
+let on_double_click : :any -> Attr;
+let on_double_click message = on "dblclick" message;
+/// The click's position on the element and its buttons and modifiers.
+let on_click_at : (:any -> :any) -> Attr;
+let on_click_at f = on_value "click" f;
+let on_input : (:string -> :any) -> Attr;
+let on_input f = on_value "input" f;
+let on_change : (:string -> :any) -> Attr;
+let on_change f = on_value "change" f;
+/// A checkbox's new state.
+let on_check : (:bool -> :any) -> Attr;
+let on_check f = on_value "change" f;
+/// Submitting never navigates: the page is the program's.
+let on_submit : :any -> Attr;
+let on_submit message = on "submit" message;
+/// The form's named fields, `%{name => value}`, as it is submitted.
+let on_submit_with : (:any -> :any) -> Attr;
+let on_submit_with f = on_value "submit" f;
+let on_focus : :any -> Attr;
+let on_focus message = on "focus" message;
+let on_blur : :any -> Attr;
+let on_blur message = on "blur" message;
+let on_key_down : (:any -> :any) -> Attr;
+let on_key_down f = on_value "keydown" f;
+let on_key_up : (:any -> :any) -> Attr;
+let on_key_up f = on_value "keyup" f;
+/// `message` when Enter is pressed, and nothing for any other key.
+let on_enter : :any -> Attr;
+let on_enter message = on_value "keydown" (fn k -> if k.["key" else ""] == "Enter" { message } else { () });
+let on_pointer_down : (:any -> :any) -> Attr;
+let on_pointer_down f = on_value "pointerdown" f;
+let on_pointer_move : (:any -> :any) -> Attr;
+let on_pointer_move f = on_value "pointermove" f;
+let on_pointer_up : (:any -> :any) -> Attr;
+let on_pointer_up f = on_value "pointerup" f;
+let on_mouse_enter : :any -> Attr;
+let on_mouse_enter message = on "mouseenter" message;
+let on_mouse_leave : :any -> Attr;
+let on_mouse_leave message = on "mouseleave" message;
+/// `%{"dx", "dy"}`, in pixels.
+let on_wheel : (:any -> :any) -> Attr;
+let on_wheel f = on_value "wheel" f;
+/// `%{"top", "left"}`, the element's scroll position.
+let on_scroll : (:any -> :any) -> Attr;
+let on_scroll f = on_value "scroll" f;
+
+when test {
+    import std.test;
+    import std.graphics;
+    let tests = [
+        test.case "an element reads as its markup" $({
+            let n = div [class "card", id "c"] [p [] [text "hi"]];
+            test.eq! ["div", ["card"], "c", "p"]
+                [Node.tag n, Node.classes n, (Node.attrs n).["id"], Node.tag (list.head (Node.children n))]
+        }),
+        test.case "a button does not submit unless asked" $({
+            test.eq! "button" ((Node.attrs (button [] [])).["type"])
+            test.eq! "submit" ((Node.attrs (button [input_type "submit"] [])).["type"])
+        }),
+        test.case "conditional classes" $(test.eq! ["todo"]
+            (Node.classes (li (classes [["todo", true], ["done", false]]) []))),
+        test.case "on_enter ignores other keys" $({
+            let h = (graphics.handlers_at (input [on_enter :go]) [0]).["keydown"];
+            test.eq! [:go, ()] [graphics.message_of h %{"key" => "Enter"}, graphics.message_of h %{"key" => "a"}]
+        })
+    ];
+}

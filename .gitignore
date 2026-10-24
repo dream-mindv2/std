@@ -1,1 +1,3 @@
 target/
+graphics/node_modules/
+__pycache__/

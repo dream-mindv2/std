@@ -1,0 +1,729 @@
+// Widgets: user interfaces without HTML, CSS or JavaScript.
+//
+//     import std.graphics as ui;
+//     import std.graphics.widgets as w;
+//
+//     let view model = w.screen [
+//         w.title "Settings",
+//         w.card [
+//             w.text_field "Name" (Model.name model) Msg.name |> w.placeholder "Ada Lovelace",
+//             w.switch "Email me updates" (Model.updates model) Msg.updates,
+//             w.slider "Volume" 0 100 1 (Model.volume model) Msg.volume,
+//             w.row [w.spacer, w.button "Cancel" Msg.cancel, w.button "Save" Msg.save |> w.primary],
+//         ],
+//     ];
+//     let main! = w.run! (ui.App.new () |> ui.App.set_init (Model.new ())
+//         |> ui.App.set_update update! |> ui.App.set_view view);
+//
+// **What a program says is what it means.** A widget is a thing a person sees
+// and uses -- a screen, a card, a button, a field with its label, a switch --
+// and it looks finished as written: spacing, type, colour, focus rings, hover
+// and pressed states, dark mode and narrow screens come from the kit's design,
+// which is one `Theme`. The program never names a tag, a class or a property.
+// Accessibility is the widget's job too: a field is labelled by its label, a
+// switch is a switch to a screen reader, a dialog is modal and closes on
+// Escape, a list of messages is announced.
+//
+// **Adjusting one is a modifier**, `Node -> Node`, in a pipeline: `w.primary`,
+// `w.danger`, `w.small`, `w.full` for a button; `w.gap 4`, `w.padding 2`,
+// `w.grow`, `w.align :center`, `w.justify :between` for layout, on the kit's
+// spacing scale (0 to 8); `w.placeholder`, `w.hint`, `w.error`, `w.on_enter`,
+// `w.disabled`, `w.autofocus` for a field, which reach the control inside the
+// labelled field however it is wrapped; `w.key` where a list can reorder.
+//
+// **Underneath is std.graphics**, and every widget is an ordinary `Node`, so
+// a widget and `std.graphics.html` mix in one tree, `html.class` and
+// `html.style` still apply, and a program's own CSS can address `.dw-card`.
+// That is the way out when the kit has no answer; it should rarely be needed.
+import std.atom;
+import std.char;
+import std.graphics.{element, text as text_node, nothing as nothing_node, with, App, Attr, Handler, Node};
+import std.graphics.browser;
+import std.graphics.css;
+import std.list;
+import std.map;
+import std.num;
+import std.str;
+
+// --- running ---------------------------------------------------------------------
+
+/// The kit's design, in a handful of choices. Colours are CSS colours; `mode`
+/// is `:auto` (the person's system setting), `:light` or `:dark`; `width` is
+/// how wide a `screen` grows; `radius` how round corners are.
+mapping Theme {
+    accent : :string = "#5b5bd6"
+    danger : :string = "#d93f3f"
+    success : :string = "#1f9d55"
+    warning : :string = "#c27c0e"
+    radius : :string = "10px"
+    font : :string = "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif"
+    mode : :atom = :auto
+    width : :string = "44rem"
+}
+
+/// Run `app` in the browser with the kit's design under its own styles.
+let run! : App -> Result :any :atom;
+let run! app = browser.run! (themed (Theme.new ()) app);
+
+/// `app` with `theme`'s stylesheet first, then whatever styles it had.
+let themed : Theme -> App -> App;
+let themed theme app = {
+    let own = App.styles app;
+    let mine = if type_of own == :string { if own == "" { [] } else { [own] } } else { own };
+    App.set_styles (list.append (styles theme) mine) app
+};
+
+// --- layout ----------------------------------------------------------------------
+
+/// The whole window, in the theme's background: what `w.mode` is put on to
+/// change light and dark while the program runs.
+let page : [Node] -> Node;
+let page children = kit "div" "page" children;
+/// The page: centred, as wide as the theme allows, with room around it.
+let screen : [Node] -> Node;
+let screen children = kit "main" "screen" children;
+/// Children one above another, `gap 3` apart unless told otherwise.
+let column : [Node] -> Node;
+let column children = kit "div" "column" children;
+/// Children side by side, centred on a line, wrapping when there is no room.
+let row : [Node] -> Node;
+let row children = kit "div" "row" children;
+/// Children in `n` equal columns, one column on a narrow screen.
+let grid : :integer -> [Node] -> Node;
+let grid n children = kit "div" "grid" children |> with (Attr.style "--dw-columns" (to_string n));
+/// Children on top of one another, in the same place.
+let stack : [Node] -> Node;
+let stack children = kit "div" "stack" children;
+/// What is left of a row or a column: pushes what follows to the far end.
+let spacer : Node;
+let spacer = kit "div" "spacer" [];
+let divider : Node;
+let divider = kit "hr" "divider" [];
+/// A raised panel that groups what is in it.
+let card : [Node] -> Node;
+let card children = kit "section" "card" children;
+/// A titled part of a screen.
+let section : :string -> [Node] -> Node;
+let section heading_text children = kit "section" "section" (list.cons (heading heading_text) children);
+/// Children that scroll when they are taller than `height` allows.
+let scroll : [Node] -> Node;
+let scroll children = kit "div" "scroll" children;
+/// Children centred both ways in the space there is.
+let center : [Node] -> Node;
+let center children = kit "div" "center" children;
+
+// --- text ------------------------------------------------------------------------
+
+let title : :string -> Node;
+let title s = kit "h1" "title" [text_node s];
+let heading : :string -> Node;
+let heading s = kit "h2" "heading" [text_node s];
+/// A paragraph.
+let text : :string -> Node;
+let text s = kit "p" "text" [text_node s];
+/// Text that matters less: a note, a count, a date.
+let caption : :string -> Node;
+let caption s = kit "p" "caption" [text_node s];
+let strong : :string -> Node;
+let strong s = kit "strong" "strong" [text_node s];
+let code : :string -> Node;
+let code s = kit "code" "code" [text_node s];
+/// A link within the application: a route, which `ui.on_url` hears.
+let link : :string -> :string -> Node;
+let link caption_text href = kit "a" "link" [text_node caption_text] |> with (Attr.attribute "href" href);
+/// A small label beside something: a count, a state. `w.tone` colours it.
+let badge : :string -> Node;
+let badge s = kit "span" "badge" [text_node s];
+
+// --- actions ---------------------------------------------------------------------
+
+/// A button that sends `message`. Plain unless made `primary`, `danger`
+/// or `ghost`.
+let button : :string -> :any -> Node;
+let button caption_text message = kit "button" "button" [text_node caption_text]
+    |> with (Attr.attribute "type" "button") |> with (Attr.on "click" (Handler.message message));
+/// A button with an icon before its caption.
+let button_with : :string -> :string -> :any -> Node;
+let button_with icon_name caption_text message = kit "button" "button" [icon icon_name, text_node caption_text]
+    |> with (Attr.attribute "type" "button") |> with (Attr.on "click" (Handler.message message));
+/// A button that is only an icon. `label` is what a screen reader says, and
+/// the tooltip.
+let icon_button : :string -> :string -> :any -> Node;
+let icon_button icon_name label message = kit "button" "icon-button" [icon icon_name]
+    |> with (Attr.attribute "type" "button") |> with (Attr.on "click" (Handler.message message))
+    |> with (Attr.attribute "aria-label" label) |> with (Attr.attribute "title" label);
+
+// --- fields ----------------------------------------------------------------------
+
+/// A labelled one-line field. `f` makes the message from the text as it is
+/// typed; the field shows `value`.
+let text_field : :string -> :string -> (:string -> :any) -> Node;
+let text_field label value f = field label (input_of "text" value f);
+let password_field : :string -> :string -> (:string -> :any) -> Node;
+let password_field label value f = field label (input_of "password" value f);
+let email_field : :string -> :string -> (:string -> :any) -> Node;
+let email_field label value f = field label (input_of "email" value f);
+/// A field for searching, with its icon.
+let search_field : :string -> :string -> (:string -> :any) -> Node;
+let search_field label value f = field label (kit "span" "search" [icon "search", input_of "search" value f]);
+/// A field for a number: `f` gets an integer, a float, or `()` while it is empty.
+let number_field : :string -> :any -> (:any -> :any) -> Node;
+let number_field label value f = field label (input_of "number" (if value == () { "" } else { to_string value })
+    (fn s -> f (number_of s)));
+/// Several lines of text.
+let text_area : :string -> :string -> (:string -> :any) -> Node;
+let text_area label value f = field label (element "textarea" [Attr.class "dw-control", Attr.attribute "value" value,
+    Attr.attribute "rows" 4, Attr.on "input" (Handler.reading f)] []);
+
+/// One of `options`, chosen from a list; `f` gets the option chosen.
+let select : :string -> [:string] -> :string -> (:string -> :any) -> Node;
+let select label options selected f = select_of label (list.map (fn o -> [o, o]) options) selected f;
+/// The same, each option a `[value, caption]` pair.
+let select_of : :string -> [[:string]] -> :string -> (:string -> :any) -> Node;
+let select_of label options selected f = field label (element "select"
+    [Attr.class "dw-control", Attr.attribute "value" selected, Attr.on "change" (Handler.reading f)]
+    (list.map (fn o -> element "option" [Attr.attribute "value" (list.nth 0 o)] [text_node (list.nth 1 o)]) options));
+
+/// A slider from `low` to `high` in steps of `step`; `f` gets the number.
+let slider : :string -> :any -> :any -> :any -> :any -> (:any -> :any) -> Node;
+let slider label low high step value f = kit "label" "field" [
+    // The value is shown, and hidden from screen readers, which hear the
+    // slider's own; in the label it would become part of the slider's name.
+    kit "span" "field-label" [text_node label, kit "span" "value" [text_node (to_string value)]
+        |> with (Attr.attribute "aria-hidden" "true")],
+    element "input" [Attr.class "dw-slider", Attr.attribute "type" "range", Attr.attribute "min" low,
+        Attr.attribute "max" high, Attr.attribute "step" step, Attr.attribute "value" (to_string value),
+        Attr.on "input" (Handler.reading (fn s -> f (number_of s)))] [],
+];
+
+/// A box to tick; `f` gets whether it is ticked.
+let checkbox : :string -> :bool -> (:bool -> :any) -> Node;
+let checkbox label checked f = kit "label" "check" [
+    element "input" [Attr.attribute "type" "checkbox", Attr.attribute "checked" checked,
+        Attr.on "change" (Handler.reading f)] [],
+    kit "span" "check-label" [text_node label],
+];
+
+/// On or off, as a switch; `f` gets the new state.
+let switch : :string -> :bool -> (:bool -> :any) -> Node;
+let switch label on f = kit "label" "switch-row" [
+    kit "span" "check-label" [text_node label],
+    kit "button" "switch" [] |> with (Attr.attribute "type" "button") |> with (Attr.attribute "role" "switch")
+        |> with (Attr.attribute "aria-checked" (if on { "true" } else { "false" }))
+        |> with (Attr.on "click" (Handler.message (f (not on)))),
+];
+
+/// One of `options`, as radio buttons under a legend; `f` gets the option.
+let radio_group : :string -> [:string] -> :string -> (:string -> :any) -> Node;
+let radio_group label options selected f = {
+    let group = slug label;
+    kit "fieldset" "radios" (list.cons (kit "legend" "field-label" [text_node label]) (list.map (fn o ->
+        kit "label" "check" [
+            element "input" [Attr.attribute "type" "radio", Attr.attribute "name" group, Attr.attribute "value" o,
+                Attr.attribute "checked" (o == selected), Attr.on "change" (Handler.message (f o))] [],
+            kit "span" "check-label" [text_node o],
+        ]) options))
+};
+
+/// One of `options` as a row of tabs; `f` gets the tab chosen. Each option is
+/// a `[value, caption]` pair.
+let tabs : [[:string]] -> :string -> (:string -> :any) -> Node;
+let tabs options selected f = kit "div" "tabs" (list.map (fn o -> {
+    let value = list.nth 0 o;
+    kit "button" "tab" [text_node (list.nth 1 o)] |> with (Attr.attribute "type" "button")
+        |> with (Attr.attribute "role" "tab") |> with (Attr.attribute "aria-selected" (if value == selected { "true" } else { "false" }))
+        |> with (Attr.on "click" (Handler.message (f value)))
+}) options) |> with (Attr.attribute "role" "tablist");
+
+// --- feedback --------------------------------------------------------------------
+
+/// How far along: `fraction` from 0.0 to 1.0. `w.tone` colours the bar.
+let progress : :any -> Node;
+let progress fraction = kit "div" "progress" [kit "div" "progress-bar" []
+    |> with (Attr.style "width" (to_string (num.to_float (clamp fraction) * 100.0) + "%"))]
+    |> with (Attr.attribute "role" "progressbar") |> with (Attr.attribute "aria-valuemin" 0)
+    |> with (Attr.attribute "aria-valuemax" 100) |> with (Attr.attribute "aria-valuenow" (num.to_float (clamp fraction) * 100.0));
+/// Something is happening.
+let spinner : Node;
+let spinner = kit "span" "spinner" [] |> with (Attr.attribute "role" "status") |> with (Attr.attribute "aria-label" "Loading");
+
+/// A message in the flow of the page, coloured by `tone`: `:info`,
+/// `:success`, `:warning` or `:danger`.
+let notice : :atom -> :string -> Node;
+let notice t s = kit "div" "notice" [icon (tone_icon t), kit "span" "notice-text" [text_node s]]
+    |> tone t |> with (Attr.attribute "role" (if t == :danger { "alert" } else { "status" }));
+
+/// The place toasts appear, bottom right, announced as they come. Keep the
+/// list in the model and take each out after a while (`browser.after!`).
+let toasts : [Node] -> Node;
+let toasts children = kit "div" "toasts" children |> with (Attr.attribute "aria-live" "polite");
+/// One toast; `dismiss` is the message its close button sends.
+let toast : :atom -> :string -> :any -> Node;
+let toast t s dismiss = kit "div" "toast" [icon (tone_icon t), kit "span" "notice-text" [text_node s],
+    icon_button "x" "Dismiss" dismiss |> ghost |> small] |> tone t;
+
+/// A modal dialog while `open`: the rest of the page cannot be used, Escape or
+/// a click outside sends `close`. `actions` are its buttons, at the foot.
+let dialog : :bool -> :string -> [Node] -> [Node] -> :any -> Node;
+let dialog open heading_text body actions close = if not open { nothing_node } else {
+    kit "dialog" "dialog" [kit "div" "dialog-body" (list.concat [
+        [kit "h2" "heading" [text_node heading_text]],
+        body,
+        [kit "div" "dialog-actions" actions],
+    ])]
+    |> with (Attr.attribute "data-modal" "true") |> with (Attr.attribute "aria-label" heading_text)
+    |> with (Attr.on "close" (Handler.message close))
+    |> with (Attr.on "click" (Handler.reading (fn at -> if at.["self" else false] == true { close } else { () })))
+};
+
+/// Nothing here yet, said kindly.
+let empty : :string -> :string -> Node;
+let empty heading_text hint_text = kit "div" "empty" [icon "inbox", kit "p" "strong" [text_node heading_text],
+    caption hint_text];
+
+// --- data ------------------------------------------------------------------------
+
+/// Rows of widgets, each item its own row. An item with a key keeps it on its
+/// row, so a list that reorders keeps what each item had.
+let list_of : [Node] -> Node;
+let list_of items = kit "ul" "list" (list.map (fn item -> kit "li" "list-item" [item]
+    |> (if Node.key item == "" { fn n -> n } else { fn n -> Node.set_key ("row-" + Node.key item) n })) items);
+
+/// A table: a header for each column, then the rows, each a list of cells.
+let table : [:string] -> [[Node]] -> Node;
+let table columns rows = kit "div" "table-wrap" [kit "table" "table" [
+    element "thead" [] [element "tr" [] (list.map (fn c -> element "th" [Attr.attribute "scope" "col"] [text_node c]) columns)],
+    element "tbody" [] (list.map (fn r -> element "tr" [] (list.map (fn c -> element "td" [] [c]) r)) rows),
+]];
+
+/// A picture the application ships (`build.py --asset`), with what it shows.
+let image : :string -> :string -> Node;
+let image src alt = kit "img" "image" [] |> with (Attr.attribute "src" src) |> with (Attr.attribute "alt" alt);
+
+// --- modifiers -------------------------------------------------------------------
+
+let key : :string -> Node -> Node;
+let key k node = Node.set_key k node;
+/// Send `message` when it is clicked or tapped.
+let on_tap : :any -> Node -> Node;
+let on_tap message node = with (Attr.on "click" (Handler.message message)) node;
+let tooltip : :string -> Node -> Node;
+let tooltip s node = with (Attr.attribute "title" s) node;
+
+let primary : Node -> Node;
+let primary node = class "primary" node;
+let danger : Node -> Node;
+let danger node = class "danger" node;
+let ghost : Node -> Node;
+let ghost node = class "ghost" node;
+let small : Node -> Node;
+let small node = class "small" node;
+let large : Node -> Node;
+let large node = class "large" node;
+/// As wide as what holds it.
+let full : Node -> Node;
+let full node = class "full" node;
+/// `:info`, `:success`, `:warning`, `:danger` or `:accent`.
+let tone : :atom -> Node -> Node;
+let tone t node = class ("tone-" + atom.name t) node;
+
+/// `:light` or `:dark` for this node and everything in it, whatever the
+/// theme's mode -- a setting the person changes. `:auto` is the theme's.
+let mode : :atom -> Node -> Node;
+let mode m node = if m == :auto { node } else { class ("mode-" + atom.name m) node };
+
+/// Space between children, on the scale 0 to 8.
+let gap : :integer -> Node -> Node;
+let gap n node = with (Attr.style "gap" (space n)) node;
+/// Space inside, on the scale 0 to 8.
+let padding : :integer -> Node -> Node;
+let padding n node = with (Attr.style "padding" (space n)) node;
+/// Take the room a row or column has left.
+let grow : Node -> Node;
+let grow node = with (Attr.style "flex" "1 1 0") (with (Attr.style "min-width" "0") node);
+/// Where children sit across the line: `:start`, `:center`, `:end`, `:stretch`.
+let align : :atom -> Node -> Node;
+let align a node = with (Attr.style "align-items" (place a)) node;
+/// Where children sit along the line: `:start`, `:center`, `:end`, `:between`.
+let justify : :atom -> Node -> Node;
+let justify a node = with (Attr.style "justify-content" (place a)) node;
+/// A width or height in any CSS length: `w.width "16rem"`.
+let width : :string -> Node -> Node;
+let width s node = with (Attr.style "width" s) node;
+let max_width : :string -> Node -> Node;
+let max_width s node = with (Attr.style "max-width" s) node;
+let height : :string -> Node -> Node;
+let height s node = with (Attr.style "max-height" s) (with (Attr.style "height" s) node);
+/// Gone -- from the page and from screen readers -- while `b` holds.
+let hidden : :bool -> Node -> Node;
+let hidden b node = if b { with (Attr.attribute "hidden" true) node } else { node };
+
+// What reaches the control inside a field: a field is its label around the
+// control, and these mean the control.
+let placeholder : :string -> Node -> Node;
+let placeholder s node = control (with (Attr.attribute "placeholder" s)) node;
+let disabled : :bool -> Node -> Node;
+let disabled b node = control (with (Attr.attribute "disabled" b)) node;
+let autofocus : Node -> Node;
+let autofocus node = control (with (Attr.attribute "autofocus" true)) node;
+/// Send `message` when Enter is pressed in the control.
+let on_enter : :any -> Node -> Node;
+let on_enter message node = control (with (Attr.on "keydown"
+    (Handler.reading (fn k -> if k.["key" else ""] == "Enter" { message } else { () })))) node;
+/// The field's label kept for screen readers and the field's name, but not
+/// shown: for a field whose purpose is plain from where it is, a search box in
+/// a toolbar. Its placeholder should say the same.
+let quiet_label : Node -> Node;
+let quiet_label node = class "quiet" node;
+/// A word of help under a field.
+let hint : :string -> Node -> Node;
+let hint s node = Node.set_children (list.append (Node.children node) [kit "span" "hint" [text_node s]]) node;
+/// What is wrong with a field, under it, and the field marked invalid; `""`
+/// is nothing wrong.
+let error : :string -> Node -> Node;
+let error s node = if s == "" { node } else {
+    control (with (Attr.attribute "aria-invalid" "true"))
+        (Node.set_children (list.append (Node.children node) [kit "span" "error" [text_node s]
+            |> with (Attr.attribute "role" "alert")]) node)
+};
+
+// --- icons -----------------------------------------------------------------------
+
+/// A line icon, in the colour of the text around it: `plus`, `minus`, `x`,
+/// `check`, `trash`, `edit`, `search`, `chevron-down`, `chevron-right`,
+/// `chevron-left`, `menu`, `info`, `warning`, `alert`, `star`, `heart`,
+/// `settings`, `sun`, `moon`, `user`, `home`, `inbox`, `refresh`, `download`,
+/// `upload`, `copy`, `external`, `calendar`, `clock`, `lock`. Unknown names draw nothing.
+let icon : :string -> Node;
+let icon name = element "svg" [Attr.class "dw-icon", Attr.attribute "viewBox" "0 0 24 24",
+    Attr.attribute "fill" "none", Attr.attribute "stroke" "currentColor", Attr.attribute "stroke-width" 2,
+    Attr.attribute "stroke-linecap" "round", Attr.attribute "stroke-linejoin" "round",
+    Attr.attribute "aria-hidden" "true"] [element "path" [Attr.attribute "d" (icon_path name)] []];
+
+priv let icon_path name = match name {
+    "plus" => "M12 5v14M5 12h14",
+    "minus" => "M5 12h14",
+    "x" => "M6 6l12 12M18 6L6 18",
+    "check" => "M5 12.5l4.5 4.5L19 7.5",
+    "trash" => "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3",
+    "edit" => "M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4",
+    "search" => "M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4-4",
+    "chevron-down" => "M6 9l6 6 6-6",
+    "chevron-right" => "M9 6l6 6-6 6",
+    "chevron-left" => "M15 6l-6 6 6 6",
+    "menu" => "M4 6h16M4 12h16M4 18h16",
+    "info" => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 11v5M12 7.5v.01",
+    "warning" => "M12 3.5l9.5 16.5h-19zM12 10v4M12 17v.01",
+    "alert" => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 7.5v5M12 16v.01",
+    "star" => "M12 3l2.8 5.8 6.2.9-4.5 4.4 1.1 6.3L12 17.4 6.4 20.4l1.1-6.3L3 9.7l6.2-.9z",
+    "heart" => "M12 20s-7.5-4.6-9.2-9.2A4.8 4.8 0 0 1 12 7a4.8 4.8 0 0 1 9.2 3.8C19.5 15.4 12 20 12 20z",
+    "settings" => "M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6zM12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1",
+    "sun" => "M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8zM12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4",
+    "moon" => "M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z",
+    "user" => "M12 4a4 4 0 1 0 0 8a4 4 0 1 0 0-8zM4 21a8 8 0 0 1 16 0",
+    "home" => "M3 11l9-7 9 7M5 10v10h14V10",
+    "inbox" => "M3 13l3-8h12l3 8v6H3zM3 13h5l1 2h6l1-2h5",
+    "refresh" => "M20 11a8 8 0 0 0-14.5-4.5L4 8M4 4v4h4M4 13a8 8 0 0 0 14.5 4.5L20 16M20 20v-4h-4",
+    "download" => "M12 4v11M7 10l5 5 5-5M5 20h14",
+    "upload" => "M12 20V9M7 14l5-5 5 5M5 4h14",
+    "copy" => "M9 9h11v11H9zM5 15H4V4h11v1",
+    "external" => "M14 4h6v6M20 4l-9 9M18 14v6H4V6h6",
+    "calendar" => "M4 6h16v14H4zM4 10h16M8 3v4M16 3v4",
+    "clock" => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 7v5l3 2",
+    "lock" => "M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4",
+    _ => "",
+};
+
+priv let tone_icon t = match t {
+    :success => "check",
+    :warning => "warning",
+    :danger => "alert",
+    _ => "info",
+};
+
+// --- the parts -------------------------------------------------------------------
+
+priv let kit tag name children = element tag [Attr.class ("dw-" + name)] children;
+priv let class name node = with (Attr.class ("dw-" + name)) node;
+
+/// A label around a control: clicking the words focuses the control, and a
+/// screen reader reads them as its name, with no id to keep unique.
+priv let field label control_node = kit "label" "field" [kit "span" "field-label" [text_node label], control_node];
+priv let input_of kind value f = element "input" [Attr.class "dw-control", Attr.attribute "type" kind,
+    Attr.attribute "value" value, Attr.on "input" (Handler.reading f)] [];
+
+priv let controls = ["input", "textarea", "select", "button"];
+/// `f` applied to every control in `node`, the node itself if it is one.
+priv let rec control f node = if list.contains (Node.tag node) controls { f node }
+    else { Node.set_children (list.map (fn c -> control f c) (Node.children node)) node };
+
+priv let number_of s = match num.parse_int s {
+    () => num.parse_float s,
+    n => n,
+};
+priv let clamp x = if x < 0 { 0 } else if x > 1 { 1 } else { x };
+priv let space n = "var(--dw-space-" + to_string (if n < 0 { 0 } else if n > 8 { 8 } else { n }) + ")";
+priv let place a = match a {
+    :start => "flex-start",
+    :end => "flex-end",
+    :between => "space-between",
+    :around => "space-around",
+    other => atom.name other,
+};
+/// A name made of a label: lower case, a hyphen for anything that is not a
+/// letter or a digit.
+priv let slug s = str.of_chars (list.map (fn c -> if char.is_alnum c { char.lower c } else { '-' }) (str.chars s));
+
+// --- the design ------------------------------------------------------------------
+
+/// The kit's stylesheet for `theme`. `themed` puts it under a program's own.
+let styles : Theme -> [:string];
+let styles theme = list.concat [
+    [css.rule ":root" (light theme)],
+    match Theme.mode theme {
+        :dark => [css.rule ":root" dark],
+        :light => [],
+        _ => [css.media "(prefers-color-scheme: dark)" [css.rule ":root" dark]],
+    },
+    [css.rule ".dw-mode-dark" (dark.["color-scheme" => "dark"]), css.rule ".dw-mode-light" (light_palette.["color-scheme" => "light"])],
+    base,
+];
+
+priv let light_palette = %{
+    "--dw-bg" => "#f6f6f8", "--dw-surface" => "#ffffff", "--dw-sunken" => "#efeff3",
+    "--dw-text" => "#1b1b22", "--dw-muted" => "#6a6a78", "--dw-border" => "#dedee6",
+    "--dw-shadow" => "0 1px 2px rgb(20 20 40 / 0.06), 0 4px 16px rgb(20 20 40 / 0.06)",
+};
+
+priv let light theme = map.merge light_palette %{
+    "color-scheme" => if Theme.mode theme == :dark { "dark" } else if Theme.mode theme == :light { "light" } else { "light dark" },
+    "--dw-accent" => Theme.accent theme, "--dw-danger" => Theme.danger theme,
+    "--dw-success" => Theme.success theme, "--dw-warning" => Theme.warning theme, "--dw-info" => Theme.accent theme,
+    "--dw-radius" => Theme.radius theme, "--dw-font" => Theme.font theme, "--dw-width" => Theme.width theme,
+    "--dw-on-accent" => "#ffffff",
+    "--dw-space-0" => "0", "--dw-space-1" => "0.25rem", "--dw-space-2" => "0.5rem", "--dw-space-3" => "0.75rem",
+    "--dw-space-4" => "1rem", "--dw-space-5" => "1.5rem", "--dw-space-6" => "2rem", "--dw-space-7" => "3rem",
+    "--dw-space-8" => "4rem",
+};
+
+priv let dark = %{
+    "--dw-bg" => "#111116", "--dw-surface" => "#1b1b22", "--dw-sunken" => "#15151b",
+    "--dw-text" => "#ececf2", "--dw-muted" => "#9c9cab", "--dw-border" => "#2e2e38",
+    "--dw-shadow" => "0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.3)",
+};
+
+/// A colour mixed toward transparent: what tints and rings are made of.
+priv let tint c pct = "color-mix(in srgb, " + c + " " + to_string pct + "%, transparent)";
+
+priv let base = [
+    css.rule "body" %{ "background" => "var(--dw-bg)", "color" => "var(--dw-text)", "font-family" => "var(--dw-font)",
+        "font-size" => "15px", "line-height" => "1.5", "-webkit-font-smoothing" => "antialiased" },
+    css.rule "*, *::before, *::after" %{ "box-sizing" => "border-box" },
+    css.rule ":focus-visible" %{ "outline" => "2px solid var(--dw-accent)", "outline-offset" => "2px" },
+    css.media "(prefers-reduced-motion: reduce)" [css.rule "*" %{ "transition" => "none !important", "animation-duration" => "0s !important" }],
+
+    // layout
+    css.rule ".dw-page, .dw-mode-dark, .dw-mode-light" %{ "background" => "var(--dw-bg)", "color" => "var(--dw-text)" },
+    css.rule ".dw-page" %{ "min-height" => "100vh", "transition" => "background 200ms, color 200ms" },
+    css.rule ".dw-screen" %{ "max-width" => "var(--dw-width)", "margin" => "0 auto", "padding" => "var(--dw-space-6) var(--dw-space-4)",
+        "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-5)" },
+    css.rule ".dw-column" %{ "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-3)", "min-width" => "0" },
+    css.rule ".dw-row" %{ "display" => "flex", "flex-wrap" => "wrap", "align-items" => "center", "gap" => "var(--dw-space-2)", "min-width" => "0" },
+    css.rule ".dw-grid" %{ "display" => "grid", "gap" => "var(--dw-space-4)",
+        "grid-template-columns" => "repeat(var(--dw-columns, 2), minmax(0, 1fr))" },
+    css.media "(max-width: 640px)" [css.rule ".dw-grid" %{ "grid-template-columns" => "minmax(0, 1fr)" }],
+    css.rule ".dw-stack" %{ "display" => "grid" },
+    css.rule ".dw-stack > *" %{ "grid-area" => "1 / 1" },
+    css.rule ".dw-spacer" %{ "flex" => "1 1 0" },
+    css.rule ".dw-center" %{ "display" => "flex", "align-items" => "center", "justify-content" => "center", "flex-direction" => "column",
+        "gap" => "var(--dw-space-3)", "min-height" => "100%" },
+    css.rule ".dw-divider" %{ "border" => "none", "border-top" => "1px solid var(--dw-border)", "margin" => "var(--dw-space-2) 0", "width" => "100%" },
+    css.rule ".dw-card" %{ "background" => "var(--dw-surface)", "border" => "1px solid var(--dw-border)",
+        "border-radius" => "calc(var(--dw-radius) + 4px)", "box-shadow" => "var(--dw-shadow)", "padding" => "var(--dw-space-5)",
+        "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-4)", "min-width" => "0" },
+    css.rule ".dw-section" %{ "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-3)" },
+    css.rule ".dw-scroll" %{ "overflow" => "auto", "min-height" => "0" },
+
+    // text
+    css.rule ".dw-title" %{ "font-size" => "1.75rem", "font-weight" => "700", "letter-spacing" => "-0.02em", "line-height" => "1.2", "margin" => "0" },
+    css.rule ".dw-heading" %{ "font-size" => "1.1rem", "font-weight" => "650", "letter-spacing" => "-0.01em", "margin" => "0" },
+    css.rule ".dw-text" %{ "margin" => "0" },
+    css.rule ".dw-caption" %{ "margin" => "0", "font-size" => "0.85rem", "color" => "var(--dw-muted)" },
+    css.rule ".dw-strong" %{ "font-weight" => "650", "margin" => "0" },
+    css.rule ".dw-code" %{ "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace", "font-size" => "0.9em",
+        "background" => "var(--dw-sunken)", "padding" => "0.1em 0.35em", "border-radius" => "6px" },
+    css.rule ".dw-link" %{ "color" => "var(--dw-accent)", "text-decoration" => "none", "font-weight" => "550", "border-radius" => "4px" },
+    css.rule ".dw-link:hover" %{ "text-decoration" => "underline" },
+    css.rule ".dw-link[aria-current]" %{ "text-decoration" => "underline", "text-underline-offset" => "4px" },
+    css.rule ".dw-badge" %{ "display" => "inline-flex", "align-items" => "center", "height" => "1.4rem", "width" => "fit-content", "padding" => "0 0.55rem",
+        "border-radius" => "999px", "font-size" => "0.78rem", "font-weight" => "600",
+        "background" => tint "var(--dw-tone, var(--dw-muted))" 14, "color" => "var(--dw-tone, var(--dw-muted))" },
+
+    // tones: what a badge, a notice, a toast or a button is coloured by
+    css.rule ".dw-tone-info, .dw-tone-accent" %{ "--dw-tone" => "var(--dw-accent)" },
+    css.rule ".dw-tone-success" %{ "--dw-tone" => "var(--dw-success)" },
+    css.rule ".dw-tone-warning" %{ "--dw-tone" => "var(--dw-warning)" },
+    css.rule ".dw-tone-danger" %{ "--dw-tone" => "var(--dw-danger)" },
+
+    // buttons
+    css.rule ".dw-button, .dw-icon-button" %{ "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
+        "gap" => "var(--dw-space-2)", "height" => "2.25rem", "padding" => "0 0.95rem", "border-radius" => "var(--dw-radius)",
+        "border" => "1px solid var(--dw-border)", "background" => "var(--dw-surface)", "color" => "var(--dw-text)",
+        "font" => "inherit", "font-weight" => "550", "cursor" => "pointer", "white-space" => "nowrap", "user-select" => "none",
+        "transition" => "background 120ms, border-color 120ms, box-shadow 120ms, transform 60ms" },
+    css.rule ".dw-button:hover, .dw-icon-button:hover" %{ "background" => "var(--dw-sunken)" },
+    css.rule ".dw-button:active, .dw-icon-button:active" %{ "transform" => "translateY(1px)" },
+    css.rule ".dw-button:disabled, .dw-icon-button:disabled" %{ "opacity" => "0.5", "cursor" => "not-allowed", "transform" => "none" },
+    css.rule ".dw-icon-button" %{ "width" => "2.25rem", "padding" => "0" },
+    css.rule ".dw-button.dw-primary, .dw-icon-button.dw-primary" %{ "background" => "var(--dw-accent)", "border-color" => "var(--dw-accent)",
+        "color" => "var(--dw-on-accent)", "box-shadow" => "0 1px 2px " + tint "var(--dw-accent)" 40 },
+    css.rule ".dw-button.dw-primary:hover, .dw-icon-button.dw-primary:hover" %{ "background" => "color-mix(in srgb, var(--dw-accent) 88%, black)" },
+    css.rule ".dw-button.dw-danger, .dw-icon-button.dw-danger" %{ "background" => "var(--dw-danger)", "border-color" => "var(--dw-danger)", "color" => "#fff" },
+    css.rule ".dw-button.dw-danger:hover, .dw-icon-button.dw-danger:hover" %{ "background" => "color-mix(in srgb, var(--dw-danger) 88%, black)" },
+    css.rule ".dw-button.dw-ghost, .dw-icon-button.dw-ghost" %{ "background" => "transparent", "border-color" => "transparent" },
+    css.rule ".dw-button.dw-ghost:hover, .dw-icon-button.dw-ghost:hover" %{ "background" => tint "var(--dw-text)" 8 },
+    css.rule ".dw-small" %{ "height" => "1.85rem", "font-size" => "0.875rem" },
+    css.rule ".dw-icon-button.dw-small" %{ "width" => "1.85rem" },
+    css.rule ".dw-button.dw-small" %{ "padding" => "0 0.7rem" },
+    css.rule ".dw-large" %{ "height" => "2.75rem", "font-size" => "1.05rem" },
+    css.rule ".dw-button.dw-large" %{ "padding" => "0 1.25rem" },
+    css.rule ".dw-full" %{ "width" => "100%" },
+    css.rule ".dw-icon" %{ "width" => "1.15em", "height" => "1.15em", "flex" => "none" },
+
+    // fields
+    css.rule ".dw-field" %{ "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-1)", "min-width" => "0" },
+    css.rule ".dw-quiet > .dw-field-label" %{ "position" => "absolute", "width" => "1px", "height" => "1px", "overflow" => "hidden",
+        "clip-path" => "inset(50%)", "white-space" => "nowrap" },
+    css.rule ".dw-field-label" %{ "display" => "flex", "justify-content" => "space-between", "font-size" => "0.875rem",
+        "font-weight" => "550", "padding" => "0" },
+    css.rule ".dw-value" %{ "color" => "var(--dw-muted)", "font-variant-numeric" => "tabular-nums" },
+    css.rule ".dw-control" %{ "width" => "100%", "min-height" => "2.25rem", "padding" => "0.45rem 0.7rem", "font" => "inherit",
+        "color" => "var(--dw-text)", "background" => "var(--dw-surface)", "border" => "1px solid var(--dw-border)",
+        "border-radius" => "var(--dw-radius)", "transition" => "border-color 120ms, box-shadow 120ms" },
+    css.rule "textarea.dw-control" %{ "resize" => "vertical", "line-height" => "1.45" },
+    css.rule ".dw-control:hover" %{ "border-color" => "color-mix(in srgb, var(--dw-border) 60%, var(--dw-text))" },
+    css.rule ".dw-control:focus" %{ "outline" => "none", "border-color" => "var(--dw-accent)", "box-shadow" => "0 0 0 3px " + tint "var(--dw-accent)" 22 },
+    css.rule ".dw-control[aria-invalid=true]" %{ "border-color" => "var(--dw-danger)" },
+    css.rule ".dw-control[aria-invalid=true]:focus" %{ "box-shadow" => "0 0 0 3px " + tint "var(--dw-danger)" 22 },
+    css.rule ".dw-control:disabled" %{ "opacity" => "0.6", "cursor" => "not-allowed" },
+    css.rule ".dw-control::placeholder" %{ "color" => "var(--dw-muted)", "opacity" => "0.8" },
+    css.rule ".dw-search" %{ "position" => "relative", "display" => "block" },
+    css.rule ".dw-search .dw-icon" %{ "position" => "absolute", "left" => "0.7rem", "top" => "50%", "transform" => "translateY(-50%)",
+        "color" => "var(--dw-muted)", "pointer-events" => "none" },
+    css.rule ".dw-search .dw-control" %{ "padding-left" => "2.1rem" },
+    css.rule ".dw-hint" %{ "font-size" => "0.8rem", "color" => "var(--dw-muted)" },
+    css.rule ".dw-error" %{ "font-size" => "0.8rem", "color" => "var(--dw-danger)", "font-weight" => "550" },
+    css.rule ".dw-slider" %{ "width" => "100%", "accent-color" => "var(--dw-accent)", "height" => "1.5rem" },
+    css.rule ".dw-check, .dw-switch-row" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-2)", "cursor" => "pointer",
+        "min-height" => "2rem" },
+    css.rule ".dw-switch-row" %{ "justify-content" => "space-between", "gap" => "var(--dw-space-4)" },
+    css.rule ".dw-check input" %{ "width" => "1.1rem", "height" => "1.1rem", "accent-color" => "var(--dw-accent)", "margin" => "0", "cursor" => "pointer" },
+    css.rule ".dw-switch" %{ "position" => "relative", "flex" => "none", "width" => "2.6rem", "height" => "1.5rem", "padding" => "0",
+        "border" => "none", "border-radius" => "999px", "background" => "color-mix(in srgb, var(--dw-muted) 45%, var(--dw-border))",
+        "cursor" => "pointer", "transition" => "background 160ms" },
+    css.rule ".dw-switch::after" %{ "content" => "\"\"", "position" => "absolute", "top" => "0.2rem", "left" => "0.2rem",
+        "width" => "1.1rem", "height" => "1.1rem", "border-radius" => "50%", "background" => "#fff",
+        "box-shadow" => "0 1px 3px rgb(0 0 0 / 0.3)", "transition" => "transform 160ms" },
+    css.rule ".dw-switch[aria-checked=true]" %{ "background" => "var(--dw-accent)" },
+    css.rule ".dw-switch[aria-checked=true]::after" %{ "transform" => "translateX(1.1rem)" },
+    css.rule ".dw-radios" %{ "border" => "none", "margin" => "0", "padding" => "0", "display" => "flex", "flex-direction" => "column",
+        "gap" => "var(--dw-space-1)" },
+    css.rule ".dw-radios .dw-field-label" %{ "margin-bottom" => "var(--dw-space-1)" },
+    css.rule ".dw-tabs" %{ "display" => "inline-flex", "gap" => "2px", "padding" => "3px", "background" => "var(--dw-sunken)",
+        "border-radius" => "calc(var(--dw-radius) + 2px)", "border" => "1px solid var(--dw-border)", "flex-wrap" => "wrap" },
+    css.rule ".dw-tab" %{ "border" => "none", "background" => "transparent", "color" => "var(--dw-muted)", "font" => "inherit",
+        "font-weight" => "550", "height" => "1.9rem", "padding" => "0 0.85rem", "border-radius" => "var(--dw-radius)", "cursor" => "pointer",
+        "transition" => "background 120ms, color 120ms" },
+    css.rule ".dw-tab:hover" %{ "color" => "var(--dw-text)" },
+    css.rule ".dw-tab[aria-selected=true]" %{ "background" => "var(--dw-surface)", "color" => "var(--dw-text)", "box-shadow" => "0 1px 2px rgb(0 0 0 / 0.12)" },
+
+    // feedback
+    css.rule ".dw-progress" %{ "height" => "0.5rem", "border-radius" => "999px", "background" => "var(--dw-sunken)", "overflow" => "hidden",
+        "border" => "1px solid var(--dw-border)" },
+    css.rule ".dw-progress-bar" %{ "height" => "100%", "background" => "var(--dw-tone, var(--dw-accent))", "border-radius" => "999px", "transition" => "width 240ms ease" },
+    css.keyframes "dw-spin" [["to", %{ "transform" => "rotate(360deg)" }]],
+    css.rule ".dw-spinner" %{ "display" => "inline-block", "width" => "1.25rem", "height" => "1.25rem", "border-radius" => "50%",
+        "border" => "2px solid " + tint "var(--dw-accent)" 25, "border-top-color" => "var(--dw-accent)", "animation" => "dw-spin 0.7s linear infinite" },
+    css.rule ".dw-notice, .dw-toast" %{ "display" => "flex", "align-items" => "flex-start", "gap" => "var(--dw-space-2)",
+        "padding" => "var(--dw-space-3) var(--dw-space-4)", "border-radius" => "var(--dw-radius)",
+        "border" => "1px solid " + tint "var(--dw-tone, var(--dw-accent))" 35,
+        "background" => "color-mix(in srgb, var(--dw-tone, var(--dw-accent)) 9%, var(--dw-surface))" },
+    css.rule ".dw-notice > .dw-icon, .dw-toast > .dw-icon" %{ "color" => "var(--dw-tone, var(--dw-accent))", "margin-top" => "0.15rem" },
+    css.rule ".dw-notice-text" %{ "flex" => "1" },
+    css.rule ".dw-toasts" %{ "position" => "fixed", "right" => "var(--dw-space-4)", "bottom" => "var(--dw-space-4)", "z-index" => "10",
+        "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-2)", "width" => "min(24rem, calc(100vw - 2rem))" },
+    css.rule ".dw-toast" %{ "align-items" => "center", "box-shadow" => "var(--dw-shadow)", "background" => "var(--dw-surface)",
+        "animation" => "dw-rise 180ms ease-out" },
+    css.keyframes "dw-rise" [["from", %{ "opacity" => "0", "transform" => "translateY(8px)" }]],
+    css.rule ".dw-dialog" %{ "border" => "none", "padding" => "0", "border-radius" => "calc(var(--dw-radius) + 6px)",
+        "background" => "var(--dw-surface)", "color" => "var(--dw-text)", "box-shadow" => "0 24px 64px rgb(0 0 0 / 0.3)",
+        "width" => "min(28rem, calc(100vw - 2rem))", "animation" => "dw-rise 160ms ease-out" },
+    css.rule ".dw-dialog::backdrop" %{ "background" => "rgb(10 10 20 / 0.45)", "backdrop-filter" => "blur(2px)" },
+    css.rule ".dw-dialog-body" %{ "padding" => "var(--dw-space-5)", "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-3)" },
+    css.rule ".dw-dialog-actions" %{ "display" => "flex", "justify-content" => "flex-end", "gap" => "var(--dw-space-2)", "margin-top" => "var(--dw-space-2)" },
+    css.rule ".dw-empty" %{ "display" => "flex", "flex-direction" => "column", "align-items" => "center", "gap" => "var(--dw-space-1)",
+        "padding" => "var(--dw-space-6) var(--dw-space-4)", "color" => "var(--dw-muted)", "text-align" => "center" },
+    css.rule ".dw-empty > .dw-icon" %{ "width" => "2rem", "height" => "2rem", "margin-bottom" => "var(--dw-space-2)" },
+    css.rule ".dw-empty .dw-strong" %{ "color" => "var(--dw-text)" },
+
+    // data
+    css.rule ".dw-list" %{ "list-style" => "none", "margin" => "0", "padding" => "0", "display" => "flex", "flex-direction" => "column" },
+    css.rule ".dw-list-item" %{ "padding" => "var(--dw-space-2) 0", "border-bottom" => "1px solid var(--dw-border)" },
+    css.rule ".dw-list-item:last-child" %{ "border-bottom" => "none" },
+    css.rule ".dw-table-wrap" %{ "overflow-x" => "auto" },
+    css.rule ".dw-table" %{ "width" => "100%", "border-collapse" => "collapse", "font-size" => "0.925rem" },
+    css.rule ".dw-table th" %{ "text-align" => "left", "font-weight" => "600", "color" => "var(--dw-muted)", "font-size" => "0.8rem",
+        "text-transform" => "uppercase", "letter-spacing" => "0.04em", "padding" => "var(--dw-space-2) var(--dw-space-3)",
+        "border-bottom" => "1px solid var(--dw-border)" },
+    css.rule ".dw-table td" %{ "padding" => "var(--dw-space-2) var(--dw-space-3)", "border-bottom" => "1px solid var(--dw-border)",
+        "vertical-align" => "middle" },
+    css.rule ".dw-table tbody tr:hover" %{ "background" => tint "var(--dw-text)" 4 },
+    css.rule ".dw-table tbody tr:last-child td" %{ "border-bottom" => "none" },
+    css.rule ".dw-image" %{ "max-width" => "100%", "border-radius" => "var(--dw-radius)", "display" => "block" },
+];
+
+when test {
+    import std.test;
+    import std.graphics;
+    let classes_of n = Node.classes n;
+    let tests = [
+        test.case "a widget is a node with the kit's class" $(test.eq! [["dw-button", "dw-primary"], "button"]
+            [classes_of (button "Save" :save |> primary), Node.tag (button "Save" :save)]),
+        test.case "a field is its label around the control, and modifiers reach the control" $({
+            let f = text_field "Email" "a@b" (fn s -> s) |> placeholder "you@example.com" |> disabled true |> error "Required";
+            let [label_node, control_node, error_node] = Node.children f;
+            test.eq! ["label", "Email", "you@example.com", true, "true", "Required"]
+                [Node.tag f, Node.text (list.head (Node.children label_node)), (Node.attrs control_node).["placeholder"],
+                 (Node.attrs control_node).["disabled"], (Node.attrs control_node).["aria-invalid"],
+                 Node.text (list.head (Node.children error_node))]
+        }),
+        test.case "a switch says what it is, and sends its next state" $({
+            let s = list.nth 1 (Node.children (switch "Wifi" true (fn b -> [:wifi, b])));
+            test.eq! ["switch", "true", [:wifi, false]]
+                [(Node.attrs s).["role"], (Node.attrs s).["aria-checked"], graphics.message_of ((graphics.handlers_at s [0]).["click"]) ()]
+        }),
+        test.case "a slider and a number field answer numbers" $({
+            let s = slider "Volume" 0 10 1 5 (fn n -> n);
+            test.eq! [7, 2.5] [graphics.message_of ((graphics.handlers_at s [0, 1]).["input"]) "7", number_of "2.5"]
+        }),
+        test.case "a closed dialog is nothing, and an open one closes from outside alone" $({
+            test.eq! "#none" (Node.tag (dialog false "Sure?" [] [] :close))
+            let click = (graphics.handlers_at (dialog true "Sure?" [] [] :close) [0]).["click"];
+            test.eq! [:close, ()] [graphics.message_of click %{"self" => true}, graphics.message_of click %{"self" => false}]
+        }),
+        test.case "spacing is on the scale, clamped" $(test.eq! ["var(--dw-space-4)", "var(--dw-space-8)"]
+            [(Node.style (row [] |> gap 4)).["gap"], (Node.style (row [] |> padding 12)).["padding"]]),
+        test.case "a keyed item keeps its row" $(test.eq! "row-a"
+            (Node.key (list.head (Node.children (list_of [text "x" |> key "a"]))))),
+        test.case "a theme is its stylesheet, under the program's own" $({
+            let app = themed (Theme.new () |> Theme.set_mode :dark) (App.new () |> App.set_styles ".mine { }");
+            let sheet = App.styles app;
+            test.true! (str.contains_str "--dw-accent: #5b5bd6" (list.head sheet))
+            test.eq! ".mine { }" (list.last sheet)
+            test.false! (list.any (fn r -> str.contains_str "prefers-color-scheme" r) sheet)
+        }),
+        test.case "icons are drawn, and an unknown one is empty" $(test.eq! ["svg", ""]
+            [Node.tag (icon "plus"), (Node.attrs (list.head (Node.children (icon "nope")))).["d"]]),
+        test.case "radio names come from the label" $(test.eq! "delivery-speed" (slug "Delivery speed"))
+    ];
+}

@@ -1,0 +1,175 @@
+// A todo list, which is most of what a frontend does: a form, a keyed list
+// that reorders, routes (`/`, `/active`, `/done`), state kept in the
+// browser's storage, a keyboard shortcut, a stylesheet written in Dream --
+// and, where the page has something Dream does not, the application's own
+// JavaScript: `widgets.mjs` defines `<progress-ring>` and a `confirm` function.
+//
+//     python3 mind/std/graphics/build.py --vm build-dream/bin/dream \
+//         --compiler build/dreams.dream --runtime build-browser \
+//         --frontend mind/std/graphics/examples/todo/frontend.dr \
+//         --js mind/std/graphics/examples/todo/widgets.mjs \
+//         --css mind/std/graphics/examples/todo/todo.css --out /tmp/todo
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.css;
+import std.graphics.html;
+import std.list;
+import std.str;
+
+mapping Item {
+    id : :integer = 0
+    title : :string = ""
+    done : :bool = false
+}
+
+mapping Model {
+    items : [Item] = []
+    draft : :string = ""
+    next : :integer = 1
+    filter : :string = "/"
+    editing : :integer = 0
+}
+
+union Msg {
+    draft(text : :string)
+    add
+    toggle(id : :integer)
+    remove(id : :integer)
+    edit(id : :integer)
+    rename(id : :integer, text : :string)
+    finish_edit
+    clear_done
+    clear_confirmed(answer : Result :any :string)
+    route(location : :any)
+    loaded(saved : Option :any)
+    key(press : :any)
+}
+
+/// What is kept between visits: the items, as plain JSON.
+let saved : Model -> :any;
+let saved model = list.map (fn i -> %{ "id" => Item.id i, "title" => Item.title i, "done" => Item.done i })
+    (Model.items model);
+
+let restore : :any -> Model -> Model;
+let restore items model = {
+    let restored = list.map (fn m -> Item.new () |> Item.set_id m.["id"] |> Item.set_title m.["title"]
+        |> Item.set_done m.["done"]) items;
+    model |> Model.set_items restored
+        |> Model.set_next (list.fold (fn n i -> if Item.id i >= n { Item.id i + 1 } else { n }) 1 restored)
+};
+
+/// Every change to the items is saved as it is made.
+let keep! : Model -> Model;
+let keep! model = { browser.save! "todos" (saved model); model };
+
+let change : :integer -> (Item -> Item) -> Model -> Model;
+let change id f model = Model.set_items (list.map (fn i -> if Item.id i == id { f i } else { i }) (Model.items model)) model;
+
+let update! : Msg -> Model -> Model;
+let update! msg model = match msg {
+    Msg.draft(t) => Model.set_draft t model,
+    Msg.add => if str.trim (Model.draft model) == "" { model } else {
+        keep! (model
+            |> Model.set_items (list.append (Model.items model)
+                   [Item.new () |> Item.set_id (Model.next model) |> Item.set_title (str.trim (Model.draft model))])
+            |> Model.set_next (Model.next model + 1) |> Model.set_draft "")
+    },
+    Msg.toggle(id) => keep! (change id (fn i -> Item.set_done (not (Item.done i)) i) model),
+    Msg.remove(id) => keep! (Model.set_items (list.filter (fn i -> Item.id i != id) (Model.items model)) model),
+    Msg.edit(id) => {
+        browser.focus! ("edit-" + to_string id)
+        Model.set_editing id model
+    },
+    Msg.rename(id, t) => change id (Item.set_title t) model,
+    Msg.finish_edit => keep! (Model.set_editing 0 model),
+    Msg.clear_done => {
+        browser.js! "confirm" %{ "text" => "Clear the finished items?" } Msg.clear_confirmed
+        model
+    },
+    Msg.clear_confirmed(Result.ok(true)) => keep! (Model.set_items (list.filter (fn i -> not (Item.done i)) (Model.items model)) model),
+    Msg.clear_confirmed(_) => model,
+    Msg.route(at) => Model.set_filter at.["path"] model,
+    Msg.loaded(Option.some(items)) => restore items model,
+    Msg.loaded(Option.none) => model,
+    // `/` anywhere but in a text field puts the cursor in the new-item box.
+    Msg.key(k) => if k.["key"] == "/" && not k.["in_field"] { browser.focus! "new"; model } else { model },
+};
+
+let start! : Model -> Model;
+let start! model = { browser.load! "todos" Msg.loaded; model };
+
+let shown : Model -> [Item];
+let shown model = match Model.filter model {
+    "/active" => list.filter (fn i -> not (Item.done i)) (Model.items model),
+    "/done" => list.filter (fn i -> Item.done i) (Model.items model),
+    _ => Model.items model,
+};
+
+let item_view : Model -> Item -> ui.Node;
+let item_view model item = {
+    let id = Item.id item;
+    let key = "item-" + to_string id;
+    html.li [html.key key, ui.only (Item.done item) (html.class "done")] [
+        html.input [html.key ("check-" + to_string id), html.input_type "checkbox", html.checked (Item.done item),
+                    html.on_check (fn b -> Msg.toggle id), html.aria "label" ("Done: " + Item.title item)],
+        if Model.editing model == id {
+            html.input [html.key ("edit-" + to_string id), html.value (Item.title item),
+                        html.on_input (Msg.rename id), html.on_enter Msg.finish_edit, html.on_blur Msg.finish_edit,
+                        html.aria "label" "Rename"]
+        } else {
+            html.span [html.on_double_click (Msg.edit id)] [html.text (Item.title item)]
+        },
+        html.button [html.class "remove", html.on_click (Msg.remove id), html.aria "label" ("Remove " + Item.title item)]
+            [html.text "×"],
+    ]
+};
+
+let link : Model -> :string -> :string -> ui.Node;
+let link model path caption = html.a [html.href path, ui.only (Model.filter model == path) (html.aria "current" "page")]
+    [html.text caption];
+
+let view : Model -> ui.Node;
+let view model = {
+    let total = list.length (Model.items model);
+    let finished = list.length (list.filter (fn i -> Item.done i) (Model.items model));
+    html.main [html.class "todo"] [
+        html.header [] [
+            html.h1 [] [html.text "Things to do"],
+            ui.element "progress-ring" [html.prop "fraction" (if total == 0 { 0 } else { finished * 1.0 / total }),
+                                        html.aria "label" (to_string finished + " of " + to_string total + " done")] [],
+        ],
+        html.form [html.on_submit Msg.add] [
+            html.input [html.key "new", html.value (Model.draft model), html.on_input Msg.draft,
+                        html.placeholder "What needs doing?  (press / to come back here)", html.aria "label" "New item"],
+            html.button [html.input_type "submit"] [html.text "Add"],
+        ],
+        html.ul [html.class "items"] (list.map (item_view model) (shown model)),
+        html.footer [] [
+            html.span [html.role "status"] [html.text (to_string (total - finished) + " left")],
+            html.nav [] [link model "/" "All", link model "/active" "Active", link model "/done" "Done"],
+            if finished > 0 { html.button [html.on_click Msg.clear_done] [html.text "Clear finished"] } else { ui.nothing },
+        ],
+    ]
+};
+
+let styles = [
+    css.vars %{ "--accent" => "#5b5bd6", "--muted" => "color-mix(in srgb, CanvasText 55%, transparent)" },
+    css.rule ".todo" %{ "max-width" => "36rem", "margin" => "0 auto", "padding" => "2rem 1rem" },
+    css.rule ".todo header" %{ "display" => "flex", "align-items" => "center", "justify-content" => "space-between" },
+    css.rule ".todo form" %{ "display" => "flex", "gap" => "0.5rem" },
+    css.rule ".todo form input" %{ "flex" => "1", "padding" => "0.5rem" },
+    css.rule ".items" %{ "list-style" => "none", "padding" => "0" },
+    css.rule ".items li" %{ "display" => "flex", "gap" => "0.75rem", "align-items" => "center", "padding" => "0.5rem 0",
+                            "border-bottom" => "1px solid color-mix(in srgb, CanvasText 15%, transparent)" },
+    css.rule ".items li span" %{ "flex" => "1" },
+    css.rule ".items li.done span" %{ "text-decoration" => "line-through", "color" => "var(--muted)" },
+    css.rule ".todo footer" %{ "display" => "flex", "gap" => "1rem", "align-items" => "center", "color" => "var(--muted)" },
+    css.rule ".todo nav" %{ "display" => "flex", "gap" => "0.5rem", "flex" => "1" },
+    css.rule ".todo nav a[aria-current]" %{ "color" => "var(--accent)", "font-weight" => "600" },
+    css.media "(max-width: 480px)" [css.rule ".todo footer" %{ "flex-wrap" => "wrap" }],
+];
+
+let main! = browser.run! (ui.App.new () |> ui.title "Things to do" |> ui.App.set_init (Model.new ())
+    |> ui.App.set_start start! |> ui.App.set_update update! |> ui.App.set_view view
+    |> ui.App.set_subscriptions (fn model -> [ui.on_url Msg.route, ui.on_key_down Msg.key])
+    |> ui.App.set_styles styles);

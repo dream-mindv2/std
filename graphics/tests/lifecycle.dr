@@ -1,0 +1,12 @@
+// Closing the window: `closing!` runs and its last request reaches the backend
+// before the backend is stopped. The window is the size and title asked for.
+import std.graphics as ui;
+import std.graphics.browser;
+
+union Msg { closed(answer : Result :any :string) }
+
+let main! = browser.run! (ui.App.new ()
+    |> ui.App.set_window (ui.Window.new () |> ui.Window.set_title "Dream lifecycle test"
+        |> ui.Window.set_width 800 |> ui.Window.set_height 500)
+    |> ui.App.set_view (fn model -> ui.text "Close this window to test cleanup")
+    |> ui.App.set_closing (fn model -> { browser.invoke! "closed" 42 Msg.closed; model }));

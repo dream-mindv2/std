@@ -1,0 +1,95 @@
+// Drawing with the pointer, on a canvas, with an animation running under it:
+// `std.graphics.canvas` for the picture, `ui.on_frame` for time, pointer
+// events for the hand. Press `c` to clear, `z` to take back the last stroke.
+import std.graphics as ui;
+import std.graphics.browser;
+import std.graphics.canvas as cv;
+import std.graphics.css;
+import std.graphics.html;
+import std.list;
+import std.math;
+
+let width : :integer;
+let width = 640;
+let height : :integer;
+let height = 400;
+
+mapping Model {
+    strokes : [[[:any]]] = []
+    current : [[:any]] = []
+    drawing : :bool = false
+    time : :float = 0.0
+    color : :string = "#ff6b6b"
+}
+
+union Msg {
+    press(at : :any)
+    drag(at : :any)
+    lift
+    frame(time : :float)
+    key(press : :any)
+    pick(color : :string)
+}
+
+let point : :any -> [:any];
+let point at = [at.["x"], at.["y"]];
+
+let update! : Msg -> Model -> Model;
+let update! msg model = match msg {
+    Msg.press(at) => model |> Model.set_drawing true |> Model.set_current [point at],
+    Msg.drag(at) => if Model.drawing model { Model.set_current (list.cons (point at) (Model.current model)) model } else { model },
+    Msg.lift => if Model.drawing model {
+        model |> Model.set_strokes (list.append (Model.strokes model) [Model.current model])
+              |> Model.set_current [] |> Model.set_drawing false
+    } else { model },
+    Msg.frame(t) => Model.set_time t model,
+    Msg.key(k) => match k.["key"] {
+        "c" => Model.set_strokes [] model,
+        "z" => Model.set_strokes (list.drop_last 1 (Model.strokes model)) model,
+        _ => model,
+    },
+    Msg.pick(c) => Model.set_color c model,
+};
+
+/// A slow orbit behind the strokes: an animation is a drawing of the time.
+let backdrop : :float -> [:any];
+let backdrop t = {
+    let a = t / 1000.0;
+    [cv.clear "#101820",
+     cv.translate (width / 2) (height / 2) [
+         cv.rotate a [cv.alpha 0.35 [cv.stroke "#5b5bd6" 2 (cv.rounded (-60) (-60) 120 120 16)]],
+         cv.fill "#5b5bd6" (cv.circle (math.cos a * 150.0) (math.sin a * 90.0) 6),
+     ]]
+};
+
+let view : Model -> ui.Node;
+let view model = html.main [html.class "sketch"] [
+    html.h1 [] [html.text "Sketch"],
+    cv.view [html.key "canvas", html.aria "label" "Drawing area", html.role "img",
+             html.on_pointer_down Msg.press, html.on_pointer_move Msg.drag, html.on_pointer_up (fn p -> Msg.lift),
+             html.on_mouse_leave Msg.lift]
+        width height
+        (list.append (backdrop (Model.time model))
+            (list.concat [
+                list.map (fn s -> cv.stroke (Model.color model) 4 (cv.polyline s)) (Model.strokes model),
+                [cv.stroke "white" 4 (cv.polyline (list.reverse (Model.current model)))],
+                [cv.text_with "14px system-ui" "#ffffffaa" "right" (width - 12) (height - 12)
+                    (to_string (list.length (Model.strokes model)) + " strokes")],
+            ])),
+    html.div [html.class "palette"] (list.map (fn c ->
+        html.button [html.key ("color-" + c), html.style "background" c, html.on_click (Msg.pick c),
+                     html.aria "label" ("Colour " + c), html.aria "pressed" (Model.color model == c)] [])
+        ["#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff"]),
+    html.p [] [html.text "Draw with the pointer. c clears, z undoes."],
+];
+
+let main! = browser.run! (ui.App.new () |> ui.title "Sketch" |> ui.App.set_init (Model.new ())
+    |> ui.App.set_update update! |> ui.App.set_view view
+    |> ui.App.set_subscriptions (fn model -> [ui.on_frame Msg.frame, ui.on_key_down Msg.key])
+    |> ui.App.set_styles [
+        css.rule ".sketch" %{ "padding" => "1.5rem", "display" => "grid", "gap" => "1rem", "justify-items" => "start" },
+        css.rule ".sketch canvas" %{ "border-radius" => "12px", "touch-action" => "none", "cursor" => "crosshair" },
+        css.rule ".palette" %{ "display" => "flex", "gap" => "0.5rem" },
+        css.rule ".palette button" %{ "width" => "2rem", "height" => "2rem", "border-radius" => "50%", "border" => "2px solid transparent" },
+        css.rule ".palette button[aria-pressed=true]" %{ "border-color" => "CanvasText" },
+    ]);

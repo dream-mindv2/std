@@ -1,0 +1,9 @@
+// Every std.graphics module's tests. The browser driver's are here too: they
+// test its protocol, and never call the page, which only the browser VM has.
+import std.graphics;
+import std.graphics.html;
+import std.graphics.css;
+import std.graphics.canvas;
+import std.graphics.browser;
+import std.graphics.backend;
+import std.graphics.widgets;

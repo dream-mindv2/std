@@ -1,0 +1,8 @@
+import std.console;
+import std.graphics.backend;
+let echo! value = value;
+let closed! value = { console.error! "graphics close cleanup"; value };
+let main! = backend.serve! %{
+    "echo" => backend.command! :integer :integer echo!,
+    "closed" => backend.command! :integer :integer closed!
+};
