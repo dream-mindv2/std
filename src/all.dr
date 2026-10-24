@@ -101,7 +101,7 @@ import std.wire;
 import std.types;
 /// The library's own version, so a program can report what it was built with.
 let version : :string;
-let version = "0.1.0";
+let version = "0.2.0";
 
 /// The modules this build provides.
 let modules : [:string];
