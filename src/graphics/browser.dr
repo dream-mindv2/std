@@ -27,7 +27,7 @@
 // wants one sends the loop a message asking for it.
 //
 // **Breaking out.** `js!` calls a function the application's own JavaScript
-// registered (`build.py --js`); `ui.on_port` hears what that JavaScript sends;
+// registered (`[graphics] js`); `ui.on_port` hears what that JavaScript sends;
 // a custom element is `ui.element "my-widget" [html.prop "data" value] []`.
 // docs/graphics.md, "Breaking out", says what the JavaScript side sees.
 import std.browser as bridge;
@@ -44,6 +44,7 @@ import std.vm;
 let run! : App -> Result :any :atom;
 let run! app = run_with! (driver! ()) app;
 
+/// The page as a `Driver`: renders, subscriptions and styles go over the bridge as JSON.
 let driver! : :unit -> Driver;
 let driver! u = Driver.new ()
     |> Driver.set_open open!
@@ -64,6 +65,7 @@ let open! options = {
     Result.ok ()
 };
 
+/// Read the page's events from the bridge and deliver each to the UI loop, until the page closes.
 priv let rec forward! ui_process = {
     match input_of (bridge.next! ()) {
         Result.ok(input) => deliver! ui_process input,
@@ -98,8 +100,10 @@ priv let answer_of m = {
     else { Result.error (to_text reply.["error" else "failed"]) }
 };
 
+/// A value as the text a service is given: a string as it is, anything else as JSON.
 priv let to_text v = if type_of v == :string { v } else { json.encode v };
 
+/// Send the page one message, as JSON.
 priv let post! value = bridge.send! (json.encode value);
 
 /// Ask the page's `service` for something, the answer becoming `f answer`.
@@ -116,7 +120,7 @@ priv let tell! service args = post! %{ "type" => "request", "id" => 0, "service"
 
 /// An HTTP request, made by the page's `fetch`. The page's content security
 /// policy decides where it may go: the application's own origin, and any
-/// origin given to `build.py --connect`.
+/// origin in `[graphics] connect`.
 mapping Request {
     url : :string = ""
     method : :string = "GET"
@@ -151,6 +155,7 @@ let post_json! url value f = fetch! (Request.new () |> Request.set_url url |> Re
         |> Request.set_headers %{ "content-type" => "application/json" } |> Request.set_body (json.encode value))
     (fn r -> f (Result.and_then (fn body -> if body == "" { Result.ok () } else { json.decode body }) (body_of r)));
 
+/// A request body as text: a string as it is, any other value as JSON.
 priv let body_of r = match r {
     Result.ok(response) => if Response.ok response { Result.ok (Response.body response) }
         else { Result.error ("HTTP " + to_string (Response.status response)) },
@@ -173,6 +178,7 @@ let load! key f = request! "storage.get" %{ "key" => key } (fn r -> f (match r {
     _ => Option.none,
 }));
 
+/// Remove what `save!` kept under `key`.
 let forget! : :string -> :unit;
 let forget! key = tell! "storage.remove" %{ "key" => key };
 
@@ -185,9 +191,11 @@ let navigate! url = tell! "navigate" %{ "url" => url, "replace" => false };
 /// The same, replacing the current entry in the history.
 let replace_url! : :string -> :unit;
 let replace_url! url = tell! "navigate" %{ "url" => url, "replace" => true };
+/// Go back one entry in the page's history, as the browser's back button does.
 let back! : :unit -> :unit;
 let back! u = tell! "back" ();
 
+/// Set the window's title, or the tab's.
 let set_title! : :string -> :unit;
 let set_title! title = tell! "title" %{ "title" => title };
 
@@ -198,6 +206,7 @@ let set_title! title = tell! "title" %{ "title" => title };
 /// Give the keyboard to the node with this key.
 let focus! : :string -> :unit;
 let focus! key = after_render! (fn u -> tell! "focus" %{ "key" => key });
+/// Take focus away from the node with this key, once the render this update makes is shown.
 let blur! : :string -> :unit;
 let blur! key = after_render! (fn u -> tell! "blur" %{ "key" => key });
 /// Scroll the node with this key into view.

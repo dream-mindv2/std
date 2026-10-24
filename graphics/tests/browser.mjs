@@ -1,5 +1,5 @@
 // The examples in a real browser: headless Chromium through Playwright, each
-// application served as the static site build.py makes, with its content
+// application served as the static site `mind build` makes, with its content
 // security policy, and driven the way a person would.
 //
 //     node tests/browser.mjs APPS_DIR    (holding counter/, todo/, sketch/)

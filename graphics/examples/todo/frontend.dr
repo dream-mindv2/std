@@ -4,11 +4,8 @@
 // and, where the page has something Dream does not, the application's own
 // JavaScript: `widgets.mjs` defines `<progress-ring>` and a `confirm` function.
 //
-//     python3 mind/std/graphics/build.py --vm build-dream/bin/dream \
-//         --compiler build/dreams.dream --runtime build-browser \
-//         --frontend mind/std/graphics/examples/todo/frontend.dr \
-//         --js mind/std/graphics/examples/todo/widgets.mjs \
-//         --css mind/std/graphics/examples/todo/todo.css --out /tmp/todo
+//     mind run            # in this directory: serves it at http://127.0.0.1:8000/
+//     mind run --desktop  # or in a window
 import std.graphics as ui;
 import std.graphics.browser;
 import std.graphics.css;

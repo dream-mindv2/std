@@ -7,9 +7,9 @@
 // answered with a `reply` unless its id is 0) and `close`. To it: `dom`,
 // `sub`, `port`, `reply` and `close` events. Every message is JSON.
 //
-// **Breaking out.** An application may ship JavaScript of its own (`build.py
-// --js`), listed in `app.json`. Each module is imported before the program
-// starts, and its `setup(dream)`, if it has one, is given:
+// **Breaking out.** An application may ship JavaScript of its own (`[graphics]
+// js` in its manifest), listed in `app.json`. Each module is imported before
+// the program starts, and its `setup(dream)`, if it has one, is given:
 //
 //   dream.handle(name, fn)   fn(args) answers `browser.js! name args`; it may be
 //                            async, and what it throws is the error
@@ -20,7 +20,7 @@
 //   dream.root               the element the program renders into
 //
 // and may define custom elements, which a program renders by name and feeds
-// through properties (`html.prop`). Its own CSS (`build.py --css`) is linked
+// through properties (`html.prop`). Its own CSS (`[graphics] css`) is linked
 // by `index.html`.
 //
 // **The desktop host.** Under `dream --graphics` the page has `ipc`, the
@@ -274,7 +274,7 @@ export async function startApplication(root, worker, scope = globalThis, { modul
   worker.postMessage({ type: 'start' });
 }
 
-/// The application's own scripts, as `build.py` listed them. An application
+/// The application's own scripts, as `mind build` listed them. An application
 /// without any has no `app.json`; one whose script does not load must not
 /// start as though it did.
 async function applicationModules() {

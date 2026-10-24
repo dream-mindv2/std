@@ -1,6 +1,8 @@
 // Drawing with the pointer, on a canvas, with an animation running under it:
 // `std.graphics.canvas` for the picture, `ui.on_frame` for time, pointer
 // events for the hand. Press `c` to clear, `z` to take back the last stroke.
+//
+//     mind run            # in this directory: serves it at http://127.0.0.1:8000/
 import std.graphics as ui;
 import std.graphics.browser;
 import std.graphics.canvas as cv;

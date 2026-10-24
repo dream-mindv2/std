@@ -32,18 +32,22 @@ let view attrs width height drawing =
 
 // --- shapes --------------------------------------------------------------------
 
+/// A rectangle at `x`, `y`, `w` wide and `h` high.
 let rect : :any -> :any -> :any -> :any -> :any;
 let rect x y w h = %{ "kind" => "rect", "x" => x, "y" => y, "w" => w, "h" => h };
 /// A rectangle whose corners are rounded by `r`.
 let rounded : :any -> :any -> :any -> :any -> :any -> :any;
 let rounded x y w h r = %{ "kind" => "rounded", "x" => x, "y" => y, "w" => w, "h" => h, "r" => r };
+/// A circle centred at `x`, `y` with radius `r`.
 let circle : :any -> :any -> :any -> :any;
 let circle x y r = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => r, "ry" => r };
+/// An ellipse centred at `x`, `y` with radii `rx` and `ry`.
 let ellipse : :any -> :any -> :any -> :any -> :any;
 let ellipse x y rx ry = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => rx, "ry" => ry };
 /// An arc of the circle at `x`, `y`, from angle `from` to `to`, in radians.
 let arc : :any -> :any -> :any -> :any -> :any -> :any;
 let arc x y r from to = %{ "kind" => "arc", "x" => x, "y" => y, "r" => r, "from" => from, "to" => to };
+/// A straight line from `x1`, `y1` to `x2`, `y2`.
 let line : :any -> :any -> :any -> :any -> :any;
 let line x1 y1 x2 y2 = %{ "kind" => "polyline", "points" => [[x1, y1], [x2, y2]] };
 /// Points joined in order, `[[x, y], ..]`, left open.
@@ -61,6 +65,7 @@ let path d = %{ "kind" => "path", "d" => d };
 /// Paint the whole canvas `color`.
 let clear : :string -> :any;
 let clear color = %{ "op" => "clear", "color" => color };
+/// A shape filled with `color`.
 let fill : :string -> :any -> :any;
 let fill color shape = %{ "op" => "fill", "color" => color, "shape" => shape };
 /// Outline `shape` with a line `width` pixels wide.
@@ -77,7 +82,7 @@ let text x y s = text_with "16px system-ui" "currentColor" "left" x y s;
 let text_with : :string -> :string -> :string -> :any -> :any -> :string -> :any;
 let text_with font color align x y s = %{ "op" => "text", "font" => font, "color" => color,
     "align" => align, "x" => x, "y" => y, "text" => s };
-/// An image the application ships (`build.py --asset`), by its path, drawn
+/// An image the application ships (`[graphics] assets`), by its path, drawn
 /// into `w` by `h` at `x`, `y`. It appears once it has loaded.
 let image : :string -> :any -> :any -> :any -> :any -> :any;
 let image src x y w h = %{ "op" => "image", "src" => src, "x" => x, "y" => y, "w" => w, "h" => h };
@@ -85,12 +90,14 @@ let image src x y w h = %{ "op" => "image", "src" => src, "x" => x, "y" => y, "w
 /// `drawing`, under any of `translate`, `rotate`, `scale` and `alpha` together.
 let group : %{:string => :any} -> [:any] -> :any;
 let group settings drawing = %{ "op" => "group", "settings" => settings, "drawing" => drawing };
+/// A drawing moved by `x` across and `y` down.
 let translate : :any -> :any -> [:any] -> :any;
 let translate x y drawing = group %{ "translate" => [x, y] } drawing;
 /// Clockwise, in radians, about the origin -- `translate` there first to turn
 /// something about its own centre.
 let rotate : :any -> [:any] -> :any;
 let rotate radians drawing = group %{ "rotate" => radians } drawing;
+/// A drawing scaled by `sx` across and `sy` down.
 let scale : :any -> :any -> [:any] -> :any;
 let scale sx sy drawing = group %{ "scale" => [sx, sy] } drawing;
 /// Opacity from 0.0 to 1.0.

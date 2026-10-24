@@ -114,8 +114,10 @@ let center children = kit "div" "center" children;
 
 // --- text ------------------------------------------------------------------------
 
+/// The screen's title: the largest text, once a screen.
 let title : :string -> Node;
 let title s = kit "h1" "title" [text_node s];
+/// A section's heading.
 let heading : :string -> Node;
 let heading s = kit "h2" "heading" [text_node s];
 /// A paragraph.
@@ -124,8 +126,10 @@ let text s = kit "p" "text" [text_node s];
 /// Text that matters less: a note, a count, a date.
 let caption : :string -> Node;
 let caption s = kit "p" "caption" [text_node s];
+/// Text that matters more than what is around it.
 let strong : :string -> Node;
 let strong s = kit "strong" "strong" [text_node s];
+/// Text set as code, in a fixed-width face.
 let code : :string -> Node;
 let code s = kit "code" "code" [text_node s];
 /// A link within the application: a route, which `ui.on_url` hears.
@@ -159,8 +163,10 @@ let icon_button icon_name label message = kit "button" "icon-button" [icon icon_
 /// typed; the field shows `value`.
 let text_field : :string -> :string -> (:string -> :any) -> Node;
 let text_field label value f = field label (input_of "text" value f);
+/// A text field whose text is hidden as it is typed.
 let password_field : :string -> :string -> (:string -> :any) -> Node;
 let password_field label value f = field label (input_of "password" value f);
+/// A text field for an email address, with the keyboard a phone shows for one.
 let email_field : :string -> :string -> (:string -> :any) -> Node;
 let email_field label value f = field label (input_of "email" value f);
 /// A field for searching, with its icon.
@@ -296,28 +302,35 @@ let table columns rows = kit "div" "table-wrap" [kit "table" "table" [
     element "tbody" [] (list.map (fn r -> element "tr" [] (list.map (fn c -> element "td" [] [c]) r)) rows),
 ]];
 
-/// A picture the application ships (`build.py --asset`), with what it shows.
+/// A picture the application ships (`[graphics] assets`), with what it shows.
 let image : :string -> :string -> Node;
 let image src alt = kit "img" "image" [] |> with (Attr.attribute "src" src) |> with (Attr.attribute "alt" alt);
 
 // --- modifiers -------------------------------------------------------------------
 
+/// The identity a widget keeps across renders: give every item of a list that can reorder one.
 let key : :string -> Node -> Node;
 let key k node = Node.set_key k node;
 /// Send `message` when it is clicked or tapped.
 let on_tap : :any -> Node -> Node;
 let on_tap message node = with (Attr.on "click" (Handler.message message)) node;
+/// Words shown when the pointer rests on a widget.
 let tooltip : :string -> Node -> Node;
 let tooltip s node = with (Attr.attribute "title" s) node;
 
+/// A button that is the screen's main action, in the accent colour.
 let primary : Node -> Node;
 let primary node = class "primary" node;
+/// A button that destroys something, in the danger colour.
 let danger : Node -> Node;
 let danger node = class "danger" node;
+/// A button with no background until the pointer is over it.
 let ghost : Node -> Node;
 let ghost node = class "ghost" node;
+/// A smaller widget.
 let small : Node -> Node;
 let small node = class "small" node;
+/// A larger widget.
 let large : Node -> Node;
 let large node = class "large" node;
 /// As wide as what holds it.
@@ -350,8 +363,10 @@ let justify a node = with (Attr.style "justify-content" (place a)) node;
 /// A width or height in any CSS length: `w.width "16rem"`.
 let width : :string -> Node -> Node;
 let width s node = with (Attr.style "width" s) node;
+/// The widest a widget grows, as any CSS length.
 let max_width : :string -> Node -> Node;
 let max_width s node = with (Attr.style "max-width" s) node;
+/// A widget's height, as any CSS length.
 let height : :string -> Node -> Node;
 let height s node = with (Attr.style "max-height" s) (with (Attr.style "height" s) node);
 /// Gone -- from the page and from screen readers -- while `b` holds.
@@ -360,10 +375,13 @@ let hidden b node = if b { with (Attr.attribute "hidden" true) node } else { nod
 
 // What reaches the control inside a field: a field is its label around the
 // control, and these mean the control.
+/// What an empty field shows until something is typed.
 let placeholder : :string -> Node -> Node;
 let placeholder s node = control (with (Attr.attribute "placeholder" s)) node;
+/// A widget that cannot be used while `b` holds.
 let disabled : :bool -> Node -> Node;
 let disabled b node = control (with (Attr.attribute "disabled" b)) node;
+/// A field that has the focus when it first appears.
 let autofocus : Node -> Node;
 let autofocus node = control (with (Attr.attribute "autofocus" true)) node;
 /// Send `message` when Enter is pressed in the control.
@@ -400,6 +418,7 @@ let icon name = element "svg" [Attr.class "dw-icon", Attr.attribute "viewBox" "0
     Attr.attribute "stroke-linecap" "round", Attr.attribute "stroke-linejoin" "round",
     Attr.attribute "aria-hidden" "true"] [element "path" [Attr.attribute "d" (icon_path name)] []];
 
+/// The SVG path an icon is drawn with, or `""` for a name the kit does not have.
 priv let icon_path name = match name {
     "plus" => "M12 5v14M5 12h14",
     "minus" => "M5 12h14",
@@ -434,6 +453,7 @@ priv let icon_path name = match name {
     _ => "",
 };
 
+/// The icon a notice or toast of this tone shows.
 priv let tone_icon t = match t {
     :success => "check",
     :warning => "warning",
@@ -443,12 +463,15 @@ priv let tone_icon t = match t {
 
 // --- the parts -------------------------------------------------------------------
 
+/// An element with the kit's class for `name`.
 priv let kit tag name children = element tag [Attr.class ("dw-" + name)] children;
+/// The kit's class for `name` added to a node.
 priv let class name node = with (Attr.class ("dw-" + name)) node;
 
 /// A label around a control: clicking the words focuses the control, and a
 /// screen reader reads them as its name, with no id to keep unique.
 priv let field label control_node = kit "label" "field" [kit "span" "field-label" [text_node label], control_node];
+/// An `<input>` of `kind` showing `value`, sending `f` of what is typed.
 priv let input_of kind value f = element "input" [Attr.class "dw-control", Attr.attribute "type" kind,
     Attr.attribute "value" value, Attr.on "input" (Handler.reading f)] [];
 
@@ -457,12 +480,16 @@ priv let controls = ["input", "textarea", "select", "button"];
 priv let rec control f node = if list.contains (Node.tag node) controls { f node }
     else { Node.set_children (list.map (fn c -> control f c) (Node.children node)) node };
 
+/// Typed text as a number: an integer, a float, or `()` when it is neither.
 priv let number_of s = match num.parse_int s {
     () => num.parse_float s,
     n => n,
 };
+/// A fraction held between 0 and 1.
 priv let clamp x = if x < 0 { 0 } else if x > 1 { 1 } else { x };
+/// A step of the spacing scale, 0 to 8, as the custom property that holds it.
 priv let space n = "var(--dw-space-" + to_string (if n < 0 { 0 } else if n > 8 { 8 } else { n }) + ")";
+/// An alignment as CSS says it.
 priv let place a = match a {
     :start => "flex-start",
     :end => "flex-end",
@@ -495,6 +522,7 @@ priv let light_palette = %{
     "--dw-shadow" => "0 1px 2px rgb(20 20 40 / 0.06), 0 4px 16px rgb(20 20 40 / 0.06)",
 };
 
+/// The theme's colours for a light page.
 priv let light theme = map.merge light_palette %{
     "color-scheme" => if Theme.mode theme == :dark { "dark" } else if Theme.mode theme == :light { "light" } else { "light dark" },
     "--dw-accent" => Theme.accent theme, "--dw-danger" => Theme.danger theme,

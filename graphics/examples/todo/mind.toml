@@ -1,0 +1,9 @@
+# The application's own JavaScript and stylesheet ship beside the program.
+[package]
+name = "todo"
+version = "0.1.0"
+entry = "frontend.dr"
+
+[graphics]
+js = ["widgets.mjs"]
+css = ["todo.css"]

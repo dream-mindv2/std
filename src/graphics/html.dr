@@ -26,6 +26,7 @@
 import std.graphics.{element, text as text_node, nothing as nothing_node, Attr, Handler, Node};
 import std.list;
 
+/// Text, shown as written: never parsed as markup.
 let text : :string -> Node;
 let text value = text_node value;
 let nothing : Node;
@@ -33,70 +34,103 @@ let nothing = nothing_node;
 
 // --- elements ----------------------------------------------------------------
 
+/// A block with no meaning of its own, to lay things out.
 let div : [Attr] -> [Node] -> Node;
 let div attrs children = element "div" attrs children;
+/// A run of text with no meaning of its own, to style.
 let span : [Attr] -> [Node] -> Node;
 let span attrs children = element "span" attrs children;
+/// A paragraph.
 let p : [Attr] -> [Node] -> Node;
 let p attrs children = element "p" attrs children;
+/// The page's heading.
 let h1 : [Attr] -> [Node] -> Node;
 let h1 attrs children = element "h1" attrs children;
+/// A section's heading.
 let h2 : [Attr] -> [Node] -> Node;
 let h2 attrs children = element "h2" attrs children;
+/// A subsection's heading.
 let h3 : [Attr] -> [Node] -> Node;
 let h3 attrs children = element "h3" attrs children;
+/// A heading below that.
 let h4 : [Attr] -> [Node] -> Node;
 let h4 attrs children = element "h4" attrs children;
+/// The page's main content.
 let main : [Attr] -> [Node] -> Node;
 let main attrs children = element "main" attrs children;
+/// A part of the page, usually with a heading.
 let section : [Attr] -> [Node] -> Node;
 let section attrs children = element "section" attrs children;
+/// A piece that stands on its own: a post, a card.
 let article : [Attr] -> [Node] -> Node;
 let article attrs children = element "article" attrs children;
+/// What introduces the page or a section.
 let header : [Attr] -> [Node] -> Node;
 let header attrs children = element "header" attrs children;
+/// What closes the page or a section.
 let footer : [Attr] -> [Node] -> Node;
 let footer attrs children = element "footer" attrs children;
+/// Links that move around the application.
 let nav : [Attr] -> [Node] -> Node;
 let nav attrs children = element "nav" attrs children;
+/// Content beside the main content.
 let aside : [Attr] -> [Node] -> Node;
 let aside attrs children = element "aside" attrs children;
+/// A link; `href` says where to.
 let a : [Attr] -> [Node] -> Node;
 let a attrs children = element "a" attrs children;
+/// Text that matters more than what is around it.
 let strong : [Attr] -> [Node] -> Node;
 let strong attrs children = element "strong" attrs children;
+/// Text said with emphasis.
 let em : [Attr] -> [Node] -> Node;
 let em attrs children = element "em" attrs children;
+/// Small print.
 let small : [Attr] -> [Node] -> Node;
 let small attrs children = element "small" attrs children;
+/// Text that is code.
 let code : [Attr] -> [Node] -> Node;
 let code attrs children = element "code" attrs children;
+/// Text shown with its spacing and lines kept.
 let pre : [Attr] -> [Node] -> Node;
 let pre attrs children = element "pre" attrs children;
+/// A list whose order does not matter.
 let ul : [Attr] -> [Node] -> Node;
 let ul attrs children = element "ul" attrs children;
+/// A numbered list.
 let ol : [Attr] -> [Node] -> Node;
 let ol attrs children = element "ol" attrs children;
+/// An item of a list.
 let li : [Attr] -> [Node] -> Node;
 let li attrs children = element "li" attrs children;
+/// A table.
 let table : [Attr] -> [Node] -> Node;
 let table attrs children = element "table" attrs children;
+/// A table's header rows.
 let thead : [Attr] -> [Node] -> Node;
 let thead attrs children = element "thead" attrs children;
+/// A table's body rows.
 let tbody : [Attr] -> [Node] -> Node;
 let tbody attrs children = element "tbody" attrs children;
+/// A row of a table.
 let tr : [Attr] -> [Node] -> Node;
 let tr attrs children = element "tr" attrs children;
+/// A header cell.
 let th : [Attr] -> [Node] -> Node;
 let th attrs children = element "th" attrs children;
+/// A cell.
 let td : [Attr] -> [Node] -> Node;
 let td attrs children = element "td" attrs children;
+/// A form; `on_submit` hears it sent, with its fields.
 let form : [Attr] -> [Node] -> Node;
 let form attrs children = element "form" attrs children;
+/// Fields that belong together.
 let fieldset : [Attr] -> [Node] -> Node;
 let fieldset attrs children = element "fieldset" attrs children;
+/// What a fieldset holds, in words.
 let legend : [Attr] -> [Node] -> Node;
 let legend attrs children = element "legend" attrs children;
+/// The words naming a field; around it, or `label_for` its id.
 let label : [Attr] -> [Node] -> Node;
 let label attrs children = element "label" attrs children;
 /// A button's type is `button` unless the program says otherwise, so a button
@@ -104,24 +138,34 @@ let label attrs children = element "label" attrs children;
 /// since attributes apply in order.
 let button : [Attr] -> [Node] -> Node;
 let button attrs children = element "button" (list.cons (Attr.attribute "type" "button") attrs) children;
+/// A text field of several lines; its text is `value`.
 let textarea : [Attr] -> Node;
 let textarea attrs = element "textarea" attrs [];
+/// A choice from a list of `option`s.
 let select : [Attr] -> [Node] -> Node;
 let select attrs children = element "select" attrs children;
+/// One choice of a `select`.
 let option : [Attr] -> [Node] -> Node;
 let option attrs children = element "option" attrs children;
+/// How far something has got.
 let progress : [Attr] -> [Node] -> Node;
 let progress attrs children = element "progress" attrs children;
+/// The result of a calculation.
 let output : [Attr] -> [Node] -> Node;
 let output attrs children = element "output" attrs children;
+/// Content shown when its `summary` is opened.
 let details : [Attr] -> [Node] -> Node;
 let details attrs children = element "details" attrs children;
+/// What a `details` says while closed.
 let summary : [Attr] -> [Node] -> Node;
 let summary attrs children = element "summary" attrs children;
+/// A dialog box.
 let dialog : [Attr] -> [Node] -> Node;
 let dialog attrs children = element "dialog" attrs children;
+/// A field, a checkbox, a slider: what kind is `input_type`.
 let input : [Attr] -> Node;
 let input attrs = element "input" attrs [];
+/// An image, from `src`; give it `alt`.
 let img : [Attr] -> Node;
 let img attrs = element "img" attrs [];
 let br : Node;
@@ -132,74 +176,103 @@ let hr = element "hr" [] [];
 
 // --- attributes --------------------------------------------------------------
 
+/// Any attribute, by name.
 let attr : :string -> :any -> Attr;
 let attr name value = Attr.attribute name value;
 /// A JavaScript property rather than an attribute: what a custom element reads
 /// its data from, and the live state of a control (`scrollTop`, `indeterminate`).
 let prop : :string -> :any -> Attr;
 let prop name value = Attr.property name value;
+/// The identity a node keeps across renders: give every item of a list that can reorder one.
 let key : :string -> Attr;
 let key k = Attr.key k;
+/// The element's `id`.
 let id : :string -> Attr;
 let id v = Attr.attribute "id" v;
+/// A class, added to any the node has.
 let class : :string -> Attr;
 let class name = Attr.class name;
 /// Each name whose condition holds: `classes [["todo", true], ["done", finished]]`.
 let classes : [[:any]] -> [Attr];
 let classes pairs = list.map (fn pair -> Attr.class (list.head pair))
     (list.filter (fn pair -> list.nth 1 pair == true) pairs);
+/// One inline style declaration.
 let style : :string -> :string -> Attr;
 let style name value = Attr.style name value;
+/// Where a link goes: a route of the application, or another site.
 let href : :string -> Attr;
 let href v = Attr.attribute "href" v;
+/// Where an image or medium is loaded from.
 let src : :string -> Attr;
 let src v = Attr.attribute "src" v;
+/// What an image shows, for whoever cannot see it.
 let alt : :string -> Attr;
 let alt v = Attr.attribute "alt" v;
+/// Words shown when the pointer rests on the element.
 let title : :string -> Attr;
 let title v = Attr.attribute "title" v;
+/// What an empty field shows until something is typed.
 let placeholder : :string -> Attr;
 let placeholder v = Attr.attribute "placeholder" v;
 /// A control's value. The page keeps what is being typed while an IME is
 /// composing, so a model that echoes the input back never fights the person.
 let value : :any -> Attr;
 let value v = Attr.attribute "value" v;
+/// Whether a checkbox or radio button is ticked.
 let checked : :bool -> Attr;
 let checked v = Attr.attribute "checked" v;
+/// Whether a control can be used.
 let disabled : :bool -> Attr;
 let disabled v = Attr.attribute "disabled" v;
+/// Whether an option is the one chosen.
 let selected : :bool -> Attr;
 let selected v = Attr.attribute "selected" v;
+/// Whether the element is shown.
 let hidden : :bool -> Attr;
 let hidden v = Attr.attribute "hidden" v;
+/// Whether a field can be changed.
 let readonly : :bool -> Attr;
 let readonly v = Attr.attribute "readonly" v;
+/// Whether a form needs this field filled.
 let required : :bool -> Attr;
 let required v = Attr.attribute "required" v;
+/// Whether the field has the focus when it first appears.
 let autofocus : :bool -> Attr;
 let autofocus v = Attr.attribute "autofocus" v;
+/// Whether a `<details>` or `<dialog>` is open.
 let open : :bool -> Attr;
 let open v = Attr.attribute "open" v;
+/// What kind of input or button it is: `"checkbox"`, `"range"`, `"submit"`, ..
 let input_type : :string -> Attr;
 let input_type v = Attr.attribute "type" v;
+/// A field's name, which a submitted form reports it by.
 let name : :string -> Attr;
 let name v = Attr.attribute "name" v;
+/// The id of the field a label names.
 let label_for : :string -> Attr;
 let label_for v = Attr.attribute "for" v;
+/// The least a number or slider takes.
 let min : :any -> Attr;
 let min v = Attr.attribute "min" v;
+/// The most a number or slider takes.
 let max : :any -> Attr;
 let max v = Attr.attribute "max" v;
+/// How far apart a number's or slider's values are.
 let step : :any -> Attr;
 let step v = Attr.attribute "step" v;
+/// How many lines of text a text area shows.
 let rows : :integer -> Attr;
 let rows v = Attr.attribute "rows" v;
+/// The width an image or canvas is drawn at.
 let width : :any -> Attr;
 let width v = Attr.attribute "width" v;
+/// The height an image or canvas is drawn at.
 let height : :any -> Attr;
 let height v = Attr.attribute "height" v;
+/// Where the element comes when moving through the page by Tab; `-1` is never.
 let tabindex : :integer -> Attr;
 let tabindex v = Attr.attribute "tabindex" v;
+/// What the element is to assistive technology, when its tag does not say.
 let role : :string -> Attr;
 let role v = Attr.attribute "role" v;
 /// `aria "label" "Close"` is `aria-label="Close"`.
@@ -219,15 +292,19 @@ let on event message = Attr.on event (Handler.message message);
 let on_value : :string -> (:any -> :any) -> Attr;
 let on_value event f = Attr.on event (Handler.reading f);
 
+/// A message when the element is clicked, tapped, or pressed with Enter or Space.
 let on_click : :any -> Attr;
 let on_click message = on "click" message;
+/// A message when the element is double-clicked.
 let on_double_click : :any -> Attr;
 let on_double_click message = on "dblclick" message;
 /// The click's position on the element and its buttons and modifiers.
 let on_click_at : (:any -> :any) -> Attr;
 let on_click_at f = on_value "click" f;
+/// The field's text, made into a message, as each character is typed.
 let on_input : (:string -> :any) -> Attr;
 let on_input f = on_value "input" f;
+/// The control's value, made into a message, when a change is finished.
 let on_change : (:string -> :any) -> Attr;
 let on_change f = on_value "change" f;
 /// A checkbox's new state.
@@ -239,25 +316,34 @@ let on_submit message = on "submit" message;
 /// The form's named fields, `%{name => value}`, as it is submitted.
 let on_submit_with : (:any -> :any) -> Attr;
 let on_submit_with f = on_value "submit" f;
+/// A message when the element gains the focus.
 let on_focus : :any -> Attr;
 let on_focus message = on "focus" message;
+/// A message when the element loses the focus.
 let on_blur : :any -> Attr;
 let on_blur message = on "blur" message;
+/// A message made from each key pressed while the element has the focus.
 let on_key_down : (:any -> :any) -> Attr;
 let on_key_down f = on_value "keydown" f;
+/// A message made from each key released while the element has the focus.
 let on_key_up : (:any -> :any) -> Attr;
 let on_key_up f = on_value "keyup" f;
 /// `message` when Enter is pressed, and nothing for any other key.
 let on_enter : :any -> Attr;
 let on_enter message = on_value "keydown" (fn k -> if k.["key" else ""] == "Enter" { message } else { () });
+/// A message made from where a pointer pressed on the element.
 let on_pointer_down : (:any -> :any) -> Attr;
 let on_pointer_down f = on_value "pointerdown" f;
+/// A message made from where a pointer moved over the element.
 let on_pointer_move : (:any -> :any) -> Attr;
 let on_pointer_move f = on_value "pointermove" f;
+/// A message made from where a pointer was released over the element.
 let on_pointer_up : (:any -> :any) -> Attr;
 let on_pointer_up f = on_value "pointerup" f;
+/// A message when the pointer comes over the element.
 let on_mouse_enter : :any -> Attr;
 let on_mouse_enter message = on "mouseenter" message;
+/// A message when the pointer leaves the element.
 let on_mouse_leave : :any -> Attr;
 let on_mouse_leave message = on "mouseleave" message;
 /// `%{"dx", "dy"}`, in pixels.

@@ -1,9 +1,7 @@
 // The smallest std.graphics program: a model, its messages, a view.
 //
-//     python3 mind/std/graphics/build.py --vm build-dream/bin/dream \
-//         --compiler build/dreams.dream --runtime build-browser \
-//         --frontend mind/std/graphics/examples/counter/frontend.dr \
-//         --backend mind/std/graphics/examples/counter/backend.dr --out /tmp/counter
+//     mind run            # in this directory: serves it at http://127.0.0.1:8000/
+//     mind run --desktop  # or in a window, with its backend
 import std.graphics as ui;
 import std.graphics.browser;
 import std.graphics.css;

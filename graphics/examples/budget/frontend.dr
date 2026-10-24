@@ -3,8 +3,8 @@
 // before anything is deleted, toasts that go away on their own, a budget on a
 // slider, dark mode as a setting, and everything kept in the browser.
 //
-//     just graphics-app /tmp/budget mind/std/graphics/examples/budget/frontend.dr
-//     just graphics-serve /tmp/budget
+//     mind run            # in this directory: serves it at http://127.0.0.1:8000/
+//     mind run --desktop  # or in a window
 import std.graphics as ui;
 import std.graphics.browser;
 import std.graphics.widgets as w;

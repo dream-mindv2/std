@@ -6,7 +6,7 @@ written. Spacing, type, colour, focus rings, hover states, dark mode, narrow
 screens and accessibility come from the kit, so a program says what is on the
 screen and nothing about HTML, CSS or JavaScript.
 
-```dream
+```dream no-run
 import std.graphics as ui;
 import std.graphics.widgets as w;
 
@@ -42,7 +42,7 @@ let main! = w.run! (ui.App.new () |> ui.title "Settings" |> ui.App.set_init (Mod
 ```
 
 ```sh
-just graphics-app /tmp/settings settings.dr && just graphics-serve /tmp/settings
+mind run      # with `[graphics]` in mind.toml, as graphics.md shows
 ```
 
 `examples/budget` in `mind/std/graphics` is a whole application in widgets
@@ -133,7 +133,7 @@ A widget is adjusted in a pipeline, `Node -> Node`:
 
 `Theme` is the whole design in a handful of choices, with defaults:
 
-```dream
+```dream no-run
 let theme = w.Theme.new () |> w.Theme.set_accent "#0a7d5a" |> w.Theme.set_radius "6px"
     |> w.Theme.set_mode :light |> w.Theme.set_width "56rem";
 let main! = browser.run! (w.themed theme app);

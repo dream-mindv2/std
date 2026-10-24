@@ -90,6 +90,7 @@ union Attr {
     none
 }
 
+/// A node of `tag`, its attributes applied in the order written, with `children`.
 let element : :string -> [Attr] -> [Node] -> Node;
 let element tag attrs children =
     list.fold (fn node a -> with a node) (Node.new () |> Node.set_tag tag |> Node.set_children children) attrs;
@@ -119,15 +120,19 @@ let only : :bool -> Attr -> Attr;
 let only condition a = if condition { a } else { Attr.none };
 
 // The pipeline spelling of the same, for a node already made.
+/// An attribute set on a node already made.
 let attribute : :string -> :any -> Node -> Node;
 let attribute name value node = with (Attr.attribute name value) node;
 
+/// Inline style declarations added to a node already made.
 let styled : %{:string => :string} -> Node -> Node;
 let styled declarations node = Node.set_style (map.merge (Node.style node) declarations) node;
 
+/// A node that sends `message` on `event`.
 let on : :string -> :any -> Node -> Node;
 let on event message node = with (Attr.on event (Handler.message message)) node;
 
+/// A node given the key it is known by across renders.
 let keyed : :string -> Node -> Node;
 let keyed k node = Node.set_key k node;
 
@@ -144,6 +149,7 @@ let lazy f value = {
     Node.new () |> Node.set_tag "#lazy" |> Node.set_memo [f, value, fn u -> made]
 };
 
+/// `lazy` for a function of two values: not made again while `f`, `a` and `b` are unchanged.
 let lazy2 : (a -> b -> Node) -> a -> b -> Node;
 let lazy2 f a b = {
     let made = f a b;
@@ -191,20 +197,28 @@ union Sub {
     port(name : :string, handler : Handler)
 }
 
+/// A message every `ms` milliseconds, made from the time.
 let every : :integer -> (:integer -> :any) -> Sub;
 let every ms f = Sub.every ms (Handler.reading f);
+/// A message every animation frame, made from the milliseconds since the last.
 let on_frame : (:float -> :any) -> Sub;
 let on_frame f = Sub.frame (Handler.reading f);
+/// A message for each key pressed anywhere on the page; `f` answering `()` ignores it.
 let on_key_down : (:any -> :any) -> Sub;
 let on_key_down f = Sub.key_down (Handler.reading f);
+/// A message for each key released anywhere on the page.
 let on_key_up : (:any -> :any) -> Sub;
 let on_key_up f = Sub.key_up (Handler.reading f);
+/// A message when the window changes size, made from its width and height.
 let on_resize : (:any -> :any) -> Sub;
 let on_resize f = Sub.resize (Handler.reading f);
+/// A message when the page's address changes: a link followed, back or forward.
 let on_url : (:any -> :any) -> Sub;
 let on_url f = Sub.url (Handler.reading f);
+/// A message when the page is shown or hidden, made from whether it is visible.
 let on_visible : (:bool -> :any) -> Sub;
 let on_visible f = Sub.visible (Handler.reading f);
+/// A message for each value the application's own JavaScript sends under `name`.
 let on_port : :string -> (:any -> :any) -> Sub;
 let on_port name f = Sub.port name (Handler.reading f);
 
@@ -221,6 +235,7 @@ let sub_wire s = match s {
     Sub.port(name, _) => %{ "id" => "port:" + name, "kind" => "port", "name" => name },
 };
 
+/// How a subscription's value becomes a message.
 priv let sub_handler : Sub -> Handler;
 let sub_handler s = match s {
     Sub.every(_, h) => h, Sub.frame(h) => h, Sub.key_down(h) => h, Sub.key_up(h) => h,
@@ -238,6 +253,7 @@ mapping Window {
     height : :integer = 640
 }
 
+/// The window as given, or `:invalid_window` when a dimension is not a positive integer.
 let validate_window : Window -> Result Window :atom;
 let validate_window options = if Window.width options < 1 || Window.width options > 16384
     || Window.height options < 1 || Window.height options > 16384
@@ -325,6 +341,7 @@ mapping Driver {
 let available! : :unit -> :bool;
 let available! u = false;
 
+/// Open a window with no driver: there is no graphics host here, which is the answer.
 let open! : Window -> Result :unit :atom;
 let open! options = Result.error :graphics_unavailable;
 
@@ -383,9 +400,11 @@ priv let step !i node = if Node.key node == "" { i } else { Node.key node };
 let describe : Node -> json.Value;
 let describe node = describe_at [step 0 node] (shown node);
 
+/// A node and everything in it as the page reads it; `at` is its id, reversed.
 priv let rec describe_at at node =
     fields at node |> put "c" (describe_children at 0 (live (Node.children node)) []);
 
+/// Each child described, in order, at the position it takes.
 priv let rec describe_children at !i nodes !out = match nodes {
     [] => list.reverse out,
     [n, ..rest] => describe_children at (i + 1) rest (list.cons (describe_at (list.cons (step i n) at) (shown n)) out),
@@ -398,6 +417,7 @@ let target tree id = match id {
     _ => Option.none,
 };
 
+/// The node the rest of an id names below `node`, if it is there.
 priv let rec descend node id = match id {
     [] => Option.some node,
     [s, ..rest] => {
@@ -426,6 +446,7 @@ union Change {
     replace(entry : json.Value)
 }
 
+/// What the page must be told to show `next` where it shows `last`.
 let diff : Node -> Node -> Change;
 let diff last next = if same_memo last next { Change.same } else {
     let old = shown last;
@@ -434,6 +455,7 @@ let diff last next = if same_memo last next { Change.same } else {
     else { Change.replace (describe new) }
 };
 
+/// Two nodes of the same tag and key compared: the same, or a patch of the old one.
 priv let diff_at at old new = if old == new { Change.same } else {
     let own = fields at new;
     let olds = live (Node.children old);
@@ -447,6 +469,7 @@ priv let diff_at at old new = if old == new { Change.same } else {
     }
 };
 
+/// Whether children entries keep every old child where it was and add none.
 priv let unchanged entries n_old n_new = n_old == n_new && (n_old == 0 || entries == [[0, n_old]]);
 
 /// Children whose keys are where they were -- the usual case, a list that
@@ -455,11 +478,13 @@ priv let diff_children at olds news =
     if list.map Node.key olds == list.map Node.key news { in_place at 0 olds news [] }
     else { by_key at (key_index olds) (array.of_list olds) 0 news [] };
 
+/// Children matched position by position, since their keys are where they were.
 priv let rec in_place at !i olds news !out = match [olds, news] {
     [[o, ..os], [n, ..ns]] => in_place at (i + 1) os ns (child at i (Option.some [i, o]) n out),
     _ => list.reverse out,
 };
 
+/// Children matched by key, and an unkeyed one by position when the old child there has no key.
 priv let rec by_key at index olds !i news !out = match news {
     [] => list.reverse out,
     [n, ..ns] => {
@@ -472,6 +497,7 @@ priv let rec by_key at index olds !i news !out = match news {
     },
 };
 
+/// The old children's positions by key.
 priv let key_index olds = list.fold (fn m entry -> {
     let [j, o] = entry;
     if Node.key o == "" { m } else { m.[Node.key o => j] }
@@ -582,6 +608,7 @@ priv let rec loop! driver app !state = {
 /// page last showed, since that is what the person acted on.
 priv let settle! driver app state = if vm.mailbox_size! () > 0 { state } else { render! driver app state };
 
+/// One input from the page routed to the message it means, and that message applied.
 priv let rec step! driver app state input = match input {
     Input.dom(id, event, value) => match (handlers_at (Loop.tree state) id).[event else ()] {
         () => state,
@@ -599,6 +626,7 @@ priv let rec step! driver app state input = match input {
     Input.close => state,
 };
 
+/// Every handler's message for one value applied in turn.
 priv let rec apply_all! driver app !state handlers value = match handlers {
     [] => state,
     [h, ..rest] => apply_all! driver app (apply! driver app state (message_of h value)) rest value,
@@ -629,6 +657,7 @@ priv let subscribe! driver app state = {
            }) %{} subs)
 };
 
+/// The view of the current model sent as what changed, then what waited for it run.
 priv let render! driver app state = {
     let view = App.view app;
     let tree = view (Loop.model state);
@@ -643,11 +672,13 @@ priv let render! driver app state = {
     state |> Loop.set_tree tree |> Loop.set_later []
 };
 
+/// The actions waiting for a render, run in the order they were asked for.
 priv let rec run_later! actions = match actions {
     [] => (),
     [action!, ..rest] => { action! (); run_later! rest },
 };
 
+/// Subscriptions and then the view brought up to the model.
 priv let show! driver app state = render! driver app (subscribe! driver app state);
 
 when test {

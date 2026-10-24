@@ -7,7 +7,7 @@ window with a native Dream backend behind it. Nothing about the frontend has
 to be written in anything but Dream, and when the page has something Dream
 does not, the application ships JavaScript and CSS of its own beside it.
 
-```dream
+```dream no-run
 import std.graphics as ui;
 import std.graphics.browser;
 import std.graphics.html;
@@ -51,28 +51,45 @@ alone).
 
 ## Building and running
 
-```sh
-just                                          # the VM and the compiler
-nix-shell -p emscripten cmake --run 'just graphics-browser'   # the browser VM
-just graphics-app /tmp/hello hello.dr         # build an application
-just graphics-serve /tmp/hello                # and open http://127.0.0.1:8000/
+An application is a package whose manifest has a `[graphics]` section; its
+program is the frontend.
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+entry = "hello.dr"
+
+[graphics]
 ```
 
-`build.py` (which `graphics-app` runs) compiles the frontend for any VM and
-puts it in `OUT/assets` with the browser VM and the page that runs it: a
-static site, which any host serves if it answers `.mjs` as JavaScript, `.wasm`
-as WebAssembly and an extensionless path with `index.html`. Its flags:
+```sh
+mind run              # build it, and serve it at http://127.0.0.1:8000/
+mind run --desktop    # or open it in a window, backend and all
+mind build            # target/debug/hello/: the application, to put anywhere
+```
 
-| Flag | |
+`mind build` compiles the frontend for any VM and puts it in `assets/` with the
+browser VM and the page that runs it: a static site, which any host serves if
+it answers `.mjs` as JavaScript, `.wasm` as WebAssembly and an extensionless
+path with `index.html` (as `mind run` and `mind serve --fallback index.html`
+do). Building one needs the browser VM, from `just graphics-browser` in the
+Dream repository; `mind` finds it in the installation, in a checkout's
+`build-browser/`, or where `--runtime DIR`, `[graphics] runtime` or
+`$DREAM_BROWSER` says. The section's keys, each optional, paths relative to the
+manifest:
+
+| Key | |
 |---|---|
-| `--frontend app.dr` | the program |
-| `--backend backend.dr` | a native backend (below); optional |
-| `--js widgets.mjs` | an ES module of the application's own, imported before the program starts (repeatable) |
-| `--css theme.css` | a stylesheet of its own, linked before the program's (repeatable) |
-| `--asset img/` | files to ship: images, fonts, data (repeatable) |
-| `--connect https://api.example.com` | an origin the page may fetch from (repeatable) |
-| `--base /` | where the page finds its files; `./` (the default) works from any directory, `/` lets a deep route be reloaded |
-| `-L DIR` | a package directory for the compiler |
+| `frontend = "app.dr"` | the program, when it is not the package's entry |
+| `backend = "backend.dr"` | a native backend (below) |
+| `js = ["widgets.mjs"]` | ES modules of the application's own, imported before the program starts |
+| `css = ["theme.css"]` | stylesheets of its own, linked before the program's |
+| `assets = ["img"]` | files and directories to ship: images, fonts, data |
+| `connect = ["https://api.example.com"]` | origins the page may fetch from |
+| `base = "/"` | where the page finds its files; `./` (the default) works from any directory, `/` lets a deep route be reloaded |
+
+Dependencies, profiles and `when` flags are the package's, as for any build.
 
 On the desktop the same directory is an application:
 
@@ -132,7 +149,7 @@ the loop's own process.
 then its children (`input`, `img`, `textarea` take only attributes; `br` and
 `hr` nothing), and a function for each attribute and event worth a name:
 
-```dream
+```dream no-run
 html.form [html.class "search", html.on_submit Msg.search] [
     html.label [html.label_for "q"] [html.text "Search"],
     html.input [html.id "q", html.value query, html.on_input Msg.query, html.placeholder "Anything"],
@@ -159,7 +176,7 @@ element there. Keys are unique on the page, since `focus!` and
 not make, compare or send while `f` and `value` are the ones it had the render
 before (`ui.lazy2 f a b` for two values):
 
-```dream
+```dream no-run
 let row : Item -> ui.Node;
 let row item = html.tr [] [html.td [] [html.text (Item.name item)], ..];
 
@@ -193,7 +210,7 @@ route: the page follows it without loading, and `ui.on_url` hears it.
 `std.graphics.css` writes CSS as Dream values; a rule is its text, so a
 stylesheet is a list of strings and a theme is a function:
 
-```dream
+```dream no-run
 let styles = [
     css.vars %{ "--accent" => "#5b5bd6" },
     css.rule ".card" %{ "padding" => css.rem 1, "border-radius" => css.px 8 },
@@ -208,11 +225,11 @@ pairs where order matters. `App.styles` is installed once, as a `<style>` of
 its own. Inline styles (`html.style "color" c`) are for what a view computes
 from data, and the page refuses `url()` and `@import` in one; a stylesheet is
 the program's own code and may use anything CSS has. A hand-written file is
-`build.py --css`, linked first, so the program's rules win a tie.
+`[graphics] css`, linked first, so the program's rules win a tie.
 
 ## Canvas
 
-```dream
+```dream no-run
 import std.graphics.canvas as cv;
 
 cv.view [html.key "board", html.on_pointer_down Msg.press] 400 300 [
@@ -277,7 +294,7 @@ cross as JSON text that JavaScript never parses.
 
 ## The backend
 
-```dream
+```dream no-run
 import std.graphics.backend;
 
 let save! notes = { file.write! "notes.json" (json.encode notes); true };
@@ -307,7 +324,7 @@ terminal on the desktop and the console in a tab.
 ## Breaking out
 
 The page is not a sandbox to escape but one to extend. An application's own
-module (`build.py --js widgets.mjs`) is imported before the program starts; its
+module (`[graphics] js = ["widgets.mjs"]`) is imported before the program starts; its
 `setup(dream)` is given:
 
 | | |
@@ -333,14 +350,14 @@ export function setup(dream) {
 }
 ```
 
-```dream
+```dream no-run
 ui.element "spark-line" [html.prop "points" (Model.history model)] []
 browser.js! "confirm" %{ "text" => "Delete it?" } Msg.confirmed
 ui.on_port "online" (fn b -> Msg.online)
 ```
 
 A script that fails in `setup` stops the application before the program
-starts, with its error. `build.py --css` and `--asset` ship the rest.
+starts, with its error. `css` and `assets` ship the rest.
 
 ## Dream in the browser
 
@@ -408,7 +425,5 @@ an existing installation of either.
   pipe.
 - A filesystem in the browser: `std.file` could be backed by the origin's
   private file system, rather than answer `:unsupported`.
-- `mind` building an application from a `[graphics]` section, rather than
-  `build.py` on the command line.
 - A keyed node keeping its element when it moves to another parent (a card
   dragged between columns): it is made anew there, focus and all.

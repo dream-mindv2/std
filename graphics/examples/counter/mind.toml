@@ -1,0 +1,9 @@
+# `mind run` serves the page; `mind run --desktop` opens it in a window, with
+# the Dream backend the page calls.
+[package]
+name = "counter"
+version = "0.1.0"
+entry = "frontend.dr"
+
+[graphics]
+backend = "backend.dr"

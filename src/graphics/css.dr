@@ -21,7 +21,7 @@
 // included (an image the application ships is at its own path). Inline styles
 // (`html.style`) are values a view computes from data and are held to less:
 // the page refuses `url()` and `@import` in one. A file of CSS written by hand
-// is `build.py --css`, linked before this, so these rules win a tie.
+// is `[graphics] css`, linked before this, so these rules win a tie.
 import std.list;
 import std.map;
 import std.str;
@@ -30,6 +30,7 @@ import std.str;
 let rule : :string -> %{:string => :string} -> :string;
 let rule selector declarations = rule_in_order selector (map.sorted_pairs declarations);
 
+/// A rule whose declarations are pairs, written in the order given, for where order matters (a shorthand before its longhands).
 let rule_in_order : :string -> [[:string]] -> :string;
 let rule_in_order selector pairs = selector + " { " + declare pairs + "}";
 
@@ -46,7 +47,7 @@ let keyframes : :string -> [[:any]] -> :string;
 let keyframes name stops = "@keyframes " + name + " {\n"
     + str.join_str "\n" (list.map (fn s -> match s { [at, ds] => rule at ds }) stops) + "\n}";
 
-/// `@font-face { .. }`, for a font the application ships (`build.py --asset`).
+/// `@font-face { .. }`, for a font the application ships (`[graphics] assets`).
 let font_face : %{:string => :string} -> :string;
 let font_face declarations = rule "@font-face" declarations;
 
@@ -58,20 +59,26 @@ let raw text = text;
 let sheet : [:string] -> :string;
 let sheet rules = str.join_str "\n" rules;
 
+/// Declarations as CSS text, `name: value;` each.
 priv let declare pairs = str.concat_all (list.map (fn pair -> match pair {
     [name, value] => name + ": " + value + "; ",
 }) pairs);
 
 // --- values ------------------------------------------------------------------
 
+/// A length in pixels: `px 4` is `"4px"`.
 let px : :any -> :string;
 let px n = to_string n + "px";
+/// A length in root ems: `rem 1.5` is `"1.5rem"`.
 let rem : :any -> :string;
 let rem n = to_string n + "rem";
+/// A length in ems of the element's own font.
 let em : :any -> :string;
 let em n = to_string n + "em";
+/// A percentage: `pct 50` is `"50%"`.
 let pct : :any -> :string;
 let pct n = to_string n + "%";
+/// A colour from red, green and blue, each 0 to 255.
 let rgb : :integer -> :integer -> :integer -> :string;
 let rgb r g b = "rgb(" + to_string r + " " + to_string g + " " + to_string b + ")";
 /// `alpha` from 0.0 to 1.0.

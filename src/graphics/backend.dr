@@ -13,10 +13,12 @@ mapping Command {
     handle : :any = ()
 }
 
+/// A command the frontend may invoke by name: its payload decoded, `f` run on it, and the answer encoded back.
 let command! : :any -> :any -> (:any -> :any) -> Command;
 let command! input output handle! = Command.new () |> Command.set_input input
     |> Command.set_output output |> Command.set_handle handle!;
 
+/// The frame answering request `reply`: its value, or the error that stopped it.
 priv let response reply ok value = %{
     "name" => reply, "key" => "", "payload" => json.encode (if ok {
         %{ "ok" => true, "value" => value }
@@ -60,6 +62,7 @@ let dispatch! commands request = {
     }
 };
 
+/// Answer the frontend's invocations from standard input until it closes, each with the command of that name.
 let serve! : %{:string => Command} -> :unit;
 let serve! commands = {
     let input = io.stdin! ();
