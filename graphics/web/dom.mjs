@@ -35,7 +35,11 @@ const htmlTags = new Set(('div span main section article header footer nav aside
   'figure figcaption picture source img video audio track canvas address ins del').split(' '));
 const voids = new Set('input br hr wbr img source track col'.split(' '));
 const urlAttributes = new Set('href src action formaction poster cite background xlink:href ping'.split(' '));
-const markupProps = new Set(['innerHTML', 'outerHTML', 'srcdoc', 'insertAdjacentHTML']);
+const markupProps = new Set(['innerHTML', 'outerHTML', 'srcdoc', 'insertAdjacentHTML', 'setHTMLUnsafe']);
+// Properties that are an attribute's URL by another name, lower-cased.
+const urlProps = new Set([...urlAttributes, 'formaction', 'xlinkhref', 'data', 'codebase']);
+// The inline style whole, which would skip the checks on each declaration.
+const styleProps = new Set(['style', 'cssText', 'attributeStyleMap']);
 export const domEvents = new Set(('click dblclick contextmenu input change submit reset keydown keyup focus blur ' +
   'focusin focusout pointerdown pointermove pointerup pointerenter pointerleave pointercancel mouseenter ' +
   'mouseleave wheel scroll dragstart dragend dragover dragleave drop toggle close').split(' '));
@@ -81,14 +85,20 @@ function checkNode(node, svg, children) {
   if (voids.has(node.tag) && children) fail(`${node.tag} cannot have children`);
   if (node.draw.length && node.tag !== 'canvas') fail('only a canvas has a drawing');
   for (const [name, value] of Object.entries(node.attrs)) {
-    if (!/^[a-zA-Z][a-zA-Z0-9_:.-]*$/.test(name) || /^on/i.test(name) || name === 'style' || name === 'srcdoc' ||
-        name === 'is' || !scalar(value)) fail(`invalid attribute ${name}`);
-    if (booleans.has(name) && typeof value !== 'boolean') fail(`boolean required for ${name}`);
-    if (urlAttributes.has(name) && dangerousUrl(value)) fail(`unsafe URL in ${name}`);
+    // An HTML attribute's name is any case (`HREF` is `href`), so every test
+    // is of the name as the element will have it.
+    const lower = name.toLowerCase();
+    if (!/^[a-zA-Z][a-zA-Z0-9_:.-]*$/.test(name) || /^on/.test(lower) || lower === 'style' || lower === 'srcdoc' ||
+        lower === 'is' || !scalar(value)) fail(`invalid attribute ${name}`);
+    if (booleans.has(lower) && typeof value !== 'boolean') fail(`boolean required for ${name}`);
+    if (urlAttributes.has(lower) && dangerousUrl(value)) fail(`unsafe URL in ${name}`);
   }
-  for (const name of Object.keys(node.props)) {
+  for (const [name, value] of Object.entries(node.props)) {
     if (!/^[a-zA-Z_$][\w$]*$/.test(name) || /^on/i.test(name) || markupProps.has(name) ||
-        name === '__proto__' || name === 'constructor') fail(`invalid property ${name}`);
+        name === '__proto__' || name === 'constructor' || styleProps.has(name)) fail(`invalid property ${name}`);
+    // A property can say what an attribute says (`el.href = ..`), and is held
+    // to the same: no URL that runs.
+    if (urlProps.has(name.toLowerCase()) && dangerousUrl(value)) fail(`unsafe URL in ${name}`);
   }
   for (const [name, value] of Object.entries(node.style)) {
     if (!/^(--[a-zA-Z0-9_-]+|-?[a-z]+(-[a-z]+)*)$/.test(name) || !string(value) ||

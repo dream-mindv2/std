@@ -143,6 +143,12 @@ test('data never becomes code', () => {
     node('iframe', 'x'), node('object', 'x'), node('style', 'x'),
     node('div', '', { events: ['beforeunload'] }),
     node('div', '', { children: [node('p', 'same'), node('p', 'same')] }),
+    node('a', 'x', { attrs: { HREF: 'javascript:alert(1)' } }),
+    node('div', 'x', { attrs: { STYLE: 'background: url(https://evil)' } }),
+    node('a', 'x', { props: { href: 'javascript:alert(1)' } }),
+    node('button', 'x', { props: { formAction: 'javascript:alert(1)' } }),
+    node('div', 'x', { props: { style: 'background: url(https://evil)' } }),
+    node('div', 'x', { props: { cssText: 'color: red' } }),
   ];
   for (const tree of bad) assert.throws(() => validateTree(tree), JSON.stringify(tree));
   validateTree(node('a', 'ok', { attrs: { href: '/about', 'data-id': '7', 'aria-label': 'About' } }));

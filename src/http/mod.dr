@@ -607,8 +607,10 @@ let encode_request req target host = {
     let base = req |> with_header "host" host
                    |> (fn r -> if needs_length { with_header "content-length" (len body_text) r } else { r })
                    |> (fn r -> if streaming { with_header "transfer-encoding" "chunked" (without_header "content-length" r) } else { r });
-    str.concat_all ([method, " ", target, " HTTP/1.1\r\n"]
-                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Request.headers base)
+    let line_ok = valid_header_name method && str.all (fn c -> { let n = _char_code c; n > 32 && n != 127 }) target;
+    str.concat_all ([type_assert line_ok "a request's method must be a token, and its target printable with no space" method,
+                     " ", target, " HTTP/1.1\r\n"]
+                    + (header_lines (Request.headers base))
                     + ["\r\n", body_text])
 };
 
@@ -620,7 +622,7 @@ let encode_response resp head = {
     let bodiless = code < 200 || code == 204 || code == 304;
     let with_len = if bodiless { without_header "content-length" resp } else { with_header "content-length" (len (body resp)) resp };
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
-                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers with_len)
+                    + (header_lines (Response.headers with_len))
                     + ["\r\n", if head || bodiless { "" } else { body resp }])
 };
 
@@ -635,9 +637,16 @@ let encode_stream_head resp chunked = {
                  else if header "content-length" resp != () { resp }
                  else { with_header "connection" "close" resp };
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
-                    + flat_map (fn [k, v] -> [canonical k, ": ", v, "\r\n"]) (Response.headers framed)
+                    + (header_lines (Response.headers framed))
                     + ["\r\n"])
 };
+
+/// Headers as lines of a message. A value has had its line breaks taken out
+/// already (`header_value`); a name is held to the token it must be here,
+/// since one with `\r\n` in it would write a header of its own.
+priv let header_lines : [[:string, :string]] -> [:string];
+priv let header_lines headers = flat_map (fn [k, v] ->
+    [type_assert (valid_header_name k) ("not a header name: " + k) (canonical k), ": ", v, "\r\n"]) headers;
 
 /// `content-type` as `Content-Type`: how a header name is usually written,
 /// for peers that are fussier than the RFC lets them be.
@@ -837,7 +846,8 @@ priv let write_piece! h piece = { streams.write_all! h piece; () };
 /// One exchange, then the redirects, as browsers follow them: 303, and 301
 /// or 302 after anything but GET or HEAD, become a GET without a body;
 /// 307 and 308 repeat the request as it was. Credentials are not carried to
-/// another host.
+/// another origin: another host, port, or scheme -- `https` to `http` on the
+/// same host would send them in the clear.
 priv let follow! : :map -> :map -> :integer -> :any -> :map;
 priv let rec follow! c req left sink = {
     let resp = exchange! c req sink (left > 0);
@@ -852,10 +862,17 @@ priv let rec follow! c req left sink = {
         let moved = req |> Request.set_url (url.to_text (there |> url.Url.set_fragment ""))
                         |> (fn r -> if to_get { r |> Request.set_method "GET" |> with_body "" |> Request.set_stream ()
                                                   |> without_header "content-type" |> without_header "content-length" } else { r })
-                        |> (fn r -> if url.Url.host there != url.Url.host here { without_header "authorization" (without_header "cookie" r) } else { r });
+                        |> (fn r -> if same_origin here there { r } else {
+                               r |> without_header "authorization" |> without_header "proxy-authorization" |> without_header "cookie"
+                           });
         follow! c moved (left - 1) sink
     }
 };
+
+/// Whether two URLs are one origin: scheme, host and port, the port as used.
+priv let same_origin : url.Url -> url.Url -> :bool;
+priv let same_origin a b = str.lower (url.Url.scheme a) == str.lower (url.Url.scheme b)
+    && str.lower (url.Url.host a) == str.lower (url.Url.host b) && url.port_of a == url.port_of b;
 
 /// Test whether a status code triggers supported redirect handling.
 priv let is_redirect : :integer -> :bool;
@@ -1016,11 +1033,27 @@ when test {
             { let m = Response.new () |> with_header "X-Thing" "a" |> add_header "x-thing" "b";
               [header "x-THING" m, header_all "X-Thing" m, header "nope" m] } ),
         test.case "with_header replaces" $( test.eq! [["x", "2"]] (Response.headers (Response.new () |> with_header "X" 1 |> with_header "x" 2)) ),
+        test.case "a header name, method or target that would write a line of its own is refused" $( {
+            let refused! f = try! { strict! (str.length (f ())); false } catch e { true };
+            test.eq! [true, true, true]
+                [refused! (fn u -> encode_response (with_header "x\r\nset-cookie: a" "v" (Response.new ())) false),
+                 refused! (fn u -> encode_request (Request.new () |> Request.set_method "GET /x HTTP/1.1\r\nA:") "/" "h"),
+                 refused! (fn u -> encode_request (Request.new ()) "/a b\r\nEvil: 1" "h")]
+        } ),
         test.case "line breaks are taken out of values" $( test.eq! "aSet-Cookie: x" (header "x" (with_header "x" "a\r\nSet-Cookie: x" (Response.new ()))) ),
         test.case "content type without parameters" $( test.eq! "application/json"
             (content_type (with_header "Content-Type" "Application/JSON; charset=utf-8" (Response.new ()))) ),
         test.case "a JSON response" $( test.eq! [200, "{\"a\":1}", "application/json"]
             { let r = json %{ "a" => 1 }; [status r, body r, header "content-type" r] } ),
+        test.case "credentials stay with their origin" $( {
+            let u = fn t -> url.parse_or_raise t;
+            test.eq! [true, true, false, false, false]
+                [same_origin (u "https://a.example/x") (u "https://a.example/y"),
+                 same_origin (u "https://A.example/x") (u "https://a.example:443/"),
+                 same_origin (u "https://a.example/") (u "http://a.example/"),
+                 same_origin (u "https://a.example/") (u "https://a.example:8443/"),
+                 same_origin (u "https://a.example/") (u "https://b.example/")]
+        } ),
         test.case "a redirect" $( test.eq! [303, "/x"] { let r = redirect_with 303 "/x"; [status r, header "location" r] } ),
         test.case "a cookie" $( test.eq! "sid=abc; HttpOnly; Path=/"
             (header "set-cookie" (with_cookie "sid" "abc" %{ "Path" => "/", "HttpOnly" => true, "Secure" => false } (text ""))) ),

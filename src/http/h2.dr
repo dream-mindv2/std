@@ -119,9 +119,32 @@ priv let unpadded kind flags payload = {
 
 // --- the reader --------------------------------------------------------------------------
 
+// What a peer may make this end hold. This end never raises
+// SETTINGS_MAX_FRAME_SIZE, so a peer may send nothing larger than its 16 KiB
+// default -- reading up to the 16 MiB a frame's length can say was a peer's
+// way to have that much buffered per frame. A header block is bounded in
+// size and in pieces (the CONTINUATION flood of 2024: fragments sent for ever,
+// each appended to the last), and a server runs at most `max_streams`
+// handlers, the number its SETTINGS announce, however fast a client opens
+// streams and resets them (Rapid Reset, 2023).
+
+/// The largest frame a peer may send: the protocol's default, never raised.
+priv let largest_frame : :integer;
+priv let largest_frame = 16384;
+
+/// The largest header block, and the most CONTINUATION frames one may take.
+priv let max_header_block : :integer;
+priv let max_header_block = 65536;
+priv let max_continuations : :integer;
+priv let max_continuations = 64;
+
+/// The concurrent streams a server announces, and holds a client to.
+priv let max_streams : :integer;
+priv let max_streams = 128;
+
 /// Read HTTP/2 frames and forward them to the coordinating process.
 priv let read_loop! : :any -> :process -> :unit;
-priv let rec read_loop! r coordinator = match try! { let f = read_frame! r 16777215; strict! f; ok f } catch e { err e } {
+priv let rec read_loop! r coordinator = match try! { let f = read_frame! r largest_frame; strict! f; ok f } catch e { err e } {
     Result.ok(()) => { send! coordinator [:h2_closed, "the connection ended"]; () },
     Result.error(e) => { send! coordinator [:h2_closed, error.describe e]; () },
     Result.ok([kind, flags, id, payload, r2]) => {
@@ -152,6 +175,8 @@ mapping Conn {
     max_body : :integer = 10485760
     progress : :any = ()
     closing : :bool = false
+    // A server's handlers still running, a stream reset under one included.
+    running : :integer = 0
 }
 
 /// A stream: the header block arriving, the headers once decoded, the body
@@ -172,6 +197,7 @@ mapping Stream {
     ref : :any = ()
     sink : :bool = false
     head_sent : :bool = false
+    continuations : :integer = 0
 }
 
 /// Write bytes through the connection's serialized output path.
@@ -203,7 +229,7 @@ let serve! sock r respond! max_body progress! = {
     let reader = spawn! $( read_loop! r me );
     let c = Conn.new sock :server (hpack.decoder 4096)
             |> Conn.set_respond respond! |> Conn.set_max_body max_body |> Conn.set_progress progress!;
-    write! c (frame settings_frame 0 0 (settings_payload [[3, 128], [4, our_window]]) + frame window_frame 0 0 (be 4 (our_window - 65535)))
+    write! c (frame settings_frame 0 0 (settings_payload [[3, max_streams], [4, our_window]]) + frame window_frame 0 0 (be 4 (our_window - 65535)))
     coordinate! c
     // The reader is parked in a read; closing the socket under it is what
     // ends it -- quietly, where killing it would be reported as a failure.
@@ -255,12 +281,18 @@ priv let rec coordinate! c =
                 }
             },
             [:h2_closed, why] => fail_all! c why,
-            // A server's handler has its answer.
-            [:h2_respond, id, resp] => coordinate! (respond_whole! c id resp),
-            [:h2_head, id, resp] => coordinate! (send_head! c id resp false),
+            // A server's handler has its answer. A stream the client reset
+            // meanwhile is gone, and its answer goes nowhere: written, it would
+            // have been sent on a closed stream and put the stream back.
+            [:h2_respond, id, resp] => {
+                let c2 = Conn.set_running (Conn.running c - 1) c;
+                coordinate! (if map.has id (Conn.streams c2) { respond_whole! c2 id resp } else { c2 })
+            },
+            [:h2_head, id, resp] => coordinate! (if map.has id (Conn.streams c) { send_head! c id resp false } else { c }),
             [:h2_data, id, piece, end] => {
                 match Conn.progress c { () => (), p => p () }
-                coordinate! (queue! c id piece end)
+                let c2 = if end { Conn.set_running (Conn.running c - 1) c } else { c };
+                coordinate! (queue! c2 id piece end)
             },
             // A client's caller has a request.
             [:h2_request, caller, ref, req, sink] => coordinate! (start_request! c caller ref req sink),
@@ -298,14 +330,19 @@ priv let on_frame! c kind flags id payload = {
         1 => {
             if id == 0 { raise! (error.new :protocol "HEADERS on stream 0") }
             let block = match unpadded kind flags payload { () => raise! (error.new :protocol "bad padding"), b => b };
-            let s = stream_of c id |> Stream.set_block block;
+            if len block > max_header_block { raise! (error.new :protocol "a header block larger than allowed") }
+            let s = stream_of c id |> Stream.set_block block |> Stream.set_continuations 0;
             let c2 = put_stream c id s;
             if has_flag flags 4 { headers_done! c2 id (has_flag flags 1) }
             else { Conn.set_continuing id c2 |> (fn cc -> put_stream cc id (Stream.set_sink (has_flag flags 1) s)) }
         },
         9 => {
+            if Conn.continuing c == () { raise! (error.new :protocol "CONTINUATION with no header block to continue") }
             let s = stream_of c id;
-            let s2 = Stream.set_block (Stream.block s + payload) s;
+            if len (Stream.block s) + len payload > max_header_block || Stream.continuations s >= max_continuations {
+                raise! (error.new :protocol "a header block larger than allowed")
+            }
+            let s2 = s |> Stream.set_block (Stream.block s + payload) |> Stream.set_continuations (Stream.continuations s + 1);
             let c2 = put_stream c id s2;
             if has_flag flags 4 {
                 // END_STREAM rode on the HEADERS frame, kept in `sink` until now.
@@ -398,7 +435,13 @@ priv let headers_done! c id end_stream = {
         Result.ok([headers, d2]) => {
             let c2 = Conn.set_decoder d2 c;
             match Conn.role c {
-                :server => {
+                // Decoded first either way, since the decoder's table must
+                // follow every block the peer sent; then refused, if this
+                // end is already as busy as it said it would be.
+                :server => if Conn.running c2 >= max_streams || map.size (Conn.streams c2) > max_streams {
+                    write! c2 (frame rst_frame 0 id (be 4 7))
+                    drop_stream c2 id
+                } else {
                     let s2 = s |> Stream.set_block "" |> Stream.set_headers headers;
                     let c3 = put_stream c2 id s2;
                     if end_stream { stream_ended! c3 id } else { c3 }
@@ -431,7 +474,7 @@ priv let stream_ended! c id = {
             let me = self! ();
             let respond! = Conn.respond c;
             spawn! $( handle! me id respond! req )
-            put_stream c id (Stream.set_pieces [] s)
+            put_stream (Conn.set_running (Conn.running c + 1) c) id (Stream.set_pieces [] s)
         },
         _ => {
             let resp = response_of (Stream.headers s) (str.concat_all (list.reverse (Stream.pieces s)));
@@ -444,7 +487,9 @@ priv let stream_ended! c id = {
 /// A server's request handler, in a process of its own.
 priv let handle! : :process -> :integer -> (:map -> :map) -> :map -> :unit;
 priv let handle! coordinator id respond! req = {
-    let resp = respond! req;
+    // An answer always comes back, since the coordinator counts handlers by
+    // the answers they send.
+    let resp = try! { let r = respond! req; strict! r; r } catch e { %{ :status => 500, :headers => [], :body => "" } };
     match resp.[:stream else ()] {
         () => send! coordinator [:h2_respond, id, resp],
         s => {
@@ -646,6 +691,25 @@ when test {
             let req = request_of [[":method", "POST"], [":scheme", "https"], [":authority", "x.test"], [":path", "/a/b?q=1"], ["accept", "*/*"]] "body";
             test.eq! ["POST", "/a/b", "1", [["accept", "*/*"], ["host", "x.test"]], "body", "HTTP/2"]
                      [req.[:method], req.[:path], req.[:query].["q"], req.[:headers], req.[:body], req.[:version]]
+        } ),
+        test.case "a header block is bounded, and only continues one that began" $( {
+            let c = Conn.new () :server (hpack.decoder 4096);
+            let refused! f = try! { strict! (f ()); :taken } catch e { :refused };
+            let big = str.repeat 70000 "a";
+            test.eq! [:refused, :refused, :refused]
+                [refused! (fn u -> on_frame! c 9 4 1 "x"),
+                 refused! (fn u -> on_frame! c 1 0 1 big),
+                 refused! (fn u -> {
+                     let opened = on_frame! c 1 0 1 "";
+                     on_frame! opened 9 0 1 big
+                 })]
+        } ),
+        test.case "a server busy with as many handlers as it announced refuses another stream" $( {
+            let block = hpack.encode [[":method", "GET"], [":scheme", "https"], [":path", "/"], [":authority", "x"]];
+            let busy = Conn.new () :server (hpack.decoder 4096) |> Conn.set_running max_streams;
+            let idle = Conn.new () :server (hpack.decoder 4096) |> Conn.set_respond (fn req -> %{ :status => 200 });
+            test.eq! [false, true]
+                [map.has 1 (Conn.streams (on_frame! busy 1 4 1 block)), map.has 1 (Conn.streams (on_frame! idle 1 4 1 block))]
         } ),
         test.case "connection headers are left out" $( test.eq! [["content-type", "text/plain"]]
             (header_list [["Connection", "close"], ["Content-Type", "text/plain"], ["Transfer-Encoding", "chunked"]]) ),

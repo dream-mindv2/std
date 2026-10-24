@@ -118,6 +118,7 @@ priv let next! sock = {
     // connection arrives here.
     match wire.frame_size (exactly! sock wire.frame_header []) {
         size if size < 0 => (),
+        size if size > max_message => Result.error ("a message of " + to_string size + " bytes, past the limit"),
         size => {
             let body = exactly! sock size [];
             if len body < size { () } else { wire.decode body }
@@ -131,10 +132,26 @@ priv let send! sock value = streams.write_all! sock (wire.frame value);
 
 // --- serving ------------------------------------------------------------------
 
-/// A listening socket. `0` asks the system for a free port; `port_of!` says
-/// which one it gave.
+/// A listening socket on this machine alone (127.0.0.1). `0` asks the system
+/// for a free port; `port_of!` says which one it gave.
+///
+/// Loopback is the default because nothing here asks who is calling: a
+/// listener anyone can reach is a server anyone can call, every handler it
+/// has. A server meant for the network says where with `listen_on!`, and
+/// puts what decides who may use it in front.
 let listen! : :integer -> :any;
-let listen! port = net.listen! port;
+let listen! port = net.listen_on! "127.0.0.1" port;
+
+/// A listening socket at `host`: `"0.0.0.0"` for every interface, or one of
+/// this machine's addresses. For `serve_on!` and `serve_on_via!`.
+let listen_on! : :string -> :integer -> :any;
+let listen_on! host port = net.listen_on! host port;
+
+/// The largest message either end reads: a frame's header says how long its
+/// body is, and that many bytes are held before any is looked at, so the
+/// header is the one thing a peer must not be believed about.
+let max_message : :integer;
+let max_message = 16777216;
 
 /// Return the actual port bound by a network listener.
 let port_of! : :any -> :integer;
@@ -244,7 +261,7 @@ let serve_on_via! listener find! = spawn! $( accept_loop! listener find! );
 /// when a request arrives rather than when the listener started.
 let serve_via! : :integer -> (:unit -> :any) -> :any;
 let serve_via! port find! = {
-    let listener = net.listen! port;
+    let listener = listen! port;
     serve_on_via! listener find!
     listener
 };
@@ -316,6 +333,7 @@ let cast! conn message = streams.write_all! conn (wire.frame [:cast, message]);
 
 when test {
     import std.map;
+    import std.str;
     import std.registry;
     import std.supervisor;
     import std.test;
@@ -390,6 +408,16 @@ when test {
                    let r = call! c [:put, "a", 1];
                    close! c
                    r
+               })) ),
+        test.case "a message past the limit is refused before it is read"
+            $( test.true! (with_store! (fn port -> {
+                   // A header saying a gigabyte follows, and nothing after it:
+                   // the answer comes at once, not after a gigabyte is held.
+                   let sock = net.connect! "127.0.0.1" port;
+                   streams.write_all! sock (str.of_bytes [0, 0, 0, 64])
+                   let answer = next! sock;
+                   io.close! sock
+                   match answer { Result.ok(Result.error(why)) => str.contains_str "past the limit" why, _ => false }
                })) ),
         test.case "the state is still there for the next call"
             $( test.eq! 1 (with_store! (fn port -> {
