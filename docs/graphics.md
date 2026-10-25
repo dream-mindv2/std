@@ -99,18 +99,22 @@ from those payloads, and runs the image again as the backend with
 `--headless`, so it is installed and run as any program is:
 
 ```sh
-nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'
-build-graphics/bin/dream /tmp/hello/target/debug/hello.dream
+dream /tmp/hello/target/debug/hello.dream
 mind install && dream -x hello
 ```
 
 `--graphics DIR` still opens a site directory laid out by hand, with a
 `backend.dream` beside its `assets/`.
 
-`graphics-vm` builds the VM with `DREAM_ENABLE_GRAPHICS=ON` (GTK 3 and
-WebKitGTK 4.1, Linux only for now). An ordinary VM answers `--graphics` with
-`graphics_unavailable`, as a graphics VM does without a display, and importing
-`std.graphics` never opens a window.
+Every desktop Linux VM opens windows, the released toolchain's included: GTK
+3 and WebKitGTK are not linked but found when a window is first wanted, as
+`std.ffi` finds a C library (`$DREAM_LIB_WEBKIT2GTK`, `$DREAM_LIBRARY_PATH`,
+the loader, then Nix's and Homebrew's directories), API 4.1 preferred and 4.0
+accepted ([dream/src/graphics_api.hpp](../../../dream/src/graphics_api.hpp)).
+So the VM still starts where they are missing, and only a window says
+`graphics_unavailable`, naming everywhere it looked and the package to
+install. So does one with no display, or anywhere but desktop Linux for now;
+importing `std.graphics` never opens a window.
 
 ## The program
 
@@ -464,7 +468,7 @@ person's browser, and refuses every other navigation.
 npm ci --prefix mind/std/graphics
 just test-graphics            # Dream units, jsdom, the examples on the browser VM
 just test-graphics-browser    # and in headless Chromium (Playwright's, or $DREAM_CHROME)
-nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm && just test-graphics-native'
+nix-shell mind/std/graphics/shell.nix --run 'just test-graphics-native'
 just test-browser-compat      # every example on the browser VM, byte for byte
 ```
 

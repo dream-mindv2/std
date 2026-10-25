@@ -2,7 +2,7 @@
 """Run the std.graphics suites against VM, compiler and browser runtime already built.
 
     run.py --vm VM --compiler dreams.dream --mind build/mind --runtime build-browser
-           [--browser] [--graphics-vm build-graphics/bin/dream]
+           [--browser] [--graphics-vm build-dream/bin/dream]
 
 Always: the Dream modules' tests, the page's JavaScript under jsdom, every
 example built by `mind build` as its manifest says, and the counter's frontend

@@ -54,6 +54,7 @@
 
 import std.error;
 import std.install;
+import std.io;
 import std.list;
 import std.macros;
 import std.num;
@@ -661,15 +662,18 @@ let temp_dir! () = match os.platform () {
     _ => match env_dir! "TMPDIR" { () => "/tmp", p => p },
 };
 
-/// The first Dream installation directory, using the same lookup as the
-/// installed tools (`std.install.dirs!`): `$MINDV2_PATH`, the VM's packaged
-/// installation, or `~/.mindv2`. Without an existing installation, answers
-/// `~/.mindv2` even before it exists, or `()` without home. Relative paths
-/// are made absolute and quoted tildes are expanded. Does not create it.
+/// Where a person's own Dream things go -- what `mind install` installs,
+/// and a program's data: the first installation directory (`std.install.dirs!`)
+/// that is not a toolchain's. A toolchain's (it holds `toolchain.toml`) is
+/// one version of the language as it shipped, replaced whole by the next, so
+/// what is put there would go with it; the VM searches `~/.mindv2` after it
+/// for exactly this. Without an installation, answers `~/.mindv2` even
+/// before it exists, or `()` without home. Relative paths are made absolute
+/// and quoted tildes are expanded. Does not create it.
 let dream_dir! : :unit -> :string | :unit;
-let dream_dir! () = match install.dirs! () {
-    [] => under_home! ".mindv2",
-    [dir, .._] => {
+let dream_dir! () = match list.find (fn dir -> not (io.exists! (join dir "toolchain.toml"))) (install.dirs! ()) {
+    () => under_home! ".mindv2",
+    dir => {
         let expanded = slashes (expand_home! dir);
         if expanded == "~" || str.starts_with "~/" expanded { () }
         else { absolute! expanded }

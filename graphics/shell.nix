@@ -1,9 +1,9 @@
-# What the desktop graphics VM builds and is tested with: GTK 3 and
-# WebKitGTK 4.1, and Xvfb for the headless test. Inside the Dream workspace
-# this is the workspace's own shell (LLVM, the static libffi) with those added;
-# alone, it is enough for `cmake -DDREAM_ENABLE_GRAPHICS=ON`.
+# What the desktop window is tested with: GTK 3 and WebKitGTK 4.1, which the
+# VM finds on LD_LIBRARY_PATH at run time (it links neither), and Xvfb for
+# the headless test. Inside the Dream workspace this is the workspace's own
+# shell (LLVM, the static libffi) with those added.
 #
-#   nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'
+#   nix-shell mind/std/graphics/shell.nix --run 'just test-graphics-native'
 { pkgs ? import <nixpkgs> {} }:
 let
   workspace = ../../../shell.nix;

@@ -1,7 +1,7 @@
 [package]
 license = "MIT OR Apache-2.0"
 name = "std"
-version = "0.3.1"
+version = "0.3.2"
 repository = "https://github.com/dream-mindv2/std"
 description = "The Dream standard library"
 
