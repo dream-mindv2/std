@@ -31,8 +31,10 @@ mapping Clusters {
     rounds : :integer = 0
 }
 
+/// The squared Euclidean distance between two points, as lists of numbers.
 priv let sq_dist a b = list.fold (fn acc p -> { let d = list.head p - list.nth 1 p; acc + d * d }) 0.0 (list.zip a b);
 
+/// The index of the centre `score` puts nearest to `x`: the least score wins.
 priv let nearest_by score centres x = list.head (list.fold (fn best ic -> {
     let s = score (list.nth 1 ic) x;
     if best == () || s < list.nth 1 best { [list.head ic, s] } else { best }

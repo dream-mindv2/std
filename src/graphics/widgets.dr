@@ -424,6 +424,9 @@ mapping Palette {
     empty : :string = "Nothing matches"
 }
 
+/// The command palette: a field over a list of items it narrows as the
+/// person types, the arrows moving the choice and Enter taking it -- or
+/// nothing at all while it is closed.
 let palette : Palette -> Node;
 let palette p = if not (Palette.open p) { nothing_node } else {
     let items = Palette.items p;
@@ -578,9 +581,13 @@ priv let term_block parts = {
 priv let term_line spans mark = kit "div" "term-line" (list.map term_span spans)
     |> with (if mark == () { Attr.none } else { Attr.class ("dw-term-mark dw-term-" + atom.name mark) });
 
+/// A handler reading the event, for a function that was given; nothing for `()`.
 priv let on_maybe event f = if f == () { Attr.none } else { Attr.on event (Handler.reading f) };
+/// A handler sending `message`, for a message that was given; nothing for `()`.
 priv let tell_maybe event message = if message == () { Attr.none } else { Attr.on event (Handler.message message) };
 
+/// A terminal's screen: its lines in blocks, the cursor laid over them, and
+/// the field that takes the keyboard for it. See "terminals" above.
 let terminal : Terminal -> Node;
 let terminal t = {
     let marks = Terminal.marks t;
