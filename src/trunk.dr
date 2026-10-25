@@ -212,6 +212,12 @@ when test {
         test.case "a queue, pushed at one end and taken from the other"
             $( { let q = list.fold (fn acc i -> rest (push i acc)) (of [0]) (list.range 1 100);
                  test.eq! [99] (to_list q) } ),
+        // Past half its slots let go, a slice gets a store of its own: the
+        // old version must still read every slot, and the slice still grow.
+        test.case "a slice that lets most go leaves the old version whole"
+            $( { let big = list.fold (fn acc i -> push i acc) empty (list.range 0 100);
+                 let tail = push 100 (drop 95 big);
+                 test.eq! [[95, 96, 97, 98, 99, 100], 100, 99] [to_list tail, length big, at 99 big] } ),
         test.case "an association list kept by put"
             $( { let words = ["a", "b", "a", "c", "a", "b"];
                  let counts = list.fold (fn acc w -> put w (Option.unwrap_or 0 (lookup w acc) + 1) acc) empty words;
