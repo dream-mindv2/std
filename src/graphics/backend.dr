@@ -1,6 +1,16 @@
 // Explicit command capabilities for a native Dream backend. Standard output
 // belongs to this protocol; application logs belong on standard error.
+//
+// A backend answers what the frontend asks, one request at a time and in the
+// order asked, and it may also speak first: `serve_with!` hands the commands
+// an `Events`, and `emit! events name value` sends the frontend `value` under
+// `name`, where `ui.on_backend name f` hears it. That is how a backend that
+// watches something -- a process's output, a file, a socket -- tells the page
+// as it happens, instead of being asked again and again. Answers and events
+// leave through one writer process, so the lines never interleave, and any
+// process may emit.
 import std.console;
+import std.error;
 import std.io;
 import std.json;
 import std.str;
@@ -62,11 +72,58 @@ let dispatch! commands request = {
     }
 };
 
+/// Where a backend's events go: the process that owns standard output.
+struct Events {
+    writer : :process
+}
+
+/// The frame carrying event `name`.
+priv let event_frame name value = %{ "name" => "event", "key" => name, "payload" => json.encode value };
+
+/// Send the frontend `value` as event `name`, heard by `ui.on_backend name`.
+/// It returns at once; events and answers reach the page in the order they
+/// were sent. A frame over the 1 MiB limit stops the backend, so a large
+/// stream is sent in pieces.
+let emit! : Events -> :string -> json.Value -> :unit;
+let emit! events name value = {
+    post! (Events.writer events) (json.encode (event_frame name value))
+};
+
+/// `encoded` sent to the writer, or raised here, in the sender, when it is
+/// larger than the host takes: the writer is a process of its own, and a
+/// failure there would go unseen.
+priv let post! writer encoded = {
+    strict! encoded
+    if str.byte_length encoded > 1048576 {
+        raise! (error.new :graphics_protocol "a frame exceeds the message limit")
+    }
+    send! writer [:frame, encoded]
+    ()
+};
+
+/// The writer: each frame a line on standard output, until told to stop.
+priv let write_frames! output = {
+    let rec loop! u = match recv! () {
+        [:frame, encoded] => { streams.write_all! output (encoded + "\n"); loop! () },
+        [:stop, from] => send! from :stopped,
+        _ => loop! (),
+    };
+    loop! ()
+};
+
 /// Answer the frontend's invocations from standard input until it closes, each with the command of that name.
 let serve! : %{:string => Command} -> :unit;
-let serve! commands = {
+let serve! commands = serve_with! (fn events -> commands);
+
+/// The same, with the commands made from the `Events` they may emit through:
+/// `serve_with! (fn events -> %{ "watch" => backend.command! :string :bool (watch! events) })`.
+let serve_with! : (Events -> %{:string => Command}) -> :unit;
+let serve_with! make = {
     let input = io.stdin! ();
     let output = io.stdout! ();
+    let writer = spawn! $( write_frames! output );
+    let events = Events.make writer;
+    let commands = make events;
     let rec loop! u = match console.read_line_from! 1048576 input {
         () => (),
         line => {
@@ -74,15 +131,15 @@ let serve! commands = {
                 Result.ok(request) => dispatch! commands request,
                 Result.error(reason) => response "" false "invalid_json",
             };
-            let encoded = json.encode answer;
-            if str.byte_length encoded > 1048576 {
-                raise! (_error_new :graphics_protocol "response exceeds message limit")
-            }
-            streams.write_all! output (encoded + "\n")
+            post! writer (json.encode answer)
             loop! ()
         },
     };
     loop! ()
+    // Everything sent before the input ended is written before this returns.
+    send! writer [:stop, self! ()]
+    let rec stopped! u = match recv! () { :stopped => (), _ => stopped! () };
+    stopped! ()
 };
 
 when test {
@@ -122,6 +179,9 @@ when test {
         test.case "malformed command payloads are rejected" $(test.eq! (response "r" false "invalid_arguments")
             (dispatch! %{"echo" => command! :integer :integer echo!}
                 %{"type" => "invoke", "reply" => "r", "command" => "echo", "payload" => "{"})),
+        test.case "an event is a frame the page routes by name" $(test.eq!
+            %{ "name" => "event", "key" => "output", "payload" => "{\"id\":1}" }
+            (event_frame "output" %{ "id" => 1 })),
         test.case "empty reply names are rejected" $(test.eq! (response "" false "invalid_request")
             (dispatch! %{} %{"type" => "invoke", "reply" => "", "command" => "echo", "payload" => "1"}))
     ];

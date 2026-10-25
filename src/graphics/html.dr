@@ -25,6 +25,7 @@
 // name. A function that answers `()` sends nothing.
 import std.graphics.{element, text as text_node, nothing as nothing_node, Attr, Handler, Node};
 import std.list;
+import std.str;
 
 /// Text, shown as written: never parsed as markup.
 let text : :string -> Node;
@@ -352,6 +353,35 @@ let on_wheel f = on_value "wheel" f;
 /// `%{"top", "left"}`, the element's scroll position.
 let on_scroll : (:any -> :any) -> Attr;
 let on_scroll f = on_value "scroll" f;
+/// The text pasted into the element while it has the focus. With
+/// `prevent ["paste"]` nothing is inserted, and the text is the program's.
+let on_paste : (:string -> :any) -> Attr;
+let on_paste f = on_value "paste" f;
+/// The text an input method finished composing -- a word typed in Japanese,
+/// an accented letter made with a dead key.
+let on_compose : (:string -> :any) -> Attr;
+let on_compose f = on_value "compositionend" f;
+
+/// Take over what the browser would do for these events on this element:
+/// `prevent ["keydown", "paste"]` keeps Tab, the arrows and Ctrl-keys from
+/// moving the focus, scrolling or editing, and a paste from inserting, so a
+/// program that is its own editor or terminal gets every key. The browser's
+/// answer has to be given as the event happens, before the program could be
+/// asked, so the element says ahead of time. A control that prevents
+/// `compositionend` is emptied after each composition, for the same reason.
+let prevent : [:string] -> Attr;
+let prevent events = Attr.attribute "data-dream-prevent" (str.join_str " " events);
+/// Key chords the browser keeps on an element that prevents `keydown`, each
+/// written as its modifiers then its key, in this order and lower case:
+/// `"ctrl+shift+v"`, `"meta+c"`, `"f12"`. What a paste or a copy is made by
+/// is the browser's, so a terminal leaves its own paste chord to it.
+let pass_keys : [:string] -> Attr;
+let pass_keys chords = Attr.attribute "data-dream-pass" (str.join_str " " chords);
+/// The opposite, for a field that types: only these chords' defaults are
+/// taken over (`["arrowup", "arrowdown", "enter", "escape"]` for a search
+/// box with a list under it), and every other key does what it always does.
+let prevent_keys : [:string] -> Attr;
+let prevent_keys chords = Attr.attribute "data-dream-keys" (str.join_str " " chords);
 
 when test {
     import std.test;
@@ -368,6 +398,10 @@ when test {
         }),
         test.case "conditional classes" $(test.eq! ["todo"]
             (Node.classes (li (classes [["todo", true], ["done", false]]) []))),
+        test.case "an element names the defaults it takes over, and the chords it leaves" $({
+            let n = div [prevent ["keydown", "paste"], pass_keys ["ctrl+shift+v"]] [];
+            test.eq! ["keydown paste", "ctrl+shift+v"] [(Node.attrs n).["data-dream-prevent"], (Node.attrs n).["data-dream-pass"]]
+        }),
         test.case "on_enter ignores other keys" $({
             let h = (graphics.handlers_at (input [on_enter :go]) [0]).["keydown"];
             test.eq! [:go, ()] [graphics.message_of h %{"key" => "Enter"}, graphics.message_of h %{"key" => "a"}]

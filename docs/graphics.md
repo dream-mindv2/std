@@ -200,7 +200,31 @@ elsewhere on the page to the screen in about 80 ms with lazy rows, and in about
 | `on_click_at`, `on_pointer_down/move/up` | `%{"x", "y"}` on the element, `"button"`, `"buttons"`, the modifiers, `"pointer"` |
 | `on_wheel` | `%{"dx", "dy", "x", "y"}` |
 | `on_scroll` | `%{"top", "left"}` |
+| `on_paste` | the text pasted, as plain text |
+| `on_compose` | the text an input method finished composing |
 | `on_click`, `on_focus`, `on_blur`, `on_mouse_enter` .. | the message as given |
+
+**Editors and terminals.** Whether the browser does what a key or a paste
+would do -- move the focus on Tab, scroll on Space, insert the pasted text --
+has to be decided while the event is happening, before a message could reach
+the program and its answer come back. So an element says ahead of time:
+
+```dream no-run
+html.div [html.attr "tabindex" 0, html.on_key_down Msg.key, html.on_paste Msg.paste,
+    html.prevent ["keydown", "paste"], html.pass_keys ["ctrl+shift+c", "ctrl+shift+v"]] [..]
+```
+
+`html.prevent events` takes over those events' defaults on the element, so a
+program that is its own editor gets every key; a bare modifier, and a key an
+input method is composing with, stay the browser's. `html.pass_keys chords`
+leaves those chords to the browser all the same, which is how a terminal
+keeps the browser's own copy and paste. `html.prevent_keys chords` is the
+narrow form, for an ordinary control: only those chords are kept from it,
+whether or not the program listens for keys there -- a text area whose
+Ctrl+Enter is the window's shortcut, not a newline. A chord is its modifiers
+then its key, in this order and lower case: `"ctrl+alt+shift+meta+k"`,
+`"meta+enter"`, `"f12"`. A control that prevents `compositionend` is emptied
+after each composition, its text having gone to the program.
 
 A link to a path of the application's own (`html.a [html.href "/about"]`) is a
 route: the page follows it without loading, and `ui.on_url` hears it.
@@ -266,6 +290,7 @@ for again keeps running rather than restarting.
 | `ui.on_url f` | `%{"path", "query", "hash", "href"}`, at once and on each navigation |
 | `ui.on_visible f` | whether the page is showing |
 | `ui.on_port name f` | what the application's JavaScript sends under `name` |
+| `ui.on_backend name f` | what the backend emits under `name` (see "The backend"); desktop only |
 
 ## Effects
 
@@ -281,9 +306,10 @@ the answer arrives later like any other message. All are in
 | `save! key value`, `forget! key` | none: local storage, as JSON |
 | `load! key f` | `Option json.Value` |
 | `navigate! url`, `replace_url! url`, `back! ()` | none; `ui.on_url` hears it |
-| `focus! key`, `blur! key`, `scroll_to! key` | none; run after the render the update makes, so a field that update creates can be focused |
+| `focus! key`, `blur! key`, `scroll_to! key`, `scroll_to_end! key` | none; run after the render the update makes, so a field that update creates can be focused |
 | `measure! key f` | `Result %{"x", "y", "width", "height"} :string` |
 | `set_title! t`, `copy! text` | none (the clipboard only while handling a click or a key) |
+| `selected_text! f` | `Result :string :string`: the text selected on the page, `""` for none |
 | `after! ms msg` | `msg`, after `ms` |
 | `invoke! command value f` | the backend's `Result json.Value :string` |
 | `js! name args f`, `js_do! name args` | the application's JavaScript's answer |
@@ -312,6 +338,31 @@ type refuses `invalid_result`, and a handler that raises `command_failed`.
 Requests and answers are bounded to 1 MiB. The backend's standard output is the
 protocol; log with `console.error!`. In a tab, or with no backend, every
 command answers `backend_unavailable`.
+
+**Events.** An answer is the backend's only way to speak unless it is given
+the `Events`: `backend.serve_with! make` calls `make events` for its command
+table, and `backend.emit! events name value` sends the frontend `value` at any
+time after, heard by `ui.on_backend name`. That is how a command that starts
+something slow -- a shell, a download, a query -- answers at once and reports
+as it goes:
+
+```dream no-run
+let commands! events = %{
+    "watch" => backend.command! :string :bool (fn path -> {
+        spawn! $( watch! events path )
+        true
+    }),
+};
+let main! = backend.serve_with! commands!;
+// and in the frontend's subscriptions:
+ui.on_backend "changed" Msg.changed
+```
+
+One process owns the backend's standard output and writes every answer and
+event, so frames never interleave, and events reach the page in the order
+they were emitted. The 1 MiB limit is checked as each one is sent, and an
+event over it stops the backend, so a large stream goes in pieces. `spawn!`
+takes a thunk, `spawn! $( watch! events path )`, never the call itself.
 
 Closing the window sends the frontend `close`: `closing!` runs, what it asked
 of the backend is delivered, and the backend sees its input end and has two

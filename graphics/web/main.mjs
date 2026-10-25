@@ -92,7 +92,9 @@ export async function startApplication(root, worker, scope = globalThis, { modul
       const r = element(key).getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
     },
+    scroll_end: ({ key }) => { const el = element(key); el.scrollTop = el.scrollHeight; return null; },
     clipboard: async ({ text }) => { await scope.navigator?.clipboard?.writeText(String(text)); return null; },
+    selection: () => String(scope.getSelection?.() ?? ''),
     async js({ name, args }) {
       const fn = handlers.get(name);
       if (!fn) throw new Error(`no JavaScript function is registered as ${name}`);
@@ -102,7 +104,7 @@ export async function startApplication(root, worker, scope = globalThis, { modul
   };
   // A service that acts on an element sees the tree the program last sent,
   // even when the frame that would have drawn it has not come yet.
-  const onElements = new Set(['focus', 'blur', 'scroll', 'measure']);
+  const onElements = new Set(['focus', 'blur', 'scroll', 'scroll_end', 'measure']);
   function flush() {
     if (!frame) return;
     scope.cancelAnimationFrame(frame);
@@ -239,10 +241,15 @@ export async function startApplication(root, worker, scope = globalThis, { modul
       }
     } catch (e) { failure(e.message); }
   };
-  // The desktop host's messages: a backend's reply, named by request id, or
-  // the window closing. Data, delivered as one JSON argument.
+  // The desktop host's messages: a backend's reply, named by request id; an
+  // event the backend emitted, for whoever subscribed to it (`on_backend`);
+  // or the window closing. Data, delivered as one JSON argument.
   Object.defineProperty(scope, '__dreamReceive', { value: message => {
     if (message?.name === 'close') toProgram({ type: 'close' });
+    else if (message?.name === 'event' && typeof message.key === 'string' && typeof message.payload === 'string') {
+      const name = `backend:${message.key}`;
+      if (ports.has(name)) toProgram({ type: 'port', name, value: JSON.parse(message.payload) });
+    }
     else if (message && /^\d+$/.test(String(message.name))) toProgram({ type: 'reply', id: Number(message.name), payload: message.payload });
   }, writable: false, configurable: true });
   scope.addEventListener('pagehide', () => {
@@ -260,7 +267,8 @@ export async function startApplication(root, worker, scope = globalThis, { modul
       handlers.set(name, fn);
     },
     send(name, value) {
-      if (!ports.has(name)) return false;
+      // `backend:` names are the backend's events, which no script speaks for.
+      if (String(name).startsWith('backend:') || !ports.has(name)) return false;
       toProgram({ type: 'port', name, value: value === undefined ? null : JSON.parse(JSON.stringify(value)) });
       return true;
     },

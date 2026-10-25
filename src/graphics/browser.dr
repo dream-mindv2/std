@@ -220,10 +220,20 @@ let measure! key f = {
     after_render! (fn u -> post! %{ "type" => "request", "id" => id, "service" => "measure", "args" => %{ "key" => key } })
 };
 
+/// Scroll the node with this key as far down as it goes: a log, a chat, a
+/// terminal's scrollback following what arrives.
+let scroll_to_end! : :string -> :unit;
+let scroll_to_end! key = after_render! (fn u -> tell! "scroll_end" %{ "key" => key });
+
 /// Put text on the clipboard. Browsers allow it only while handling a click
 /// or a key, so call this from the `update!` for one.
 let copy! : :string -> :unit;
 let copy! text = tell! "clipboard" %{ "text" => text };
+
+/// The text the person has selected on the page, `""` for none: what a copy
+/// command copies when the selection is made of the program's own nodes.
+let selected_text! : (Result :string :string -> :any) -> :unit;
+let selected_text! f = request! "selection" %{} f;
 
 /// Send `message` to the loop after `ms` milliseconds. Ordinary Dream: a
 /// process that sleeps, then sends -- which is all a timer is.

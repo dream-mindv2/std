@@ -103,10 +103,69 @@ long one, make each item `ui.lazy item_view item |> w.key id`, and an
 unchanged item is not made again -- graphics.md, "Long lists"),
 `w.image src alt`, `w.icon name`.
 
+**Applications.** A screen reads top to bottom; an application -- an
+editor, a mail client, a terminal -- fills the window and stays put, its parts
+scrolling inside it:
+
+```dream no-run
+w.frame [
+    w.toolbar [w.doc_tabs tabs current Msg.pick Msg.close, w.spacer, w.icon_button "plus" "New tab" Msg.new],
+    w.workspace [w.sidebar [w.nav_item "home" "Home" true Msg.home, ..], w.panel [..]],
+    w.status_bar [w.caption "Ready", w.spacer, w.kbd "Ctrl+K"],
+]
+```
+
+| | |
+|---|---|
+| `w.frame [..]` | the whole window; nothing scrolls but what is inside its parts |
+| `w.toolbar [..]`, `w.status_bar [..]` | a compact bar of controls along the top; the line along the foot |
+| `w.workspace [..]` | what is left below the toolbar, its children side by side |
+| `w.sidebar [..]`, `w.panel [..]`, `w.split [..]` | a side panel, `16rem` unless `w.width` says; the main part, scrolling; panes sharing the width |
+| `w.nav_item icon caption current msg` | an entry in a sidebar, marked while it is the one shown |
+| `w.doc_tabs [[value, caption, icon, state]] selected pick close` | open documents as tabs, each with a close button; `state` `"busy"`, `"error"`, `"done"` or `""` shows as a dot |
+| `w.kbd "Ctrl+Shift+P"`, `w.chip caption msg` | a chord as the keyboard prints it; a small button offering a suggestion |
+| `w.pairs [[name, value]]`, `w.code_block text` | names and values, one pair a line; text as it is, fixed-width |
+| `w.sparkline [numbers]` | a small line scaled to its own range, a trend beside a figure |
+
+**A command palette**: `w.palette p`, where `p` is a `w.Palette` -- `open`,
+`query`, `items` (each `[value, title, detail, shortcut]`), `selected`, and the
+messages `on_query`, `on_move` (`1` or `-1`), `on_pick` (the value) and
+`on_close`. It floats over the window while open; the arrows move and Enter
+picks without the field losing a keystroke, and the program filters the items
+by the query.
+
+**A terminal**: `w.terminal t`, where `t` is a `w.Terminal`. The emulator --
+the program on a pseudo-terminal (`std.pty`), the escape sequences, the grid
+-- is the program's or its backend's; this shows the grid and takes the
+keyboard for it. `lines` are lists of spans `[text, fg, bg, flags]` (`fg` and
+`bg` CSS colours, `""` for the terminal's own; `flags` adds up 1 bold, 2 dim,
+4 italic, 8 underline, 16 inverse, 32 strikethrough, 64 blink, 128 hidden),
+numbered from `first`, so a line keeps its identity on the page as the lines
+before it scroll away. `cursor` is `[line, column]` in those numbers,
+`marks` puts `:running`, `:ok`, `:error` or `:info` in a line's gutter, and
+`ghost` is faint text after the cursor -- a suggestion of how the line ends.
+Each line is drawn lazily, so a render costs the lines that changed, and the
+text stays selectable text.
+
+The keyboard goes to a field that is not seen, laid under the cursor so an
+input method opens there; it takes every key from the browser but the chords
+in `pass` (by default those that paste), so Tab and Ctrl-C reach `on_key`,
+a paste reaches `on_paste` as text and a composed word `on_compose`.
+`w.terminal_input t` is the key to `focus!`, `w.line_key t n` the key of line
+`n` to `scroll_to!`, and `w.terminal_probe t` a run of ten characters to
+`measure!` for the size of a cell. The ANSI colours are
+`var(--dw-ansi-0)` .. `var(--dw-ansi-15)`, so a change of theme recolours
+what is on the screen already; `palette` overrides them, and `font`,
+`font_size`, `line_height` and `cursor_shape` (`:block`, `:bar`,
+`:underline`) the rest. sleep, in the workspace, is a whole terminal made of
+this.
+
 **Icons**: `plus minus x check trash edit search chevron-down chevron-right
 chevron-left menu info warning alert star heart settings sun moon user home
-inbox refresh download upload copy external calendar clock lock` -- line
-icons in the colour of the text around them.
+inbox refresh download upload copy external calendar clock lock terminal
+globe database play stop send sparkles history command folder table zap split
+cpu activity code key filter layers bolt` -- line icons in the colour of the
+text around them.
 
 ## Modifiers
 
@@ -127,6 +186,8 @@ A widget is adjusted in a pipeline, `Node -> Node`:
 | `w.placeholder s`, `w.disabled b`, `w.autofocus`, `w.on_enter msg` | a field's control, however it is wrapped |
 | `w.hint s`, `w.error s` | help, or what is wrong, under a field; an error marks it invalid, and `""` is none |
 | `w.quiet_label` | a field's label kept for screen readers but not shown |
+| `w.prevent_keys [chords]` | keep those chords (`"ctrl+enter"`) from the field, for the window's own shortcut (graphics.md, "Editors and terminals") |
+| `w.mono` | a field, a table or text in the fixed-width face; labels stay in the interface's |
 | `w.mode :dark` / `:light` | this node and what is in it, whatever the theme says |
 
 ## Themes

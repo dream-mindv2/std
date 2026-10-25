@@ -185,7 +185,8 @@ priv let same_memo old new = Node.tag old == "#lazy" && Node.tag new == "#lazy" 
 /// `%{"width", "height"}`, once at once and then on each change; `url` the
 /// location `%{"path", "query", "hash", "href"}`, once at once and then on each
 /// navigation, which is routing; `visible` whether the page is showing; and
-/// `port name` whatever the program's own JavaScript sends under that name.
+/// `port name` whatever the program's own JavaScript sends under that name --
+/// or, named `backend:` and an event's name, what the backend emits.
 union Sub {
     every(ms : :integer, handler : Handler)
     frame(handler : Handler)
@@ -221,6 +222,11 @@ let on_visible f = Sub.visible (Handler.reading f);
 /// A message for each value the application's own JavaScript sends under `name`.
 let on_port : :string -> (:any -> :any) -> Sub;
 let on_port name f = Sub.port name (Handler.reading f);
+/// A message for each event the backend emits under `name`
+/// (`backend.emit! events name value`), made from its value. On the desktop
+/// only: a tab has no backend, and nothing arrives.
+let on_backend : :string -> (:any -> :any) -> Sub;
+let on_backend name f = Sub.port ("backend:" + name) (Handler.reading f);
 
 /// The page's name for a subscription, and what it watches.
 let sub_wire : Sub -> json.Value;

@@ -42,7 +42,7 @@ const urlProps = new Set([...urlAttributes, 'formaction', 'xlinkhref', 'data', '
 const styleProps = new Set(['style', 'cssText', 'attributeStyleMap']);
 export const domEvents = new Set(('click dblclick contextmenu input change submit reset keydown keyup focus blur ' +
   'focusin focusout pointerdown pointermove pointerup pointerenter pointerleave pointercancel mouseenter ' +
-  'mouseleave wheel scroll dragstart dragend dragover dragleave drop toggle close').split(' '));
+  'mouseleave wheel scroll dragstart dragend dragover dragleave drop toggle close paste compositionend').split(' '));
 const booleans = new Set('checked disabled readonly required multiple selected open hidden autofocus inert'.split(' '));
 const controls = new Set(['input', 'textarea', 'select']);
 const MAX_NODES = 100000, MAX_DEPTH = 128;
@@ -128,6 +128,17 @@ export function validateTree(entry) {
   return entry;
 }
 
+/// Whether the element takes over `name`'s default (`data-dream-prevent`).
+const prevents = (el, name) => (el.getAttribute('data-dream-prevent') ?? '').split(' ').includes(name);
+/// Whether a key event's chord is one of those the element's `attribute` lists.
+function passes(el, event, attribute) {
+  const keep = el.getAttribute(attribute);
+  if (!keep) return false;
+  const chord = [event.ctrlKey && 'ctrl', event.altKey && 'alt', event.shiftKey && 'shift', event.metaKey && 'meta',
+    String(event.key).toLowerCase()].filter(Boolean).join('+');
+  return keep.split(' ').includes(chord);
+}
+
 /// What a DOM event is worth to the program, as JSON.
 export function eventValue(name, event, el) {
   switch (name) {
@@ -148,6 +159,10 @@ export function eventValue(name, event, el) {
       for (const [k, v] of new (el.ownerDocument.defaultView.FormData)(el)) if (typeof v === 'string') fields[k] = v;
       return fields;
     }
+    case 'paste':
+      return event.clipboardData?.getData('text/plain') ?? '';
+    case 'compositionend':
+      return event.data ?? '';
     case 'wheel':
       return { dx: event.deltaX, dy: event.deltaY, x: event.offsetX ?? 0, y: event.offsetY ?? 0 };
     case 'scroll':
@@ -246,8 +261,18 @@ export class DomDriver {
     this.composing = new WeakSet();
     this.onCompositionStart = e => this.composing.add(e.target);
     this.onCompositionEnd = e => { this.composing.delete(e.target); };
+    // The chords an element keeps from the browser (`html.prevent_keys`) are
+    // kept whether or not the program listens for keys there: a text area
+    // that only reports its input still must not take Ctrl+Enter as a
+    // newline when the window's shortcut wants it. So once, at the root, for
+    // the nearest element inside it that names any.
+    this.onKeyDown = e => {
+      const el = e.target?.closest?.('[data-dream-keys]');
+      if (el && root.contains(el) && passes(el, e, 'data-dream-keys')) e.preventDefault();
+    };
     root.addEventListener('compositionstart', this.onCompositionStart);
     root.addEventListener('compositionend', this.onCompositionEnd);
+    root.addEventListener('keydown', this.onKeyDown);
   }
   /// The element a key names, for the program's own JavaScript and for
   /// effects such as `focus!`.
@@ -300,7 +325,7 @@ export class DomDriver {
     const focused = this.root.contains(doc.activeElement) ? doc.activeElement : null;
     const selection = focused && typeof focused.selectionStart === 'number'
       ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection] : null;
-    const done = { canvases: [], modals: [] };
+    const done = { canvases: [], modals: [], autofocus: null };
     if (keep) this.update(shown, patch, done);
     else {
       const el = this.create(patch, false, done);
@@ -316,6 +341,7 @@ export class DomDriver {
       focused.focus({ preventScroll: true });
       if (selection) focused.setSelectionRange(...selection);
     }
+    if (done.autofocus?.isConnected) done.autofocus.focus({ preventScroll: true });
     this.afterRender();
   }
   /// The patch, walked beside the elements it changes: every node it brings
@@ -382,6 +408,10 @@ export class DomDriver {
       svg, handlers: new Map() };
     this.records.set(el, record);
     this.fields(record, node);
+    // `autofocus` is read by a browser once, as the page loads; a control
+    // the program brings into being later -- a field in a popup, a tab just
+    // opened -- is given the focus as it appears, which is what it asks.
+    if (node.attrs.autofocus === true && !done.autofocus) done.autofocus = el;
     for (const child of entry.c ?? []) el.appendChild(this.create(child, svg, done));
     this.settle(record, done);
     return el;
@@ -415,8 +445,19 @@ export class DomDriver {
   settle(record, done) {
     const { el, node } = record;
     if (node.tag === '#text') return;
-    if (own(node.attrs, 'value') && controls.has(node.tag) &&
-        !this.composing.has(el) && el.value !== String(node.attrs.value)) el.value = String(node.attrs.value);
+    if (own(node.attrs, 'value') && controls.has(node.tag) && !this.composing.has(el)) {
+      // A value the control itself reported is the program catching up with
+      // what was typed, and the control already holds something newer: typing
+      // faster than the program renders would otherwise lose every character
+      // typed between a report and the render made from it. Only a value the
+      // program chose -- a field cleared after a submit -- is written.
+      const value = String(node.attrs.value);
+      // What the control reported stays known after the program writes one
+      // of its own: a render made from a report that crossed that write on
+      // its way would otherwise put the old text back.
+      if (record.sent?.has(value)) { if (el.value === value) record.sent.clear(); }
+      else if (el.value !== value) el.value = value;
+    }
     if (node.tag === 'canvas') { this.canvases.add(record); done.canvases.push(record); }
     if (node.tag === 'dialog' && node.attrs['data-modal'] === 'true') done.modals.push(el);
   }
@@ -477,8 +518,21 @@ export class DomDriver {
         // menu or a link the program handles does not also do its default.
         if (name === 'submit' || name === 'contextmenu' || (name === 'click' && el.tagName === 'A') ||
             name === 'dragover' || name === 'drop') event.preventDefault();
+        // What the element said it takes over (`html.prevent`), less the
+        // chords it leaves to the browser (`html.pass_keys`). A key that is
+        // only a modifier, or one an input method is composing with, is
+        // always the browser's.
+        if (prevents(el, name) && !(name === 'keydown' && (passes(el, event, 'data-dream-pass') || event.isComposing ||
+            /^(Shift|Control|Alt|Meta|Process|Dead|Unidentified)$/.test(event.key)))) event.preventDefault();
+        if (name === 'compositionend' && prevents(el, name) && controls.has(el.tagName.toLowerCase())) el.value = '';
         if (name === 'input' && (event.isComposing || this.composing.has(el))) return;
-        this.send({ type: 'dom', id: record.node.id, event: name, value: eventValue(name, event, el) });
+        const value = eventValue(name, event, el);
+        if ((name === 'input' || name === 'change') && controls.has(el.tagName.toLowerCase()) && typeof value === 'string') {
+          record.sent ??= new Set();
+          if (record.sent.size > 256) record.sent.clear();
+          record.sent.add(value);
+        }
+        this.send({ type: 'dom', id: record.node.id, event: name, value });
       };
       el.addEventListener(name, handler, name === 'wheel' || name === 'scroll' ? { passive: true } : undefined);
       record.handlers.set(name, handler);
@@ -488,6 +542,7 @@ export class DomDriver {
   dispose() {
     this.root.removeEventListener('compositionstart', this.onCompositionStart);
     this.root.removeEventListener('compositionend', this.onCompositionEnd);
+    this.root.removeEventListener('keydown', this.onKeyDown);
     if (this.root.firstChild) this.forget(this.root.firstChild);
     this.byKey.clear();
     this.root.replaceChildren();

@@ -37,7 +37,7 @@
 // That is the way out when the kit has no answer; it should rarely be needed.
 import std.atom;
 import std.char;
-import std.graphics.{element, text as text_node, nothing as nothing_node, with, App, Attr, Handler, Node};
+import std.graphics.{element, lazy2, text as text_node, nothing as nothing_node, with, App, Attr, Handler, Node};
 import std.graphics.browser;
 import std.graphics.css;
 import std.list;
@@ -306,6 +306,294 @@ let table columns rows = kit "div" "table-wrap" [kit "table" "table" [
 let image : :string -> :string -> Node;
 let image src alt = kit "img" "image" [] |> with (Attr.attribute "src" src) |> with (Attr.attribute "alt" alt);
 
+// --- applications ------------------------------------------------------------------
+//
+// A screen is a page that reads top to bottom; an application -- an editor, a
+// mail client, a terminal -- fills the window and stays put, its parts
+// scrolling inside it. `frame` is that window: a `toolbar` along the top, a
+// `workspace` taking the rest, split into a `sidebar` and a `panel`, and a
+// `status_bar` at the foot.
+//
+//     w.frame [
+//         w.toolbar [w.doc_tabs tabs current Msg.pick Msg.close, w.spacer, w.icon_button "plus" "New tab" Msg.new],
+//         w.workspace [w.sidebar [..], w.panel [..]],
+//         w.status_bar [w.caption "Ready", w.spacer, w.kbd "Ctrl+K"],
+//     ]
+
+/// The whole window, its parts one above another and nothing scrolling but
+/// what is inside them.
+let frame : [Node] -> Node;
+let frame children = kit "div" "frame" children;
+/// A compact bar of controls along the top of a frame or a panel.
+let toolbar : [Node] -> Node;
+let toolbar children = kit "div" "toolbar" children |> with (Attr.attribute "role" "toolbar");
+/// What is left of the frame below its toolbar, its children side by side.
+let workspace : [Node] -> Node;
+let workspace children = kit "div" "workspace" children;
+/// A panel down the side, `16rem` wide unless `w.width` says otherwise.
+let sidebar : [Node] -> Node;
+let sidebar children = kit "aside" "sidebar" children;
+/// The main part of a workspace: it takes the room there is, and scrolls.
+let panel : [Node] -> Node;
+let panel children = kit "section" "panel" children;
+/// Two or more panes side by side, sharing the width, each scrolling.
+let split : [Node] -> Node;
+let split children = kit "div" "split" (list.map (fn c -> kit "div" "pane" [c]) children);
+/// The line along the foot of a frame: state, counts, the time.
+let status_bar : [Node] -> Node;
+let status_bar children = kit "footer" "status-bar" children |> with (Attr.attribute "role" "status");
+/// An entry in a sidebar: an icon and a caption, marked when it is the one shown.
+let nav_item : :string -> :string -> :bool -> :any -> Node;
+let nav_item icon_name caption_text current message = kit "button" "nav-item" [icon icon_name, kit "span" "nav-caption" [text_node caption_text]]
+    |> with (Attr.attribute "type" "button") |> with (Attr.on "click" (Handler.message message))
+    |> with (if current { Attr.attribute "aria-current" "true" } else { Attr.none });
+
+/// Open documents as a row of tabs, each `[value, caption, icon]` or
+/// `[value, caption, icon, state]`, where `state` is `"busy"`, `"error"`,
+/// `"done"` or `""` and shows as a dot. `pick` gets the value of the tab
+/// chosen, and `close` the value of the tab whose close button was pressed.
+let doc_tabs : [[:string]] -> :string -> (:string -> :any) -> (:string -> :any) -> Node;
+let doc_tabs options selected pick close = kit "div" "doc-tabs" (list.map (fn o -> {
+    let value = list.nth 0 o;
+    let state = if len o > 3 { list.nth 3 o } else { "" };
+    kit "div" "doc-tab" [
+        kit "button" "doc-tab-pick" [icon (list.nth 2 o), kit "span" "doc-tab-caption" [text_node (list.nth 1 o)],
+            if state == "" { nothing_node } else { kit "span" ("dot dw-dot-" + state) [] |> with (Attr.attribute "aria-label" state) }]
+            |> with (Attr.attribute "type" "button") |> with (Attr.attribute "role" "tab")
+            |> with (Attr.attribute "aria-selected" (if value == selected { "true" } else { "false" }))
+            |> with (Attr.attribute "title" (list.nth 1 o))
+            |> with (Attr.on "click" (Handler.message (pick value))),
+        icon_button "x" ("Close " + list.nth 1 o) (close value) |> ghost |> small,
+    ] |> Node.set_key ("tab-" + value)
+        |> with (if value == selected { Attr.attribute "data-selected" "true" } else { Attr.none })
+}) options) |> with (Attr.attribute "role" "tablist");
+
+/// A key or a chord as it is printed on the keyboard: `w.kbd "Ctrl+Shift+P"`.
+let kbd : :string -> Node;
+let kbd chord = kit "span" "kbds" (list.intersperse (text_node "+")
+    (list.map (fn k -> kit "kbd" "kbd" [text_node k]) (str.split "+" chord)));
+/// A small rounded button that offers something: a suggestion, a filter.
+let chip : :string -> :any -> Node;
+let chip caption_text message = kit "button" "chip" [text_node caption_text]
+    |> with (Attr.attribute "type" "button") |> with (Attr.on "click" (Handler.message message));
+/// Names and their values, one pair a line: headers, properties, settings.
+let pairs : [[:string]] -> Node;
+let pairs items = kit "dl" "pairs" (list.flat_map (fn p ->
+    [kit "dt" "pair-name" [text_node (list.nth 0 p)], kit "dd" "pair-value" [text_node (list.nth 1 p)]]) items);
+/// Text shown as it is, in a fixed-width face, scrolling when it is wide:
+/// a response's body, a log, a file.
+let code_block : :string -> Node;
+let code_block s = kit "pre" "code-block" [text_node s];
+/// A series of numbers as a small line, scaled to its own highest and
+/// lowest: a trend beside a figure. Fewer than two points draw nothing.
+let sparkline : [:any] -> Node;
+let sparkline values = if len values < 2 { kit "span" "sparkline" [] } else {
+    let hi = list.fold (fn m v -> if v > m { v } else { m }) (list.head values) values;
+    let lo = list.fold (fn m v -> if v < m { v } else { m }) (list.head values) values;
+    let range = if hi == lo { 1 } else { hi - lo };
+    let last = len values - 1;
+    let points = str.join_str " " (list.map_indexed (fn i v ->
+        to_string (i * 1000 / last) + "," + to_string (280 - num.round ((v - lo) * 260 / range))) values);
+    element "svg" [Attr.class "dw-sparkline", Attr.attribute "viewBox" "0 0 1000 300",
+        Attr.attribute "preserveAspectRatio" "none", Attr.attribute "aria-hidden" "true"]
+        [element "polyline" [Attr.attribute "points" points, Attr.attribute "fill" "none",
+            Attr.attribute "stroke" "currentColor", Attr.attribute "stroke-width" 2,
+            Attr.attribute "vector-effect" "non-scaling-stroke"] []]
+};
+/// Text, a field or a table set in the fixed-width face: code, commands, data.
+let mono : Node -> Node;
+let mono node = class "mono" node;
+
+/// A command palette: a search field over a list of what can be done,
+/// floating over the window while `open`. Each item is `[value, title,
+/// detail, shortcut]` -- the last two may be `""` -- and the one at
+/// `selected` is marked, which the arrows move (`on_move` gets `1` or `-1`)
+/// and Enter picks (`on_pick` gets its value, as a click does). Escape or a
+/// click outside sends `on_close`. The program filters the items by `query`,
+/// which `on_query` reports as it is typed.
+mapping Palette {
+    open : :bool = false
+    query : :string = ""
+    placeholder : :string = "Type a command"
+    items : [[:any]] = []
+    selected : :integer = 0
+    on_query : :any = ()
+    on_move : :any = ()
+    on_pick : :any = ()
+    on_close : :any = ()
+    empty : :string = "Nothing matches"
+}
+
+let palette : Palette -> Node;
+let palette p = if not (Palette.open p) { nothing_node } else {
+    let items = Palette.items p;
+    let chosen = if items == [] { () } else { list.nth (num.clamp 0 (len items - 1) (Palette.selected p)) items };
+    let pick = Palette.on_pick p;
+    let move = Palette.on_move p;
+    let keys = fn k -> match k.["key" else ""] {
+        "ArrowDown" => if move == () { () } else { move 1 },
+        "ArrowUp" => if move == () { () } else { move (-1) },
+        "Enter" => if chosen == () || pick == () { () } else { pick (list.head chosen) },
+        _ => (),
+    };
+    kit "dialog" "palette" [
+        kit "div" "palette-search" [icon "search",
+            element "input" [Attr.class "dw-palette-input", Attr.attribute "type" "text", Attr.attribute "value" (Palette.query p),
+                Attr.attribute "placeholder" (Palette.placeholder p), Attr.attribute "aria-label" (Palette.placeholder p),
+                Attr.attribute "autofocus" true, Attr.attribute "autocomplete" "off", Attr.attribute "spellcheck" "false",
+                Attr.attribute "data-dream-keys" "arrowup arrowdown enter",
+                Attr.on "keydown" (Handler.reading keys),
+                if Palette.on_query p == () { Attr.none } else { Attr.on "input" (Handler.reading (Palette.on_query p)) }] []],
+        if items == [] { kit "p" "palette-empty" [text_node (Palette.empty p)] } else {
+            kit "ul" "palette-list" (list.map_indexed (fn i item -> {
+                let [value, title_text, detail, shortcut] = item;
+                kit "li" "palette-item" [
+                    kit "span" "palette-title" [text_node title_text],
+                    if detail == "" { nothing_node } else { kit "span" "palette-detail" [text_node detail] },
+                    kit "span" "spacer" [],
+                    if shortcut == "" { nothing_node } else { kbd shortcut },
+                ] |> with (Attr.attribute "role" "option")
+                  |> with (Attr.attribute "aria-selected" (if i == Palette.selected p { "true" } else { "false" }))
+                  |> with (if pick == () { Attr.none } else { Attr.on "click" (Handler.message (pick value)) })
+            }) items) |> with (Attr.attribute "role" "listbox")
+        },
+    ] |> with (Attr.attribute "data-modal" "true") |> with (Attr.attribute "aria-label" (Palette.placeholder p))
+      |> with (if Palette.on_close p == () { Attr.none } else { Attr.on "close" (Handler.message (Palette.on_close p)) })
+      |> with (if Palette.on_close p == () { Attr.none } else {
+          Attr.on "click" (Handler.reading (fn at -> if at.["self" else false] == true { Palette.on_close p } else { () })) })
+};
+
+// --- terminals ---------------------------------------------------------------------
+//
+// A terminal's screen is text in a grid: lines of styled runs, and a cursor
+// at a row and a column. The emulator -- what turns a program's output into
+// that grid -- is the program's (or its backend's); this is what shows it and
+// takes the keyboard for it.
+//
+// **A span is `[text, fg, bg, flags]`**, the shape an emulator sends: `fg`
+// and `bg` CSS colours, `""` for the terminal's own, and the 16 colours of
+// the ANSI palette are best given as `var(--dw-ansi-0)` .. `var(--dw-ansi-15)`
+// so a change of theme recolours what is already on the screen. `flags` adds
+// up `1` bold, `2` dim, `4` italic, `8` underline, `16` inverse, `32`
+// strikethrough, `64` blink and `128` hidden.
+//
+// **Each line is drawn lazily** (`ui.lazy2` of the line and its mark), so a
+// render costs the lines that changed. The cursor is a box laid over the
+// grid at `col` widths of a character and `row` line heights, which is exact
+// in a fixed-width face, and the text stays text, selectable as any page's.
+//
+// **The keyboard goes to a field that is not seen**, laid under the cursor so
+// an input method's window opens there. It takes over every key's default
+// but the chords in `pass` -- by default the ones that paste -- so Tab, the
+// arrows and Ctrl-C reach `on_key` instead of moving the focus. A paste
+// reaches `on_paste` as text, and a composed word `on_compose`.
+
+/// `lines` are numbered from `first`, the number of the first one given, and
+/// `marks` and `cursor` (`[line, column]`) use those numbers: a line keeps
+/// its number, and so its identity on the page, as the lines before it
+/// scroll away. A line's mark -- `:running`, `:ok`, `:error` or `:info` -- is
+/// shown in the gutter: where a command started, and how it ended. `ghost` is
+/// text shown after the cursor, faint: a suggestion of how the line ends.
+mapping Terminal {
+    key : :string = "terminal"
+    lines : [:any] = []
+    first : :integer = 0
+    marks : %{:integer => :atom} = %{}
+    ghost : :string = ""
+    cursor : :any = ()
+    cursor_shape : :atom = :block
+    focused : :bool = false
+    font_size : :integer = 14
+    line_height : :float = 1.3
+    font : :string = "\"JetBrains Mono\", \"Cascadia Code\", \"Fira Code\", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+    palette : [:string] = []
+    pass : [:string] = ["ctrl+v", "ctrl+shift+v", "shift+insert", "meta+v"]
+    label : :string = "Terminal"
+    on_key : :any = ()
+    on_paste : :any = ()
+    on_compose : :any = ()
+    on_focus : :any = ()
+    on_blur : :any = ()
+    on_tap : :any = ()
+    on_scroll : :any = ()
+}
+
+/// The key of line `n` of a terminal: what `scroll_to!` names to show it.
+let line_key : Terminal -> :integer -> :string;
+let line_key t n = Terminal.key t + "-l" + to_string n;
+
+/// The key of the field a terminal reads the keyboard from: what `focus!` names.
+let terminal_input : Terminal -> :string;
+let terminal_input t = Terminal.key t + "-input";
+/// The key of a run of ten characters in the terminal's face, laid out but
+/// not seen: `measure!` it for the size of a cell, a tenth of its width and
+/// all of its height.
+let terminal_probe : Terminal -> :string;
+let terminal_probe t = Terminal.key t + "-probe";
+
+/// One span, as an element only when it has a style of its own.
+priv let term_span span = {
+    let [s, fg, bg, flags] = span;
+    if fg == "" && bg == "" && flags == 0 { text_node s } else {
+        let inverse = flags % 32 >= 16;
+        let color = if inverse { if bg == "" { "var(--dw-term-bg)" } else { bg } } else { fg };
+        let background = if inverse { if fg == "" { "var(--dw-term-fg)" } else { fg } } else { bg };
+        let flagged = fn bit name -> if flags % (bit * 2) >= bit { Attr.class ("dw-t-" + name) } else { Attr.none };
+        element "span" [
+            if color == "" { Attr.none } else { Attr.style "color" color },
+            if background == "" { Attr.none } else { Attr.style "background" background },
+            flagged 1 "b", flagged 2 "d", flagged 4 "i", flagged 8 "u", flagged 32 "s", flagged 64 "k", flagged 128 "h",
+        ] [text_node s]
+    }
+};
+
+/// A line of the grid, with its mark.
+priv let term_line spans mark = kit "div" "term-line" (list.map term_span spans)
+    |> with (if mark == () { Attr.none } else { Attr.class ("dw-term-mark dw-term-" + atom.name mark) });
+
+priv let on_maybe event f = if f == () { Attr.none } else { Attr.on event (Handler.reading f) };
+priv let tell_maybe event message = if message == () { Attr.none } else { Attr.on event (Handler.message message) };
+
+let terminal : Terminal -> Node;
+let terminal t = {
+    let marks = Terminal.marks t;
+    let first = Terminal.first t;
+    let at = Terminal.cursor t;
+    let row = if at == () { 0 } else { list.nth 0 at - first };
+    let col = if at == () { 0 } else { list.nth 1 at };
+    let place = fn node -> node |> with (Attr.style "top" ("calc(" + to_string row + " * var(--dw-term-lh) * 1em)"))
+        |> with (Attr.style "left" ("calc(" + to_string col + " * 1ch)"));
+    let palette_vars = list.map_indexed (fn i c -> Attr.style ("--dw-ansi-" + to_string i) c) (Terminal.palette t);
+    let lines = kit "div" "term-lines" (list.concat [
+        list.map_indexed (fn i line -> lazy2 term_line line marks.[first + i else ()] |> Node.set_key (line_key t (first + i))) (Terminal.lines t),
+        [if at == () || Terminal.ghost t == "" { nothing_node } else {
+            kit "span" "term-ghost" [text_node (Terminal.ghost t)] |> place |> with (Attr.attribute "aria-hidden" "true")
+        },
+        if at == () { nothing_node } else {
+            kit "div" ("term-cursor dw-term-cursor-" + atom.name (Terminal.cursor_shape t)) [] |> place
+                |> with (if Terminal.focused t { Attr.class "dw-term-focused" } else { Attr.none })
+                |> with (Attr.attribute "aria-hidden" "true") |> Node.set_key (Terminal.key t + "-cursor")
+        },
+        element "textarea" [Attr.class "dw-term-input", Attr.key (terminal_input t),
+            Attr.attribute "aria-label" (Terminal.label t), Attr.attribute "autocapitalize" "off",
+            Attr.attribute "autocomplete" "off", Attr.attribute "autocorrect" "off", Attr.attribute "spellcheck" "false",
+            Attr.attribute "rows" 1, Attr.attribute "value" "",
+            Attr.attribute "data-dream-prevent" "keydown paste compositionend",
+            Attr.attribute "data-dream-pass" (str.join_str " " (Terminal.pass t)),
+            on_maybe "keydown" (Terminal.on_key t), on_maybe "paste" (Terminal.on_paste t),
+            on_maybe "compositionend" (Terminal.on_compose t),
+            tell_maybe "focus" (Terminal.on_focus t), tell_maybe "blur" (Terminal.on_blur t)] [] |> place,
+        kit "span" "term-probe" [text_node "MMMMMMMMMM"] |> Node.set_key (terminal_probe t)
+            |> with (Attr.attribute "aria-hidden" "true")]]);
+    kit "div" "terminal" [lines] |> Node.set_key (Terminal.key t)
+        |> with (Attr.style "font-size" (to_string (Terminal.font_size t) + "px"))
+        |> with (Attr.style "--dw-term-lh" (to_string (Terminal.line_height t)))
+        |> with (Attr.style "font-family" (Terminal.font t))
+        |> with (tell_maybe "click" (Terminal.on_tap t))
+        |> with (on_maybe "scroll" (Terminal.on_scroll t))
+        |> (fn n -> list.fold (fn node a -> with a node) n palette_vars)
+};
+
 // --- modifiers -------------------------------------------------------------------
 
 /// The identity a widget keeps across renders: give every item of a list that can reorder one.
@@ -388,6 +676,11 @@ let autofocus node = control (with (Attr.attribute "autofocus" true)) node;
 let on_enter : :any -> Node -> Node;
 let on_enter message node = control (with (Attr.on "keydown"
     (Handler.reading (fn k -> if k.["key" else ""] == "Enter" { message } else { () })))) node;
+/// Keep `chords` (`["ctrl+enter"]`) from doing what they would in the
+/// control -- a newline, in a text area -- so the window's own listener can
+/// take them as shortcuts; every other key does what it always does.
+let prevent_keys : [:string] -> Node -> Node;
+let prevent_keys chords node = control (with (Attr.attribute "data-dream-keys" (str.join_str " " chords))) node;
 /// The field's label kept for screen readers and the field's name, but not
 /// shown: for a field whose purpose is plain from where it is, a search box in
 /// a toolbar. Its placeholder should say the same.
@@ -411,7 +704,10 @@ let error s node = if s == "" { node } else {
 /// `check`, `trash`, `edit`, `search`, `chevron-down`, `chevron-right`,
 /// `chevron-left`, `menu`, `info`, `warning`, `alert`, `star`, `heart`,
 /// `settings`, `sun`, `moon`, `user`, `home`, `inbox`, `refresh`, `download`,
-/// `upload`, `copy`, `external`, `calendar`, `clock`, `lock`. Unknown names draw nothing.
+/// `upload`, `copy`, `external`, `calendar`, `clock`, `lock`, `terminal`,
+/// `globe`, `database`, `play`, `stop`, `send`, `sparkles`, `history`,
+/// `command`, `folder`, `table`, `zap`, `split`, `cpu`, `activity`, `code`,
+/// `key`, `filter`, `layers`, `bolt`. Unknown names draw nothing.
 let icon : :string -> Node;
 let icon name = element "svg" [Attr.class "dw-icon", Attr.attribute "viewBox" "0 0 24 24",
     Attr.attribute "fill" "none", Attr.attribute "stroke" "currentColor", Attr.attribute "stroke-width" 2,
@@ -450,6 +746,26 @@ priv let icon_path name = match name {
     "calendar" => "M4 6h16v14H4zM4 10h16M8 3v4M16 3v4",
     "clock" => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 7v5l3 2",
     "lock" => "M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4",
+    "terminal" => "M4 5h16v14H4zM7.5 9.5l3 2.5-3 2.5M12.5 15h4",
+    "globe" => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9s1.3-6.4 3.8-9z",
+    "database" => "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
+    "play" => "M7 4.5v15l12-7.5z",
+    "stop" => "M6 6h12v12H6z",
+    "send" => "M21 3L10 14M21 3l-7 18-4-7-7-4z",
+    "sparkles" => "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8zM5 2l.6 1.4L7 4l-1.4.6L5 6l-.6-1.4L3 4l1.4-.6z",
+    "history" => "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2",
+    "command" => "M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z",
+    "folder" => "M3 6h6l2 2h10v11H3z",
+    "table" => "M3 5h18v14H3zM3 10h18M3 15h18M9 5v14",
+    "zap" => "M13 2L4 14h7l-1 8 9-12h-7z",
+    "split" => "M3 4h18v16H3zM12 4v16",
+    "cpu" => "M7 7h10v10H7zM10 10h4v4h-4zM10 2v3M14 2v3M10 19v3M14 19v3M2 10h3M2 14h3M19 10h3M19 14h3",
+    "activity" => "M3 12h4l3-8 4 16 3-8h4",
+    "code" => "M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16",
+    "key" => "M8 11a4 4 0 1 0 0 8a4 4 0 1 0 0-8zM10.8 12.2L20 3M16 7l3 3M14 9l2 2",
+    "filter" => "M3 5h18l-7 8v6l-4 2v-8z",
+    "layers" => "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5",
+    "bolt" => "M13 2L4 14h7l-1 8 9-12h-7z",
     _ => "",
 };
 
@@ -514,12 +830,19 @@ let styles theme = list.concat [
     },
     [css.rule ".dw-mode-dark" (dark.["color-scheme" => "dark"]), css.rule ".dw-mode-light" (light_palette.["color-scheme" => "light"])],
     base,
+    applications,
 ];
 
 priv let light_palette = %{
     "--dw-bg" => "#f6f6f8", "--dw-surface" => "#ffffff", "--dw-sunken" => "#efeff3",
     "--dw-text" => "#1b1b22", "--dw-muted" => "#6a6a78", "--dw-border" => "#dedee6",
     "--dw-shadow" => "0 1px 2px rgb(20 20 40 / 0.06), 0 4px 16px rgb(20 20 40 / 0.06)",
+    "--dw-term-bg" => "#fcfcfd", "--dw-term-fg" => "#24242c", "--dw-term-cursor" => "#5b5bd6",
+    "--dw-term-select" => "rgb(91 91 214 / 0.22)",
+    "--dw-ansi-0" => "#2b2b33", "--dw-ansi-1" => "#c8323a", "--dw-ansi-2" => "#2f8a3e", "--dw-ansi-3" => "#a26b00",
+    "--dw-ansi-4" => "#2f5fd0", "--dw-ansi-5" => "#9b3fbf", "--dw-ansi-6" => "#16808f", "--dw-ansi-7" => "#c9c9d2",
+    "--dw-ansi-8" => "#6a6a78", "--dw-ansi-9" => "#e0464e", "--dw-ansi-10" => "#38a34b", "--dw-ansi-11" => "#c08400",
+    "--dw-ansi-12" => "#4a77e8", "--dw-ansi-13" => "#b356d6", "--dw-ansi-14" => "#1c9aab", "--dw-ansi-15" => "#fafafc",
 };
 
 /// The theme's colours for a light page.
@@ -538,6 +861,12 @@ priv let dark = %{
     "--dw-bg" => "#111116", "--dw-surface" => "#1b1b22", "--dw-sunken" => "#15151b",
     "--dw-text" => "#ececf2", "--dw-muted" => "#9c9cab", "--dw-border" => "#2e2e38",
     "--dw-shadow" => "0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.3)",
+    "--dw-term-bg" => "#0f0f14", "--dw-term-fg" => "#dcdce6", "--dw-term-cursor" => "#a5a5ff",
+    "--dw-term-select" => "rgb(165 165 255 / 0.25)",
+    "--dw-ansi-0" => "#1d1d24", "--dw-ansi-1" => "#ff6b72", "--dw-ansi-2" => "#7fd88f", "--dw-ansi-3" => "#f1c76b",
+    "--dw-ansi-4" => "#79a6ff", "--dw-ansi-5" => "#d39cff", "--dw-ansi-6" => "#5fd3e0", "--dw-ansi-7" => "#c8c8d4",
+    "--dw-ansi-8" => "#5c5c6b", "--dw-ansi-9" => "#ff8a90", "--dw-ansi-10" => "#9ce6a9", "--dw-ansi-11" => "#ffd98a",
+    "--dw-ansi-12" => "#9bbcff", "--dw-ansi-13" => "#e2b8ff", "--dw-ansi-14" => "#8ae4ee", "--dw-ansi-15" => "#f4f4fa",
 };
 
 /// A colour mixed toward transparent: what tints and rings are made of.
@@ -710,6 +1039,138 @@ priv let base = [
     css.rule ".dw-image" %{ "max-width" => "100%", "border-radius" => "var(--dw-radius)", "display" => "block" },
 ];
 
+/// The stylesheet of the application widgets: frames, tabs, palettes, terminals.
+priv let applications = [
+    css.rule ".dw-frame" %{ "display" => "flex", "flex-direction" => "column", "height" => "100vh", "overflow" => "hidden",
+        "background" => "var(--dw-bg)", "color" => "var(--dw-text)" },
+    css.rule ".dw-toolbar" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-2)", "flex" => "none",
+        "min-height" => "2.75rem", "padding" => "var(--dw-space-1) var(--dw-space-2)", "border-bottom" => "1px solid var(--dw-border)",
+        "background" => "var(--dw-surface)", "min-width" => "0" },
+    css.rule ".dw-workspace" %{ "display" => "flex", "flex" => "1 1 0", "min-height" => "0", "min-width" => "0" },
+    css.rule ".dw-sidebar" %{ "display" => "flex", "flex-direction" => "column", "gap" => "var(--dw-space-1)", "flex" => "none",
+        "width" => "16rem", "padding" => "var(--dw-space-3) var(--dw-space-2)", "border-right" => "1px solid var(--dw-border)",
+        "background" => "var(--dw-sunken)", "overflow" => "auto" },
+    css.rule ".dw-panel" %{ "display" => "flex", "flex-direction" => "column", "flex" => "1 1 0", "min-width" => "0", "min-height" => "0",
+        "overflow" => "auto", "gap" => "var(--dw-space-3)" },
+    css.rule ".dw-split" %{ "display" => "flex", "flex" => "1 1 0", "min-height" => "0", "min-width" => "0" },
+    css.rule ".dw-pane" %{ "flex" => "1 1 0", "min-width" => "0", "overflow" => "auto", "display" => "flex", "flex-direction" => "column" },
+    css.rule ".dw-pane + .dw-pane" %{ "border-left" => "1px solid var(--dw-border)" },
+    css.rule ".dw-status-bar" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-3)", "flex" => "none",
+        "height" => "1.75rem", "padding" => "0 var(--dw-space-3)", "border-top" => "1px solid var(--dw-border)",
+        "background" => "var(--dw-surface)", "font-size" => "0.78rem", "color" => "var(--dw-muted)", "white-space" => "nowrap",
+        "overflow" => "hidden" },
+    css.rule ".dw-status-bar .dw-caption" %{ "font-size" => "inherit" },
+    css.rule ".dw-nav-item" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-2)", "width" => "100%",
+        "padding" => "0.4rem 0.6rem", "border" => "none", "border-radius" => "var(--dw-radius)", "background" => "transparent",
+        "color" => "var(--dw-muted)", "font" => "inherit", "font-weight" => "550", "text-align" => "left", "cursor" => "pointer" },
+    css.rule ".dw-nav-item:hover" %{ "background" => tint "var(--dw-text)" 6, "color" => "var(--dw-text)" },
+    css.rule ".dw-nav-item[aria-current]" %{ "background" => tint "var(--dw-accent)" 14, "color" => "var(--dw-accent)" },
+    css.rule ".dw-nav-caption" %{ "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap" },
+
+    css.rule ".dw-doc-tabs" %{ "display" => "flex", "gap" => "2px", "min-width" => "0", "overflow-x" => "auto", "scrollbar-width" => "none" },
+    css.rule ".dw-doc-tab" %{ "display" => "flex", "align-items" => "center", "flex" => "0 1 12rem", "min-width" => "6rem",
+        "border-radius" => "var(--dw-radius)", "padding-right" => "2px", "color" => "var(--dw-muted)",
+        "transition" => "background 120ms, color 120ms" },
+    css.rule ".dw-doc-tab:hover" %{ "background" => tint "var(--dw-text)" 6, "color" => "var(--dw-text)" },
+    css.rule ".dw-doc-tab[data-selected]" %{ "background" => "var(--dw-sunken)", "color" => "var(--dw-text)",
+        "box-shadow" => "inset 0 -2px 0 var(--dw-accent)" },
+    css.rule ".dw-doc-tab-pick" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-2)", "flex" => "1 1 0",
+        "min-width" => "0", "height" => "2rem", "padding" => "0 0.25rem 0 0.6rem", "border" => "none", "background" => "transparent",
+        "color" => "inherit", "font" => "inherit", "font-size" => "0.85rem", "font-weight" => "550", "cursor" => "pointer" },
+    css.rule ".dw-doc-tab-caption" %{ "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap", "flex" => "1 1 0",
+        "text-align" => "left" },
+    css.rule ".dw-doc-tab .dw-icon-button" %{ "opacity" => "0", "transition" => "opacity 120ms" },
+    css.rule ".dw-doc-tab:hover .dw-icon-button, .dw-doc-tab[data-selected] .dw-icon-button" %{ "opacity" => "1" },
+    css.rule ".dw-dot" %{ "width" => "0.5rem", "height" => "0.5rem", "border-radius" => "50%", "flex" => "none", "background" => "var(--dw-muted)" },
+    css.rule ".dw-dot-busy" %{ "background" => "var(--dw-accent)", "animation" => "dw-pulse 1.2s ease-in-out infinite" },
+    css.rule ".dw-dot-error" %{ "background" => "var(--dw-danger)" },
+    css.rule ".dw-dot-done" %{ "background" => "var(--dw-success)" },
+    css.keyframes "dw-pulse" [["50%", %{ "opacity" => "0.35" }]],
+
+    css.rule ".dw-kbds" %{ "display" => "inline-flex", "align-items" => "center", "gap" => "2px", "color" => "var(--dw-muted)",
+        "font-size" => "0.75rem" },
+    css.rule ".dw-kbd" %{ "display" => "inline-flex", "align-items" => "center", "justify-content" => "center", "min-width" => "1.35rem",
+        "height" => "1.35rem", "padding" => "0 0.3rem", "border" => "1px solid var(--dw-border)", "border-bottom-width" => "2px",
+        "border-radius" => "5px", "background" => "var(--dw-surface)", "font-family" => "inherit", "font-size" => "0.72rem",
+        "font-weight" => "600", "color" => "var(--dw-text)" },
+    css.rule ".dw-chip" %{ "display" => "inline-flex", "align-items" => "center", "gap" => "var(--dw-space-1)", "height" => "1.75rem",
+        "padding" => "0 0.7rem", "border-radius" => "999px", "border" => "1px solid var(--dw-border)", "background" => "var(--dw-surface)",
+        "color" => "var(--dw-text)", "font" => "inherit", "font-size" => "0.82rem", "cursor" => "pointer", "max-width" => "100%",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "transition" => "border-color 120ms, background 120ms" },
+    css.rule ".dw-chip:hover" %{ "border-color" => "var(--dw-accent)", "background" => tint "var(--dw-accent)" 8 },
+    css.rule ".dw-pairs" %{ "display" => "grid", "grid-template-columns" => "minmax(8rem, max-content) 1fr", "gap" => "var(--dw-space-1) var(--dw-space-4)",
+        "margin" => "0", "font-size" => "0.875rem" },
+    css.rule ".dw-pair-name" %{ "color" => "var(--dw-muted)", "font-weight" => "550", "overflow-wrap" => "anywhere" },
+    css.rule ".dw-pair-value" %{ "margin" => "0", "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace", "font-size" => "0.82rem",
+        "overflow-wrap" => "anywhere" },
+    css.rule ".dw-code-block" %{ "margin" => "0", "padding" => "var(--dw-space-3) var(--dw-space-4)", "background" => "var(--dw-sunken)",
+        "border" => "1px solid var(--dw-border)", "border-radius" => "var(--dw-radius)", "overflow" => "auto",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace", "font-size" => "0.82rem", "line-height" => "1.5",
+        "white-space" => "pre", "tab-size" => "4" },
+    css.rule ".dw-sparkline" %{ "width" => "5rem", "height" => "1.25rem", "color" => "var(--dw-tone, var(--dw-accent))", "flex" => "none" },
+    css.rule ".dw-mono, .dw-mono .dw-control, .dw-mono.dw-control" %{ "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "0.875rem" },
+    // A labelled field set in the fixed-width face keeps its label in the
+    // kit's: the face is for what is typed, not for what it is called.
+    css.rule ".dw-mono > .dw-field-label, .dw-mono > .dw-hint" %{ "font-family" => "var(--dw-font)" },
+
+    css.rule ".dw-palette" %{ "border" => "1px solid var(--dw-border)", "padding" => "0", "margin" => "12vh auto auto",
+        "border-radius" => "calc(var(--dw-radius) + 4px)", "background" => "var(--dw-surface)", "color" => "var(--dw-text)",
+        "box-shadow" => "0 24px 64px rgb(0 0 0 / 0.35)", "width" => "min(38rem, calc(100vw - 2rem))", "animation" => "dw-rise 140ms ease-out" },
+    css.rule ".dw-palette::backdrop" %{ "background" => "rgb(10 10 20 / 0.35)" },
+    css.rule ".dw-palette-search" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-2)",
+        "padding" => "0 var(--dw-space-4)", "border-bottom" => "1px solid var(--dw-border)", "color" => "var(--dw-muted)" },
+    css.rule ".dw-palette-input" %{ "flex" => "1", "height" => "3rem", "border" => "none", "outline" => "none", "background" => "transparent",
+        "color" => "var(--dw-text)", "font" => "inherit", "font-size" => "1rem" },
+    css.rule ".dw-palette-list" %{ "list-style" => "none", "margin" => "0", "padding" => "var(--dw-space-2)", "max-height" => "min(24rem, 60vh)",
+        "overflow" => "auto" },
+    css.rule ".dw-palette-item" %{ "display" => "flex", "align-items" => "center", "gap" => "var(--dw-space-3)", "padding" => "0.5rem 0.75rem",
+        "border-radius" => "var(--dw-radius)", "cursor" => "pointer", "min-width" => "0" },
+    css.rule ".dw-palette-item:hover" %{ "background" => tint "var(--dw-text)" 5 },
+    css.rule ".dw-palette-item[aria-selected=true]" %{ "background" => tint "var(--dw-accent)" 14 },
+    css.rule ".dw-palette-title" %{ "font-weight" => "550", "white-space" => "nowrap", "overflow" => "hidden", "text-overflow" => "ellipsis" },
+    css.rule ".dw-palette-detail" %{ "color" => "var(--dw-muted)", "font-size" => "0.85rem", "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "min-width" => "0" },
+    css.rule ".dw-palette-empty" %{ "margin" => "0", "padding" => "var(--dw-space-5)", "text-align" => "center", "color" => "var(--dw-muted)" },
+
+    css.rule ".dw-terminal" %{ "flex" => "1 1 0", "min-height" => "0", "overflow-y" => "auto", "overflow-x" => "hidden",
+        "background" => "var(--dw-term-bg)", "color" => "var(--dw-term-fg)", "padding" => "var(--dw-space-2) var(--dw-space-3)",
+        "cursor" => "text", "font-variant-ligatures" => "none", "--dw-term-lh" => "1.3" },
+    css.rule ".dw-terminal ::selection" %{ "background" => "var(--dw-term-select)" },
+    css.rule ".dw-term-lines" %{ "position" => "relative", "min-height" => "100%" },
+    css.rule ".dw-term-line" %{ "position" => "relative", "height" => "calc(var(--dw-term-lh) * 1em)",
+        "line-height" => "calc(var(--dw-term-lh) * 1em)", "white-space" => "pre" },
+    css.rule ".dw-term-mark::before" %{ "content" => "\"\"", "position" => "absolute", "left" => "-0.55rem", "top" => "15%",
+        "width" => "3px", "height" => "70%", "border-radius" => "2px", "background" => "var(--dw-tone, var(--dw-muted))" },
+    css.rule ".dw-term-running" %{ "--dw-tone" => "var(--dw-accent)" },
+    css.rule ".dw-term-ok" %{ "--dw-tone" => "var(--dw-success)" },
+    css.rule ".dw-term-error" %{ "--dw-tone" => "var(--dw-danger)" },
+    css.rule ".dw-term-info" %{ "--dw-tone" => "var(--dw-warning)" },
+    css.rule ".dw-t-b" %{ "font-weight" => "700" },
+    css.rule ".dw-t-d" %{ "opacity" => "0.6" },
+    css.rule ".dw-t-i" %{ "font-style" => "italic" },
+    css.rule ".dw-t-u" %{ "text-decoration" => "underline", "text-underline-offset" => "2px" },
+    css.rule ".dw-t-s" %{ "text-decoration" => "line-through" },
+    css.rule ".dw-t-u.dw-t-s" %{ "text-decoration" => "underline line-through" },
+    css.rule ".dw-t-k" %{ "animation" => "dw-blink 1s steps(1) infinite" },
+    css.rule ".dw-t-h" %{ "visibility" => "hidden" },
+    css.rule ".dw-term-cursor" %{ "position" => "absolute", "width" => "1ch", "height" => "calc(var(--dw-term-lh) * 1em)",
+        "pointer-events" => "none", "border-radius" => "1px", "outline" => "1px solid var(--dw-term-cursor)", "outline-offset" => "-1px" },
+    css.rule ".dw-term-cursor.dw-term-focused" %{ "animation" => "dw-blink 1.1s steps(1) infinite" },
+    css.rule ".dw-term-cursor-block.dw-term-focused" %{ "outline" => "none", "background" => "var(--dw-term-cursor)", "mix-blend-mode" => "difference" },
+    css.rule ".dw-term-cursor-bar" %{ "width" => "2px", "outline" => "none", "background" => "var(--dw-term-cursor)" },
+    css.rule ".dw-term-cursor-underline" %{ "outline" => "none", "border-bottom" => "2px solid var(--dw-term-cursor)" },
+    css.keyframes "dw-blink" [["50%", %{ "opacity" => "0" }]],
+    css.rule ".dw-term-ghost" %{ "position" => "absolute", "white-space" => "pre", "pointer-events" => "none", "opacity" => "0.42",
+        "height" => "calc(var(--dw-term-lh) * 1em)", "line-height" => "calc(var(--dw-term-lh) * 1em)", "font-style" => "italic" },
+    css.rule ".dw-term-input" %{ "position" => "absolute", "width" => "1ch", "height" => "1em", "padding" => "0", "border" => "none",
+        "outline" => "none", "resize" => "none", "overflow" => "hidden", "opacity" => "0", "color" => "transparent",
+        "background" => "transparent", "caret-color" => "transparent", "font" => "inherit", "z-index" => "-1" },
+    css.rule ".dw-term-probe" %{ "position" => "absolute", "top" => "0", "left" => "0", "visibility" => "hidden", "white-space" => "pre",
+        "height" => "calc(var(--dw-term-lh) * 1em)", "line-height" => "calc(var(--dw-term-lh) * 1em)" },
+];
+
 when test {
     import std.test;
     import std.graphics;
@@ -752,6 +1213,39 @@ when test {
         }),
         test.case "icons are drawn, and an unknown one is empty" $(test.eq! ["svg", ""]
             [Node.tag (icon "plus"), (Node.attrs (list.head (Node.children (icon "nope")))).["d"]]),
-        test.case "radio names come from the label" $(test.eq! "delivery-speed" (slug "Delivery speed"))
+        test.case "radio names come from the label" $(test.eq! "delivery-speed" (slug "Delivery speed")),
+        test.case "a terminal draws its lines and puts its cursor at a cell" $({
+            let t = terminal (Terminal.new () |> Terminal.set_lines [[["$ ls", "", "", 0]], [["a", "var(--dw-ansi-1)", "", 1]]]
+                |> Terminal.set_cursor [1, 4] |> Terminal.set_marks %{0 => :ok});
+            let [lines] = Node.children t;
+            let [first, second, ghost, cursor, input, probe] = Node.children lines;
+            test.eq! ["terminal", "calc(1 * var(--dw-term-lh) * 1em)", "calc(4 * 1ch)", "terminal-input", "terminal-probe", "terminal-l1"]
+                [Node.key t, (Node.style cursor).["top"], (Node.style cursor).["left"], Node.key input, Node.key probe, Node.key second]
+            test.eq! "keydown paste compositionend" (Node.attrs input).["data-dream-prevent"]
+        }),
+        test.case "lines keep their numbers as earlier ones scroll away" $({
+            let t = terminal (Terminal.new () |> Terminal.set_lines [[], []] |> Terminal.set_first 40 |> Terminal.set_cursor [41, 0]
+                |> Terminal.set_ghost "status");
+            let [lines] = Node.children t;
+            let [a, b, ghost, cursor, input, probe] = Node.children lines;
+            test.eq! ["terminal-l40", "terminal-l41", "calc(1 * var(--dw-term-lh) * 1em)", "status"]
+                [Node.key a, Node.key b, (Node.style cursor).["top"], Node.text (list.head (Node.children ghost))]
+        }),
+        test.case "a span takes a style only when it has one, and inverse swaps its colours" $({
+            test.eq! "#text" (Node.tag (term_span ["plain", "", "", 0]))
+            let s = term_span ["x", "red", "", 16 + 1];
+            test.eq! [%{"color" => "var(--dw-term-bg)", "background" => "red"}, ["dw-t-b"]] [Node.style s, Node.classes s]
+        }),
+        test.case "a palette's keys move and pick" $({
+            let p = palette (Palette.new () |> Palette.set_open true |> Palette.set_items [["a", "Alpha", "", ""], ["b", "Beta", "", "Ctrl+B"]]
+                |> Palette.set_selected 1 |> Palette.set_on_move (fn d -> [:move, d]) |> Palette.set_on_pick (fn v -> [:pick, v]));
+            let keys = (graphics.handlers_at p [0, 0, 1]).["keydown"];
+            test.eq! [[:move, 1], [:pick, "b"], ()] [graphics.message_of keys %{"key" => "ArrowDown"},
+                graphics.message_of keys %{"key" => "Enter"}, graphics.message_of keys %{"key" => "x"}]
+        }),
+        test.case "a sparkline spans its box" $({
+            let [line] = Node.children (sparkline [1, 3, 2]);
+            test.eq! "0,280 500,20 1000,150" (Node.attrs line).["points"]
+        })
     ];
 }

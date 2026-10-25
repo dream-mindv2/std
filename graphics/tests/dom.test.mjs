@@ -120,6 +120,34 @@ test('composition is not overwritten by a concurrent render', () => {
   input.dispatchEvent(new dom.window.InputEvent('input', { bubbles: true }));
   assert.equal(events[0].value, 'に');
 });
+test('typing faster than the program renders loses nothing, and a value the program chooses is written', () => {
+  const { root, show, dom, events } = setup();
+  const view = value => node('input', 'editor', { attrs: { value }, events: ['input'] });
+  show(view(''));
+  const input = root.firstChild;
+  for (const typed of ['a', 'ab', 'abc']) {
+    input.value = typed;
+    input.dispatchEvent(new dom.window.InputEvent('input', { bubbles: true }));
+  }
+  show(view('a'));
+  assert.equal(input.value, 'abc');
+  show(view('abc'));
+  assert.equal(input.value, 'abc');
+  show(view(''));
+  assert.equal(input.value, '');
+  assert.equal(events.length, 3);
+});
+test('a control that asks for the focus is given it as it appears, and only then', () => {
+  const { root, show, dom } = setup();
+  show(node('div', 'page', { children: [node('input', 'a')] }));
+  root.querySelector('input').focus();
+  show(node('div', 'page', { children: [node('input', 'a'), node('input', 'b', { attrs: { autofocus: true } })] }));
+  const [a, b] = root.querySelectorAll('input');
+  assert.equal(dom.window.document.activeElement, b);
+  a.focus();
+  show(node('div', 'page', { children: [node('input', 'a', { attrs: { value: 'x' } }), node('input', 'b', { attrs: { autofocus: true } })] }));
+  assert.equal(dom.window.document.activeElement, a);
+});
 test('invalid trees are rejected before existing DOM changes', () => {
   const { root, show, driver } = setup();
   show(node('p', 'keep', { children: [text('safe')] }));
@@ -264,4 +292,42 @@ test('a key is the page\'s once: brought in twice, or while still shown, is refu
   // Going in the same patch, it may come back somewhere else, as a new element.
   driver.render({ o: 0, c: [[1, 1], node('section', '', { children: [node('p', 'x')] })] });
   assert.equal(driver.element('x').parentNode.tagName, 'SECTION');
+});
+test('an element that takes over keys keeps them, less the chords it passes and bare modifiers', () => {
+  const { root, show, dom, events } = setup();
+  show(node('div', 'term', { attrs: { tabindex: 0, 'data-dream-prevent': 'keydown', 'data-dream-pass': 'ctrl+c' },
+    events: ['keydown'] }));
+  const el = root.firstChild;
+  const press = (key, more = {}) => {
+    const e = new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...more });
+    el.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  assert.deepEqual([press('a'), press('Tab'), press('c', { ctrlKey: true }), press('Shift', { shiftKey: true })],
+    [true, true, false, false]);
+  assert.equal(events.length, 4);
+  assert.deepEqual(events.map(e => e.value.key), ['a', 'Tab', 'c', 'Shift']);
+});
+test('the chords a control keeps are kept though nothing listens for keys there', () => {
+  const { root, show, dom, events } = setup();
+  show(node('textarea', 'sql', { attrs: { 'data-dream-keys': 'ctrl+enter meta+enter' }, events: ['input'] }));
+  const el = root.firstChild;
+  const press = (key, more = {}) => {
+    const e = new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...more });
+    el.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  assert.deepEqual([press('Enter', { ctrlKey: true }), press('Enter', { metaKey: true }), press('Enter'), press('x')],
+    [true, true, false, false]);
+  assert.equal(events.length, 0);
+});
+test('a paste reports its text, and taking it over keeps the browser from inserting it', () => {
+  const { root, show, dom, events } = setup();
+  show(node('textarea', 'in', { attrs: { 'data-dream-prevent': 'paste' }, events: ['paste'] }));
+  const el = root.firstChild;
+  const e = new dom.window.Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(e, 'clipboardData', { value: { getData: type => type === 'text/plain' ? 'ls -la\n' : '' } });
+  el.dispatchEvent(e);
+  assert.equal(e.defaultPrevented, true);
+  assert.deepEqual(events.map(x => [x.event, x.value]), [['paste', 'ls -la\n']]);
 });
