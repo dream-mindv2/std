@@ -41,10 +41,11 @@ with tempfile.TemporaryDirectory(prefix='dream-graphics-tests-') as temp:
     for name in ('dom', 'main', 'worker'):
         run('node', here / f'tests/{name}.test.mjs')
 
+    # An application builds to one image, NAME.dream, with the same page beside
+    # it as a site, NAME/, which is what the browser tests serve.
     def build(name, project):
-        app = temp / name
-        run(vm, mind, '-C', project, 'build', '--runtime', runtime, '--output', app)
-        return app
+        run(vm, mind, '-C', project, 'build', '--runtime', runtime, '--output', temp / f'{name}.dream')
+        return temp / name
 
     # A test frontend with the test backend: a project of its own, written here.
     def test_app(name):
@@ -52,7 +53,8 @@ with tempfile.TemporaryDirectory(prefix='dream-graphics-tests-') as temp:
         project.mkdir()
         (project / 'mind.toml').write_text(f'[package]\nname = "{name}"\nversion = "0.0.0"\n\n[graphics]\n'
                                            f'frontend = "{here / "tests" / name}.dr"\nbackend = "{here / "tests/backend.dr"}"\n')
-        return build(name, project)
+        build(name, project)
+        return temp / f'{name}.dream'
 
     examples = here / 'examples'
     counter = build('counter', examples / 'counter')

@@ -117,7 +117,9 @@ with tempfile.TemporaryDirectory(prefix='dream-graphics-display-') as tmp:
                 assert result.returncode != 0 and 'intentional frontend failure' in result.stderr, result
                 print('WebKitGTK: frontend failure stops the VM with an error')
             if args.lifecycle:
-                with subprocess.Popen([vm, '--graphics', str(args.lifecycle.resolve())],
+                # Run as any image is, rather than through --graphics: an image
+                # carrying a page opens its own window.
+                with subprocess.Popen([vm, str(args.lifecycle.resolve())],
                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as app:
                     try:
                         close_window(env['DISPLAY'], app)

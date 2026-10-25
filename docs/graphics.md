@@ -91,12 +91,21 @@ manifest:
 
 Dependencies, profiles and `when` flags are the package's, as for any build.
 
-On the desktop the same directory is an application:
+On the desktop the application is one image, which `mind build` writes beside
+the site: the backend's program (or, with no backend, the frontend's) carrying
+the page as payloads, a file each, named `graphics/` and the file's path. The
+VM opens a window for any image carrying `graphics/index.html`, serves the page
+from those payloads, and runs the image again as the backend with
+`--headless`, so it is installed and run as any program is:
 
 ```sh
 nix-shell mind/std/graphics/shell.nix --run 'just graphics-vm'
-build-graphics/bin/dream --graphics /tmp/hello
+build-graphics/bin/dream /tmp/hello/target/debug/hello.dream
+mind install && dream -x hello
 ```
+
+`--graphics DIR` still opens a site directory laid out by hand, with a
+`backend.dream` beside its `assets/`.
 
 `graphics-vm` builds the VM with `DREAM_ENABLE_GRAPHICS=ON` (GTK 3 and
 WebKitGTK 4.1, Linux only for now). An ordinary VM answers `--graphics` with
@@ -330,8 +339,8 @@ let main! = backend.serve! %{
 };
 ```
 
-On the desktop, `dream --graphics APP` runs `APP/backend.dream` as a native
-Dream process with ordinary access to the machine, and its command table is the
+On the desktop, the application's image runs its own program `--headless` as
+a native Dream process with ordinary access to the machine, and its command table is the
 whole of what the frontend may ask of it: an unregistered command is
 `permission_denied`, input its type refuses `invalid_arguments`, an answer its
 type refuses `invalid_result`, and a handler that raises `command_failed`.
