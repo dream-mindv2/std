@@ -31,6 +31,7 @@ import std.list;
 import std.num;
 import std.result;
 import std.str;
+import std.vm;
 
 // --- reading ----------------------------------------------------------------
 
@@ -243,7 +244,16 @@ let rec parse_array cs acc first = match skip_ws cs {
 /// };
 /// ```
 let parse : :string -> Result :any :string;
-let parse text = {
+let parse text = match vm.json_decode text {
+    [v] => Result.ok v,
+    _ => parse_chars text,
+};
+
+/// `parse`, a character at a time: what the VM's reader (`vm.json_decode`)
+/// leaves to it -- text that is not JSON, or not UTF-8 -- so that what such
+/// text comes to, and the error it gets, is this walk's.
+priv let parse_chars : :string -> Result :any :string;
+priv let parse_chars text = {
     let r = parse_value (str.chars text);
     if r == () { err "not valid JSON" }
     else {
@@ -366,6 +376,13 @@ let format_name u = "json";
 let decode : :string -> Result :any :string;
 let decode text = parse text;
 
+/// A value as JSON. The VM writes it (`vm.json_encode`): the text the walk
+/// above writes, byte for byte -- the tests below hold the two together --
+/// for a twentieth of the time, which a graphical application pays on every
+/// frame it sends and every event it hears.
+let encode : :any -> :string;
+let encode v = vm.json_encode v;
+
 // --- the names this module had before it derived anything ---------------------
 
 /// A value as JSON. `encode` is the same function under the name every codec
@@ -438,6 +455,18 @@ when test {
     let tests = [
         // A record is written as what it was built as before it was one
         // (`codec.as_written`), not as the text it prints as.
+        test.case "the VM reads what the walk reads"
+            $( {
+                let texts = ["{\"a\": [1, -2.5e3, 12345678901234567890, true, false, null], \"b\": {\"c\": \"x\\ny\\u00e9\\ud83d\\ude00\\ud800z\"}}",
+                             " [ ] ", "{}", "\"\\/\"", "[1,]", "{\"a\":1,}", "tru", "[1 2]", "1 x", "\"\\q\"", "{\"a\":1,\"a\":2}", "-", "1.5.5", "\u{e9}"];
+                test.eq! (list.map parse_chars texts) (list.map parse texts)
+            } ),
+        test.case "the VM writes what the walk writes"
+            $( {
+                let v = %{ "a" => [1, 2.5, -3, 12345678901234567890123, 1.0e300], :b => [(), true, false, "q\"\\\n\t\u{1}\u{1f} é", 'c', :atom],
+                           3 => Point.make 1 [Shape.circle 2.0, Shape.empty], "nested" => %{ :x => [[], [[]]], 2.5 => "f" } };
+                test.eq! (encode_value v) (encode v)
+            } ),
         test.case "a struct is its fields"
             $( test.eq! "[1,2]" (write (Point.make 1 2)) ),
         test.case "a variant is its tag and fields, or its tag"

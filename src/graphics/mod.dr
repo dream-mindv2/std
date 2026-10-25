@@ -158,7 +158,8 @@ let lazy2 f a b = {
 
 /// What a node shows: a lazy node's node, made now if it was not before.
 /// `nothing` made lazily still holds its place, as empty text.
-priv let rec shown node = if Node.tag node != "#lazy" { node } else {
+let shown : Node -> Node;
+let rec shown node = if Node.tag node != "#lazy" { node } else {
     let [f, value, made] = Node.memo node;
     let n = Node.set_key (Node.key node) (shown (made ()));
     if Node.tag n == "#none" { text "" |> Node.set_key (Node.key node) } else { n }

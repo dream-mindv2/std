@@ -269,9 +269,16 @@ let join_str : :string -> [:string] -> :string;
 let join_str sep parts =
     match parts {
         [] => "",
-        [first, ..rest] =>
-            _str_concat (_list_cons first (flat_map (fn s -> [sep, s]) rest)),
+        [first, ..rest] => _str_concat (_list_cons first (between sep rest)),
     };
+
+/// `sep` before each of `parts`: what `join_str` hands `_str_concat`. A cons
+/// at a time and lazily, where `flat_map` made a list of two for each part
+/// and joined them up -- a cost every JSON array and every rendered page paid.
+priv let rec between sep parts = match parts {
+    [] => [],
+    [s, ..rest] => _list_cons sep (_list_cons s (between sep rest)),
+};
 
 /// `s` repeated `n` times.
 let repeat : :integer -> :string -> :string;

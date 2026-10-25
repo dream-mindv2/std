@@ -37,7 +37,7 @@
 // That is the way out when the kit has no answer; it should rarely be needed.
 import std.atom;
 import std.char;
-import std.graphics.{element, lazy2, text as text_node, nothing as nothing_node, with, App, Attr, Handler, Node};
+import std.graphics.{element, lazy, lazy2, text as text_node, nothing as nothing_node, with, App, Attr, Handler, Node};
 import std.graphics.browser;
 import std.graphics.css;
 import std.list;
@@ -477,8 +477,12 @@ let palette p = if not (Palette.open p) { nothing_node } else {
 // up `1` bold, `2` dim, `4` italic, `8` underline, `16` inverse, `32`
 // strikethrough, `64` blink and `128` hidden.
 //
-// **Each line is drawn lazily** (`ui.lazy2` of the line and its mark), so a
-// render costs the lines that changed. The cursor is a box laid over the
+// **Lines are drawn in blocks** of 64, each lazy (`ui.lazy` of its lines
+// and their marks) and keyed by where it is, and each line in one lazy too.
+// A terminal keeps a screen and a long history, and a frame changes the
+// last few lines: a render compares a couple of dozen blocks and draws the
+// lines that changed, where comparing every line kept, each frame, was most
+// of what a stream of output cost the window. The cursor is a box laid over the
 // grid at `col` widths of a character and `row` line heights, which is exact
 // in a fixed-width face, and the text stays text, selectable as any page's.
 //
@@ -547,6 +551,29 @@ priv let term_span span = {
     }
 };
 
+/// Lines a block of the grid holds.
+priv let block_size = 64;
+
+/// The lines from number `n` on, as blocks: each the lines up to the next
+/// multiple of `block_size`, so a block keeps its place as lines scroll away.
+priv let rec term_blocks key marks !n lines !out = match lines {
+    [] => list.reverse out,
+    _ => {
+        let k = block_size - n % block_size;
+        let these = list.take k lines;
+        let block = lazy term_block [key, n, these, list.map (fn i -> marks.[n + i else ()]) (list.range 0 (len these))]
+            |> Node.set_key (key + "-b" + to_string (n / block_size));
+        term_blocks key marks (n + k) (list.drop k lines) (list.cons block out)
+    },
+};
+
+/// One block: its lines, each lazy and keyed by its number.
+priv let term_block parts = {
+    let [key, n, these, ms] = parts;
+    kit "div" "term-block" (list.zip_with (fn i pair -> lazy2 term_line (list.head pair) (list.nth 1 pair) |> Node.set_key (key + "-l" + to_string (n + i)))
+        (list.from 0) (list.zip these ms))
+};
+
 /// A line of the grid, with its mark.
 priv let term_line spans mark = kit "div" "term-line" (list.map term_span spans)
     |> with (if mark == () { Attr.none } else { Attr.class ("dw-term-mark dw-term-" + atom.name mark) });
@@ -565,7 +592,7 @@ let terminal t = {
         |> with (Attr.style "left" ("calc(" + to_string col + " * 1ch)"));
     let palette_vars = list.map_indexed (fn i c -> Attr.style ("--dw-ansi-" + to_string i) c) (Terminal.palette t);
     let lines = kit "div" "term-lines" (list.concat [
-        list.map_indexed (fn i line -> lazy2 term_line line marks.[first + i else ()] |> Node.set_key (line_key t (first + i))) (Terminal.lines t),
+        term_blocks (Terminal.key t) marks first (Terminal.lines t) [],
         [if at == () || Terminal.ghost t == "" { nothing_node } else {
             kit "span" "term-ghost" [text_node (Terminal.ghost t)] |> place |> with (Attr.attribute "aria-hidden" "true")
         },
@@ -1218,7 +1245,8 @@ when test {
             let t = terminal (Terminal.new () |> Terminal.set_lines [[["$ ls", "", "", 0]], [["a", "var(--dw-ansi-1)", "", 1]]]
                 |> Terminal.set_cursor [1, 4] |> Terminal.set_marks %{0 => :ok});
             let [lines] = Node.children t;
-            let [first, second, ghost, cursor, input, probe] = Node.children lines;
+            let [block, ghost, cursor, input, probe] = Node.children lines;
+            let [first, second] = Node.children (graphics.shown block);
             test.eq! ["terminal", "calc(1 * var(--dw-term-lh) * 1em)", "calc(4 * 1ch)", "terminal-input", "terminal-probe", "terminal-l1"]
                 [Node.key t, (Node.style cursor).["top"], (Node.style cursor).["left"], Node.key input, Node.key probe, Node.key second]
             test.eq! "keydown paste compositionend" (Node.attrs input).["data-dream-prevent"]
@@ -1227,9 +1255,17 @@ when test {
             let t = terminal (Terminal.new () |> Terminal.set_lines [[], []] |> Terminal.set_first 40 |> Terminal.set_cursor [41, 0]
                 |> Terminal.set_ghost "status");
             let [lines] = Node.children t;
-            let [a, b, ghost, cursor, input, probe] = Node.children lines;
+            let [block, ghost, cursor, input, probe] = Node.children lines;
+            let [a, b] = Node.children (graphics.shown block);
             test.eq! ["terminal-l40", "terminal-l41", "calc(1 * var(--dw-term-lh) * 1em)", "status"]
                 [Node.key a, Node.key b, (Node.style cursor).["top"], Node.text (list.head (Node.children ghost))]
+        }),
+        test.case "a block ends where its number of lines does, so it keeps its place" $({
+            let t = terminal (Terminal.new () |> Terminal.set_lines (list.replicate 70 []) |> Terminal.set_first 60);
+            let [lines] = Node.children t;
+            let [b0, b1, b2, ..rest] = Node.children lines;
+            test.eq! [["terminal-b0", 4], ["terminal-b1", 64], ["terminal-b2", 2]]
+                (list.map (fn b -> [Node.key b, len (Node.children (graphics.shown b))]) [b0, b1, b2])
         }),
         test.case "a span takes a style only when it has one, and inverse swaps its colours" $({
             test.eq! "#text" (Node.tag (term_span ["plain", "", "", 0]))
