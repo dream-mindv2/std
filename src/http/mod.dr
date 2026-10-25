@@ -743,7 +743,7 @@ priv let run! c req0 sink = {
     let req = with_client_defaults c req0;
     let opts = Request.options req;
     let timeout = opts.[:timeout else default_timeout];
-    match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink) {
+    match time.within! timeout (follow! c req (opts.[:redirects else 10]) sink true) {
         Result.ok(resp) => ok resp,
         Result.error(:timeout) => Result.error (error.new :timeout ("no response from " + Request.url req + " within " + time.format_duration timeout)),
         Result.error(e) => Result.error (if error.is_error e { e } else { error.new :error e }),
@@ -848,12 +848,17 @@ priv let write_piece! h piece = { streams.write_all! h piece; () };
 /// 307 and 308 repeat the request as it was. Credentials are not carried to
 /// another origin: another host, port, or scheme -- `https` to `http` on the
 /// same host would send them in the clear.
-priv let follow! : :map -> :map -> :integer -> :any -> :map;
-priv let rec follow! c req left sink = {
+///
+/// `first` is whether this is the request as it was asked: one asked to
+/// follow no redirects at all is answered with the redirect, and only one
+/// that ran out of the redirects it was allowed is an error.
+priv let follow! : :map -> :map -> :integer -> :any -> :bool -> :map;
+priv let rec follow! c req left sink first = {
     let resp = exchange! c req sink (left > 0);
     let code = Response.status resp;
     let location = header "location" resp;
     if location == () || not (is_redirect code) { resp }
+    else if left <= 0 && first { resp }
     else if left <= 0 { raise! (error.new :too_many_redirects ("still redirected after the last allowed, to " + location)) }
     else {
         let here = url.parse_or_raise (Request.url req);
@@ -865,7 +870,7 @@ priv let rec follow! c req left sink = {
                         |> (fn r -> if same_origin here there { r } else {
                                r |> without_header "authorization" |> without_header "proxy-authorization" |> without_header "cookie"
                            });
-        follow! c moved (left - 1) sink
+        follow! c moved (left - 1) sink false
     }
 };
 

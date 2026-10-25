@@ -1086,6 +1086,15 @@ when test {
             stop! s
             test.eq! :too_many_redirects (error.kind (Option.or_unit (Result.reason got)))
         } ),
+        test.case "a request that follows no redirects is answered with the redirect" $( {
+            let s = serve! 0 (router |> get "/a" (fn req -> http.redirect "/b"));
+            let got = http.send! (http.request "GET" (local_url s + "/a") |> http.with_redirects 0);
+            stop! s
+            match got {
+                Result.ok(r) => test.eq! [302, "/b"] [http.status r, http.header "location" r],
+                other => test.fail! other,
+            }
+        } ),
         test.case "a client timeout" $( {
             let slow = router |> get "/" (fn req -> http.text (to_string (list.length (list.from 1))));
             let s = serve_with! (defaults |> Options.set_port 0 |> Options.set_idle (time.milliseconds 300)) slow;
