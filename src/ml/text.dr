@@ -1,0 +1,266 @@
+// Text as features: tokens, n-grams, TF-IDF vectors and the similarity
+// between them, nearest neighbours, and an n-gram model of what comes next.
+//
+//     import std.ml.text;
+//
+//     let docs = ["git status", "git commit -m fix", "ls -la", "git push origin main"];
+//     let ix = text.index text.tokens (list.map (fn d -> [d, d]) docs);
+//     text.search ix "commit git" 2       // [["git commit -m fix", 0.83], ["git status", 0.29]]
+//
+//     let lm = text.ngram 3 [["cd", "ls", "git status"], ["cd", "ls", "vim"]];
+//     text.predict lm ["cd", "ls"]          // [["git status", 0.5], ["vim", 0.5]]
+//
+// **Vectors are sparse**: a map from a feature (a token, an n-gram) to its
+// weight, so a vocabulary of a hundred thousand words costs what a document
+// mentions. `hashed` turns the same features into a dense list of a fixed
+// width for `std.ml.nn`, which wants tensors.
+//
+// **Everything here is pure and small enough to retrain on every change.** A
+// shell history of ten thousand lines indexes in well under a second, which
+// is the scale these are meant for: a program learning from the person using
+// it, as they use it, without a model trained somewhere else.
+import std.char;
+import std.list;
+import std.map;
+import std.math;
+import std.num;
+import std.str;
+
+/// A sparse vector: feature to weight.
+type Sparse = %{:string => :float};
+
+// --- features --------------------------------------------------------------------
+
+/// Words, lower case: runs of letters, digits and `_`, split at everything
+/// else. Text a person wrote, a log line, a command's arguments.
+let tokens : :string -> [:string];
+let tokens s = {
+    let rec go cs cur acc = match cs {
+        [] => list.reverse (if cur == [] { acc } else { list.cons (str.of_chars (list.reverse cur)) acc }),
+        _ => {
+            let c = list.head cs;
+            if char.is_alnum c || c == '_' { go (list.tail cs) (list.cons (char.lower c) cur) acc }
+            else { go (list.tail cs) [] (if cur == [] { acc } else { list.cons (str.of_chars (list.reverse cur)) acc }) }
+        },
+    };
+    go (str.chars s) [] []
+};
+
+/// The pieces of `s` `n` characters long, with its ends marked by spaces so
+/// a word's start and finish are features too: `char_ngrams 3 "ls"` is
+/// `[" ls", "ls "]`. Robust to spelling, which is what makes "gti sttaus"
+/// still find "git status".
+let char_ngrams : :integer -> :string -> [:string];
+let char_ngrams n s = {
+    let padded = str.chars (" " + str.lower s + " ");
+    let rec go cs acc = if len cs < n { list.reverse acc } else { go (list.tail cs) (list.cons (str.of_chars (list.take n cs)) acc) };
+    if len padded < n { [str.of_chars padded] } else { go padded [] }
+};
+
+/// How many times each feature occurs.
+let counts : [:string] -> %{:string => :integer};
+let counts xs = list.fold (fn m x -> map.update_strict 0 (fn n -> n + 1) x m) map.empty xs;
+
+/// A stable number for a feature, the same on every machine and every run:
+/// a polynomial hash of its characters, below 2^31.
+let hash : :string -> :integer;
+let hash s = str.fold (fn h c -> (h * 1000003 + char.code c) % 2147483647) 5381 s;
+
+/// Features hashed into `width` buckets, each counted, then scaled to unit
+/// length: a dense row for a network.
+let hashed : :integer -> [:string] -> [:float];
+let hashed width features = {
+    let buckets = list.fold (fn m f -> map.update_strict 0 (fn n -> n + 1) (hash f % width) m) map.empty features;
+    let norm = math.sqrt (num.to_float (map.fold (fn a k v -> a + v * v) 0 buckets));
+    let scale = if norm == 0.0 { 1.0 } else { norm };
+    list.map (fn i -> num.to_float (buckets.[i else 0]) / scale) (list.range 0 width)
+};
+
+// --- vectors ---------------------------------------------------------------------
+
+/// The sum of the products of shared features.
+let dot : Sparse -> Sparse -> :float;
+let dot a b = if map.size a > map.size b { dot b a } else {
+    map.fold (fn acc k v -> acc + v * b.[k else 0.0]) 0.0 a
+};
+
+/// Length.
+let norm : Sparse -> :float;
+let norm v = math.sqrt (map.fold (fn acc k x -> acc + x * x) 0.0 v);
+
+/// `v` scaled to length one; the empty vector stays empty.
+let unit : Sparse -> Sparse;
+let unit v = {
+    let n = norm v;
+    if n == 0.0 { v } else { map.map_values (fn x -> x / n) v }
+};
+
+/// The cosine of the angle between two vectors: 1 for the same direction,
+/// 0 for nothing in common.
+let cosine : Sparse -> Sparse -> :float;
+let cosine a b = {
+    let d = norm a * norm b;
+    if d == 0.0 { 0.0 } else { dot a b / d }
+};
+
+/// The sum of two vectors.
+let add : Sparse -> Sparse -> Sparse;
+let add a b = map.fold (fn acc k v -> map.update_strict 0.0 (fn x -> x + v) k acc) a b;
+
+/// `v` times `k`.
+let scale : :float -> Sparse -> Sparse;
+let scale k v = map.map_values (fn x -> x * k) v;
+
+// --- TF-IDF ----------------------------------------------------------------------
+
+/// How rare each feature is across the documents it was fitted to:
+/// `log((1 + docs) / (1 + df)) + 1`, smoothed as scikit-learn does, so a
+/// feature in every document still counts a little.
+mapping Tfidf {
+    idf : %{:string => :float} = %{}
+    docs : :integer = 0
+    unseen : :float = 1.0
+}
+
+/// Weights for features of documents like these, each given as its features.
+let fit_tfidf : [[:string]] -> Tfidf;
+let fit_tfidf documents = {
+    let df = list.fold (fn m doc -> list.fold (fn m2 f -> map.update_strict 0 (fn n -> n + 1) f m2) m (map.keys (counts doc)))
+        map.empty documents;
+    let n = len documents;
+    let weight = fn d -> math.log (num.to_float (1 + n) / num.to_float (1 + d)) + 1.0;
+    Tfidf.new () |> Tfidf.set_idf (map.map_values weight df) |> Tfidf.set_docs n |> Tfidf.set_unseen (weight 0)
+};
+
+/// A document's vector: each feature's count, by how rare it is, scaled to
+/// length one. A feature never seen in fitting weighs as the rarest.
+let vector : Tfidf -> [:string] -> Sparse;
+let vector model features = {
+    let idf = Tfidf.idf model;
+    let unseen = Tfidf.unseen model;
+    unit (map.fold (fn acc f c -> acc.[f => num.to_float c * idf.[f else unseen]]) map.empty (counts features))
+};
+
+// --- nearest neighbours ----------------------------------------------------------
+
+/// Documents made searchable by meaning rather than by exact text: each kept
+/// as its TF-IDF vector, with the key it is answered by.
+mapping Index {
+    model : Tfidf = Tfidf.new ()
+    features : :any = ()
+    entries : [[:any]] = []
+}
+
+/// An index of `[key, text]` pairs, `features` making each text's features.
+let index : (:string -> [:string]) -> [[:any]] -> Index;
+let index features items = {
+    let model = fit_tfidf (list.map (fn kv -> features (list.nth 1 kv)) items);
+    Index.new () |> Index.set_model model |> Index.set_features features
+        |> Index.set_entries (list.map (fn kv -> [list.head kv, vector model (features (list.nth 1 kv))]) items)
+};
+
+/// The `k` keys whose text is most like `query`, most alike first, each with
+/// its cosine similarity; nothing that shares no feature at all.
+let search : Index -> :string -> :integer -> [[:any]];
+let search ix query k = {
+    let q = vector (Index.model ix) ((Index.features ix) query);
+    let scored = list.filter (fn e -> list.nth 1 e > 0.0)
+        (list.map (fn e -> [list.head e, dot q (list.nth 1 e)]) (Index.entries ix));
+    list.take k (list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b) scored)
+};
+
+// --- n-gram models ---------------------------------------------------------------
+
+/// What follows what: for every context of up to `order - 1` items, how
+/// often each item came next. Items are strings -- words, whole commands.
+/// A context is keyed by its text, since a map compares a list key by
+/// identity rather than by what is in it.
+mapping Ngram {
+    order : :integer = 3
+    table : %{:string => %{:string => :integer}} = %{}
+}
+
+/// The contexts `seq` shows before position `i`, longest first: the last
+/// `order - 1` items, then fewer, then none; each as its key.
+priv let contexts order seq i = list.map (fn n -> to_string (list.drop (i - n) (list.take i seq)))
+    (list.reverse (list.range 0 (num.min order i + 1)));
+
+/// A model of each sequence's items given the ones before them.
+let ngram : :integer -> [[:string]] -> Ngram;
+let ngram order sequences = list.fold (fn m seq -> observe m seq) (Ngram.new () |> Ngram.set_order order) sequences;
+
+/// The model with one more sequence counted: how it learns as it is used.
+let observe : Ngram -> [:string] -> Ngram;
+let observe model seq = {
+    let k = Ngram.order model - 1;
+    let table = list.fold (fn t i -> {
+        let next = list.nth i seq;
+        list.fold (fn t2 ctx -> map.update_strict map.empty (fn row -> map.update_strict 0 (fn n -> n + 1) next row) ctx t2)
+            t (contexts k seq i)
+    }) (Ngram.table model) (list.range 0 (len seq));
+    Ngram.set_table table model
+};
+
+/// What comes after `history`, most likely first, as `[item, probability]`.
+/// The longest context the model has seen is asked first and a shorter one
+/// fills in what it lacks at 0.4 of its weight ("stupid backoff", Brants et
+/// al. 2007), then the scores are made to sum to one.
+let predict : Ngram -> [:string] -> [[:any]];
+let predict model history = {
+    let k = Ngram.order model - 1;
+    let found = contexts k history (len history);
+    let [scores, _] = list.fold (fn acc ctx -> {
+        let [s, weight] = acc;
+        match (Ngram.table model).[ctx else ()] {
+            () => acc,
+            row => {
+                let total = num.to_float (map.fold (fn a key n -> a + n) 0 row);
+                [map.fold (fn s2 item n -> if map.has item s2 { s2 } else { s2.[item => weight * num.to_float n / total] }) s row,
+                 weight * 0.4]
+            },
+        }
+    }) [map.empty, 1.0] found;
+    let sum = map.fold (fn a key v -> a + v) 0.0 scores;
+    let ranked = list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b) (map.pairs scores);
+    if sum == 0.0 { [] } else { list.map (fn p -> [list.head p, list.nth 1 p / sum]) ranked }
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "tokens are words, lower case" $(test.eq! ["git", "commit", "m", "fix_it", "2"] (tokens "git commit -m 'Fix_it' 2")),
+        test.case "character n-grams mark a word's ends" $(test.eq! [" ls", "ls "] (char_ngrams 3 "ls")),
+        test.case "a hash is stable" $(test.eq! [hash "git", true] [hash "git", hash "git" != hash "tig"]),
+        test.case "hashed features have unit length" $({
+            let row = hashed 8 ["a", "b", "a"];
+            test.near! 0.000001 1.0 (list.sum (list.map (fn x -> x * x) row))
+        }),
+        test.case "cosine of a vector with itself is one, and with nothing in common zero" $({
+            let a = %{"x" => 1.0, "y" => 2.0};
+            test.near! 0.000001 1.0 (cosine a a)
+            test.eq! 0.0 (cosine a %{"z" => 3.0})
+        }),
+        test.case "a rare word weighs more than a common one" $({
+            let m = fit_tfidf [["git", "status"], ["git", "push"], ["git", "log"]];
+            let v = vector m ["git", "push"];
+            test.true! (v.["push"] > v.["git"])
+        }),
+        test.case "search finds the closest documents first, despite misspelling" $({
+            let docs = ["git status", "git commit -m fix", "ls -la", "docker compose up"];
+            let ix = index (char_ngrams 3) (list.map (fn d -> [d, d]) docs);
+            test.eq! "git status" (list.head (list.head (search ix "gti sttaus" 1)))
+            test.eq! "docker compose up" (list.head (list.head (search ix "compose" 1)))
+        }),
+        test.case "an n-gram model predicts from the longest context it knows" $({
+            let lm = ngram 3 [["cd", "ls", "git status"], ["cd", "ls", "vim"], ["make", "ls", "vim"]];
+            let p = predict lm ["cd", "ls"];
+            test.eq! ["git status", "vim"] (list.sort (list.map list.head (list.take 2 p)))
+            test.eq! "vim" (list.head (list.head (predict lm ["make", "ls"])))
+            test.near! 0.000001 1.0 (list.sum (list.map (fn x -> list.nth 1 x) p))
+        }),
+        test.case "an unseen history backs off to what is common" $({
+            let lm = ngram 2 [["a", "b"], ["x", "b"], ["c", "d"]];
+            test.eq! "b" (list.head (list.head (predict lm ["zzz"])))
+        }),
+    ];
+}

@@ -182,6 +182,38 @@ use the same splitmix64 stream, subject to the device's floating-point precision
 weights to two decimals (R² 0.998). A three-class spiral run of 30 epochs
 takes 0.48 s in all, compiling included.
 
+## Models that learn from the person
+
+`std.ml.text`, `std.ml.bayes` and `std.ml.cluster` are the other half of
+machine learning: not a network trained somewhere else and loaded, but a
+model a program fits to the person using it, while they use it, from a few
+thousand examples. They came from sleep, the terminal in the workspace, whose
+assistant learns from a shell history, and the constraint was that each
+retrains in well under a second on ten thousand lines, so nothing has to be
+saved but the history itself.
+
+- **Sparse vectors are maps**, feature to weight, so a vocabulary of a
+  hundred thousand words costs what one document mentions; `text.hashed` is
+  the dense, fixed-width form `std.ml.nn` wants. A TF-IDF index
+  (`text.index`, `text.search`) is the nearest-neighbour search the rest
+  lean on.
+- **The n-gram model** (`text.ngram`, `text.predict`) backs off as "stupid
+  backoff" does, with no smoothing to fit. Its contexts are keyed by their
+  text, not by the list of tokens: a map compares a list key by identity, so
+  two equal contexts built apart were two keys.
+- **Naive Bayes** is multinomial with Laplace smoothing, because it is the
+  right first model when examples arrive one at a time: `bayes.learn` adds
+  one in constant time with nothing retrained, and each feature's weight is
+  a count, which is what makes its answer explainable.
+- **k-means** is started by k-means++ and is repeatable by its seed;
+  `kmeans_sparse` is the spherical variant for text, unit vectors compared
+  by cosine, which groups documents by what they are about rather than by
+  how long they are.
+
+None of the three needed `std.tensor`: they are small, sparse and pure, and
+where a network does help -- sleep's next-command predictor blends one with
+the n-gram model -- `hashed` is the bridge into `std.ml.nn`.
+
 ## What is not done
 
 - **Convolutions on the host** are slow beside the GPU (179 ms a step for

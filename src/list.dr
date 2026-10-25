@@ -339,6 +339,11 @@ let flat_map f xs = concat (map f xs);
 let enumerate : [a] -> [[:integer, a]];
 let enumerate xs = zip (from 0) xs;
 
+/// `f` applied to each element and its index: `map_indexed (fn i x -> ..) xs`
+/// without the pairs `enumerate` would build.
+let map_indexed : (:integer -> a -> b) -> [a] -> [b];
+let map_indexed f xs = zip_with f (from 0) xs;
+
 /// `f` applied to corresponding elements, stopping when either list ends:
 /// `zip_with (fn a b -> a + b) xs ys` without the pairs `zip` would build.
 let zip_with : (a -> b -> c) -> [a] -> [b] -> [c];
@@ -941,6 +946,7 @@ when test {
         test.case "flat_map"            $( test.eq! [1, 1, 2, 2] (flat_map (fn x -> [x, x]) [1, 2]) ),
         test.case "enumerate"           $( test.eq! [[0, :a], [1, :b]] (enumerate [:a, :b]) ),
         test.case "zip_with"            $( test.eq! [11, 22] (zip_with (fn a b -> a + b) [1, 2, 3] [10, 20]) ),
+        test.case "map_indexed"         $( test.eq! ["0a", "1b"] (map_indexed (fn i s -> to_string i + s) ["a", "b"]) ),
         test.case "unzip"               $( test.eq! [[1, 2], [:a, :b]] (unzip [[1, :a], [2, :b]]) ),
         test.case "scan"                $( test.eq! [0, 1, 3, 6] (scan (fn a b -> a + b) 0 [1, 2, 3]) ),
         test.case "scan of empty"       $( test.eq! [7] (scan (fn a b -> a + b) 7 []) ),

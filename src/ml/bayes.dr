@@ -1,0 +1,110 @@
+// Naive Bayes: a classifier of things described by their features -- the
+// words of a line, the tokens of a command -- that learns from a handful of
+// examples, one at a time, and says how sure it is.
+//
+//     import std.ml.bayes;
+//     import std.ml.text;
+//
+//     let m = bayes.fit (list.map (fn ex -> [text.tokens (list.head ex), list.nth 1 ex]) [
+//         ["error: cannot find symbol", :error], ["warning: unused variable", :warning],
+//         ["Compiling foo v0.1.0", :info], ["fatal: not a git repository", :error],
+//     ]);
+//     bayes.classify m (text.tokens "error: no such file")    // :error
+//     bayes.probabilities m (text.tokens "unused import")      // [[:warning, 0.71], ..]
+//
+// Multinomial, with Laplace smoothing (`alpha`, 1 by default): the log of
+// each class's share of the examples plus, for each feature, the log of how
+// often it occurred in that class among all the features the class has seen.
+// It is the right first model when the examples are few and arrive as the
+// program runs: `learn` adds one in constant time and nothing is retrained,
+// and its mistakes are easy to explain, since each feature's weight is a count.
+import std.list;
+import std.map;
+import std.math;
+import std.num;
+
+/// Counts per class: examples, features in all, and each feature's.
+mapping Model {
+    alpha : :float = 1.0
+    examples : %{:any => :integer} = %{}
+    totals : %{:any => :integer} = %{}
+    features : %{:any => %{:string => :integer}} = %{}
+    vocabulary : %{:string => :bool} = %{}
+}
+
+/// A model learned from `[features, label]` examples.
+let fit : [[:any]] -> Model;
+let fit examples = list.fold (fn m ex -> learn (list.head ex) (list.nth 1 ex) m) (Model.new ()) examples;
+
+/// The model with one more example: `features` seen in a `label`.
+let learn : [:string] -> :any -> Model -> Model;
+let learn features label m = {
+    let counted = list.fold (fn acc f -> map.update_strict 0 (fn n -> n + 1) f acc) ((Model.features m).[label else map.empty]) features;
+    m |> Model.set_examples (map.update_strict 0 (fn n -> n + 1) label (Model.examples m))
+      |> Model.set_totals (map.update_strict 0 (fn n -> n + len features) label (Model.totals m))
+      |> Model.set_features ((Model.features m).[label => counted])
+      |> Model.set_vocabulary (list.fold (fn v f -> v.[f => true]) (Model.vocabulary m) features)
+};
+
+/// The classes the model has seen.
+let labels : Model -> [:any];
+let labels m = map.sorted_keys (Model.examples m);
+
+/// Each class's log score for `features`, unnormalized.
+let scores : Model -> [:string] -> [[:any]];
+let scores m features = {
+    let total = num.to_float (map.fold (fn a k n -> a + n) 0 (Model.examples m));
+    let v = num.to_float (map.size (Model.vocabulary m));
+    let alpha = Model.alpha m;
+    list.map (fn label -> {
+        let counts = (Model.features m).[label];
+        let denominator = num.to_float ((Model.totals m).[label]) + alpha * v;
+        let prior = math.log (num.to_float ((Model.examples m).[label]) / total);
+        [label, list.fold (fn acc f -> acc + math.log ((num.to_float (counts.[f else 0]) + alpha) / denominator)) prior features]
+    }) (labels m)
+};
+
+/// Each class with its probability given `features`, most likely first.
+let probabilities : Model -> [:string] -> [[:any]];
+let probabilities m features = {
+    let s = scores m features;
+    if s == [] { [] } else {
+        let top = list.fold (fn a x -> num.max a (list.nth 1 x)) (list.nth 1 (list.head s)) s;
+        let exps = list.map (fn x -> [list.head x, math.exp (list.nth 1 x - top)]) s;
+        let sum = list.fold (fn a x -> a + list.nth 1 x) 0.0 exps;
+        list.sort_by (fn a b -> list.nth 1 a > list.nth 1 b) (list.map (fn x -> [list.head x, list.nth 1 x / sum]) exps)
+    }
+};
+
+/// The most likely class, or `()` for a model that has seen nothing.
+let classify : Model -> [:string] -> :any;
+let classify m features = match probabilities m features {
+    [] => (),
+    ranked => list.head (list.head ranked),
+};
+
+when test {
+    import std.test;
+    let examples = [
+        [["error", "cannot", "find", "symbol"], :error], [["fatal", "not", "a", "git", "repository"], :error],
+        [["error", "no", "such", "file"], :error], [["warning", "unused", "variable"], :warning],
+        [["warning", "deprecated", "function"], :warning], [["compiling", "foo"], :info], [["finished", "release"], :info],
+    ];
+    let tests = [
+        test.case "it classifies by the words a class uses" $({
+            let m = fit examples;
+            test.eq! [:error, :warning, :info] [classify m ["fatal", "error"], classify m ["unused", "import"], classify m ["compiling", "bar"]]
+        }),
+        test.case "probabilities sum to one, most likely first" $({
+            let p = probabilities (fit examples) ["warning", "something"];
+            test.eq! :warning (list.head (list.head p))
+            test.near! 0.000001 1.0 (list.fold (fn a x -> a + list.nth 1 x) 0.0 p)
+        }),
+        test.case "a feature it learns moves the answer" $({
+            let m = fit examples;
+            let taught = learn ["segfault", "core", "dumped"] :crash (learn ["segfault"] :crash m);
+            test.eq! [false, :crash] [classify m ["segfault"] == :crash, classify taught ["segfault"]]
+        }),
+        test.case "an empty model knows nothing" $(test.eq! () (classify (Model.new ()) ["x"])),
+    ];
+}

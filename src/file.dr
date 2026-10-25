@@ -11,6 +11,7 @@ import std.list;
 import std.os;
 import std.path as paths;
 import std.str;
+import std.streams;
 
 /// Read a handle in 64 KiB chunks, joining the accumulated chunks at end of file.
 let read_chunks! : :any -> [:string] -> :string;
@@ -55,6 +56,15 @@ let write! path text = {
         if left > 0 { put! (offset + io.write! h (str.slice offset left text)) }
     };
     put! 0
+    io.close! h
+};
+
+/// Add `text` to the end of the file at `path`, making it if it is not there:
+/// a log, written a line at a time without reading what is already in it.
+let append! : :string -> :string -> :unit;
+let append! path text = {
+    let h = io.open! path :append;
+    streams.write_all! h text
     io.close! h
 };
 
@@ -239,6 +249,17 @@ when test {
                 strict! got
                 remove_all! d
                 test.eq! [["hello", "hello", ()], ()] [got, io.stat! d]
+            } ),
+        test.case "appending adds to the end, and makes the file"
+            $( {
+                let d = scratch! ();
+                mkdir_all! d
+                append! (d + "/log") "one\n"
+                append! (d + "/log") "two\n"
+                let got = read! (d + "/log");
+                strict! got
+                remove_all! d
+                test.eq! "one\ntwo\n" got
             } ),
     ];
 }

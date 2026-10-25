@@ -1,0 +1,187 @@
+// Pseudo-terminals: a program run on a terminal of its own, which this
+// program is the other end of.
+//
+//     import std.pty;
+//
+//     let t = pty.spawn! (pty.Options.new () |> pty.Options.set_program "bash"
+//         |> pty.Options.set_cols 120 |> pty.Options.set_rows 40);
+//     pty.write! t "ls --color\r";
+//     pty.read! t                  // what bash wrote, escape sequences and all
+//     pty.resize! t 100 30         // the shell hears SIGWINCH
+//     pty.close! t
+//
+// This is what a terminal emulator, a recorder like `script`, or a test that
+// drives an interactive program is built on. A program on a terminal behaves
+// as it does for a person -- it colours its output, buffers by line, asks for
+// a password, redraws a full screen -- because it cannot tell the difference:
+// the terminal is its controlling one, so Ctrl-C written as `"\x03"` reaches
+// it as SIGINT and a resize as SIGWINCH.
+//
+// **Reading and writing are io's**: `t`'s handle is an ordinary stream, so a
+// read parks this process rather than a worker, and `read!` answers `""` once
+// the program and everything it left running have closed the terminal --
+// which is the end of the session, whatever the program's status says.
+//
+// **The program is this one's child until reaped.** `status!` asks without
+// waiting and `wait!` waits; `close!` hangs up -- SIGHUP to the session, as
+// closing a terminal's window does -- and reaps. Only children `spawn!`
+// started can be signalled through here.
+//
+// Linux and macOS (`os.pty_spawn!` forks and makes the terminal the child's
+// controlling one with `TIOCSCTTY`); Windows' ConPTY is not yet provided, and
+// `spawn!` raises `:unsupported` there.
+import std.error;
+import std.io;
+import std.list;
+import std.os;
+import std.proc;
+import std.str;
+import std.streams;
+
+/// What to run, and on how large a terminal. `program` is found on `PATH`
+/// (the one `env` sets, if it sets one) unless it has a slash in it; `""`
+/// is the person's shell, `$SHELL` or `/bin/sh`. `env` is `NAME=value`
+/// strings laid over this program's environment, and `term` is `TERM`
+/// unless `env` names it.
+mapping Options {
+    program : :string = ""
+    args : [:string] = []
+    env : [:string] = []
+    dir : :string = ""
+    cols : :integer = 80
+    rows : :integer = 24
+    term : :string = "xterm-256color"
+}
+
+/// A program on a terminal: the terminal's master side, and the program's pid.
+struct Pty {
+    handle : :any
+    pid : :integer
+}
+
+/// How a program on a terminal ended.
+union Exit {
+    exited(code : :integer),
+    signalled(signal : :integer),
+}
+
+/// The person's shell: `$SHELL`, or `/bin/sh` where it is not set.
+let shell! : :unit -> :string;
+let shell! u = match os.env! "SHELL" {
+    () => "/bin/sh",
+    "" => "/bin/sh",
+    s => s,
+};
+
+/// Start what `o` says on a new terminal.
+let spawn! : Options -> Pty;
+let spawn! o = {
+    let program = if Options.program o == "" { shell! () } else { Options.program o };
+    let env = Options.env o;
+    let named = list.any (fn kv -> str.starts_with "TERM=" kv) env;
+    let full = if named { env } else { list.cons ("TERM=" + Options.term o) env };
+    let [handle, pid] = os.pty_spawn! program (Options.args o) full (Options.dir o) (Options.cols o) (Options.rows o);
+    Pty.make handle pid
+};
+
+/// Up to 64 KiB of what the program wrote, waiting until there is some; `""`
+/// once the terminal has closed.
+let read! : Pty -> :string;
+let read! t = io.read! (Pty.handle t) 65536;
+
+/// Type `text` at the program: all of it, waiting while the terminal is full.
+let write! : Pty -> :string -> :atom;
+let write! t text = streams.write_all! (Pty.handle t) text;
+
+/// The window is now `cols` by `rows`.
+let resize! : Pty -> :integer -> :integer -> :unit;
+let resize! t cols rows = os.pty_resize! (Pty.handle t) cols rows;
+
+/// How the program ended, or nothing while it runs. Once this has answered
+/// an exit, the child is reaped and asking again raises `:not_found`.
+let status! : Pty -> Option Exit;
+let status! t = match os.pty_status! (Pty.pid t) {
+    () => Option.none,
+    n => Option.some (if n < 0 { Exit.signalled (0 - n) } else { Exit.exited n }),
+};
+
+/// Wait for the program to end, looking every `ms` milliseconds.
+let wait_every! : :integer -> Pty -> Exit;
+let rec wait_every! ms t = match status! t {
+    Option.some(e) => e,
+    Option.none => { proc.sleep! ms; wait_every! ms t },
+};
+
+/// Wait for the program to end.
+let wait! : Pty -> Exit;
+let wait! t = wait_every! 20 t;
+
+/// Send the program's session `:hangup`, `:interrupt`, `:terminate`, `:kill`,
+/// `:quit`, `:stop` or `:continue`.
+let signal! : Pty -> :atom -> :unit;
+let signal! t sig = os.pty_signal! (Pty.pid t) sig;
+
+/// The process group in the terminal's foreground: the shell's own at a
+/// prompt, the program it is running otherwise. Nothing once it has closed.
+let foreground! : Pty -> Option :integer;
+let foreground! t = Option.of (os.pty_foreground! (Pty.handle t));
+
+/// Hang up: SIGHUP to the session, the terminal closed, and the program
+/// reaped -- killed if it is still there a second later.
+let close! : Pty -> Exit;
+let close! t = {
+    try! { signal! t :hangup } catch e { () }
+    try! { io.close! (Pty.handle t) } catch e { () }
+    let rec settle! n = match status! t {
+        Option.some(e) => e,
+        Option.none => if n == 0 { signal! t :kill; wait! t } else { proc.sleep! 20; settle! (n - 1) },
+    };
+    settle! 50
+};
+
+/// Everything the program writes until the terminal closes.
+let read_all! : Pty -> :string;
+let read_all! t = {
+    let rec go! acc = match read! t {
+        "" => list.reverse acc,
+        chunk => go! (list.cons chunk acc),
+    };
+    str.concat_all (go! [])
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a program sees a terminal of the size asked for" $({
+            let t = spawn! (Options.new () |> Options.set_program "/bin/sh"
+                |> Options.set_args ["-c", "test -t 0 && echo tty; stty size; echo $TERM"]
+                |> Options.set_cols 100 |> Options.set_rows 30);
+            let out = read_all! t;
+            test.eq! [true, true, true, Exit.exited 0]
+                [str.contains_str "tty" out, str.contains_str "30 100" out, str.contains_str "xterm-256color" out, wait! t]
+        }),
+        test.case "what is typed reaches the program, and a resize is seen" $({
+            let t = spawn! (Options.new () |> Options.set_program "/bin/sh"
+                |> Options.set_args ["-c", "read line; stty size; echo got:$line"]);
+            resize! t 132 43
+            write! t "hello\r"
+            let out = read_all! t;
+            test.eq! [true, true] [str.contains_str "got:hello" out, str.contains_str "43 132" out]
+        }),
+        test.case "a program's exit status and a signal are told apart" $({
+            let a = spawn! (Options.new () |> Options.set_program "/bin/sh" |> Options.set_args ["-c", "exit 3"]);
+            read_all! a
+            let b = spawn! (Options.new () |> Options.set_program "/bin/sh" |> Options.set_args ["-c", "sleep 30"]);
+            signal! b :kill
+            test.eq! [Exit.exited 3, Exit.signalled 9] [wait! a, wait! b]
+        }),
+        test.case "close hangs up a program that is still running" $({
+            let t = spawn! (Options.new () |> Options.set_program "/bin/sh" |> Options.set_args ["-c", "sleep 30"]);
+            test.eq! true (match close! t { Exit.signalled(_) => true, Exit.exited(_) => false })
+        }),
+        test.case "a program that is not there is said to be missing" $(test.eq! :not_found (try! {
+            spawn! (Options.new () |> Options.set_program "no-such-program-here");
+            :ran
+        } catch e { error.kind e })),
+    ];
+}

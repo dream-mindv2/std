@@ -94,6 +94,7 @@ learn.
 | `graphics`, `.widgets`, `.html`, `.css`, `.canvas`, `.browser`, `.backend` | user interfaces: a model, typed messages and a view; a widget kit with its own design ([widgets](docs/widgets.md)); elements, stylesheets and drawing as values; the page's effects; a native backend's commands ([guide](docs/graphics.md)) |
 | `path` | paths as text, POSIX's and Windows' rules both: drives, shares, `dirname`, extensions, `normalize`, `relative` ([below](#paths)) |
 | `file` | whole files, and the directories they go in |
+| `pty` | a program run on a pseudo-terminal of its own -- what a terminal emulator, a recorder or a test of an interactive program is built on; Linux and macOS |
 | `streams` | writing all of a string through a writer that may take less |
 | `cli` | command lines: one description of an option, read, checked and printed as usage |
 | `foreign` | wrapping a C library on `std.ffi`; what the `foreign` declaration builds on ([dream/docs/ffi.md](https://github.com/dream-mindv2/dream/blob/main/docs/ffi.md)) |
@@ -112,6 +113,8 @@ learn.
 | `ml.optim` | SGD, Adam, AdamW, RMSProp, Adagrad, clipping, learning-rate schedules |
 | `ml.data` | datasets: batches, shuffles, splits and folds, scalers, CSV, synthetic sets |
 | `ml.init`, `ml.tree`, `ml.ops` | initial weights, parameter trees, and the tensor compositions the rest share |
+| `ml.text` | text as features: tokens, character n-grams, sparse and hashed vectors, TF-IDF and search, an n-gram model of what comes next |
+| `ml.bayes`, `ml.cluster` | naive Bayes that learns one example at a time; k-means++, dense and spherical for text |
 
 **Writing programs**
 

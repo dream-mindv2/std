@@ -1,0 +1,114 @@
+// Clustering: k-means, on dense rows or on sparse vectors.
+//
+//     import std.ml.cluster;
+//
+//     let c = cluster.kmeans 2 7 [[0.0, 0.1], [0.2, 0.0], [5.0, 5.1], [5.2, 4.9]];
+//     cluster.Clusters.assignment c        // [0, 0, 1, 1]
+//
+//     // documents by topic: TF-IDF vectors, compared by angle
+//     let s = cluster.kmeans_sparse 3 7 (list.map (text.vector model) docs);
+//
+// Lloyd's algorithm, started by k-means++ (Arthur and Vassilvitskii, 2007):
+// the first centre at random, each next one drawn with probability by its
+// squared distance from the nearest already chosen, which makes a bad start
+// unlikely without restarts. The seed makes a run repeatable. It stops when no
+// point changes its cluster, or after 100 rounds.
+//
+// `kmeans_sparse` is the spherical variant for text: vectors of unit length
+// (`text.unit`), similarity by cosine, and each centre the normalized mean of
+// its members -- the version that groups documents by what they are about
+// rather than by how long they are.
+import std.list;
+import std.map;
+import std.ml.text;
+import std.num;
+import std.random;
+
+/// Where each point went, and what each cluster's centre is.
+mapping Clusters {
+    assignment : [:integer] = []
+    centres : [:any] = []
+    rounds : :integer = 0
+}
+
+priv let sq_dist a b = list.fold (fn acc p -> { let d = list.head p - list.nth 1 p; acc + d * d }) 0.0 (list.zip a b);
+
+priv let nearest_by score centres x = list.head (list.fold (fn best ic -> {
+    let s = score (list.nth 1 ic) x;
+    if best == () || s < list.nth 1 best { [list.head ic, s] } else { best }
+}) () (list.enumerate centres));
+
+/// k-means++: `k` starting centres from `points`, by `dist` (smaller is nearer).
+priv let seeds dist k rng points = {
+    let [first, r1] = random.run (random.pick points) rng;
+    let rec more chosen r = if len chosen >= k || len chosen >= len points { list.reverse chosen } else {
+        let weights = list.map (fn x -> [list.fold (fn m c -> num.min m (dist c x)) 1.0e300 chosen, x]) points;
+        let total = list.fold (fn a w -> a + list.head w) 0.0 weights;
+        if total <= 0.0 { list.reverse chosen } else {
+            let [next, r2] = random.run (random.weighted weights) r;
+            more (list.cons next chosen) r2
+        }
+    };
+    more [first] r1
+};
+
+/// Lloyd's rounds from `centres`, with `dist` to assign and `mean` to move.
+priv let rec lloyd dist mean points centres last round = {
+    let assignment = list.map (fn x -> nearest_by dist centres x) points;
+    if assignment == last || round >= 100 { Clusters.new () |> Clusters.set_assignment assignment |> Clusters.set_centres centres |> Clusters.set_rounds round }
+    else {
+        let groups = list.fold (fn m p -> map.update_strict [] (fn xs -> list.cons (list.nth 1 p) xs) (list.head p) m)
+            map.empty (list.zip assignment points);
+        let moved = list.map_indexed (fn i c -> match groups.[i else []] { [] => c, members => mean members }) centres;
+        lloyd dist mean points moved assignment (round + 1)
+    }
+};
+
+/// `k` clusters of dense rows by Euclidean distance, from seed `seed`.
+let kmeans : :integer -> :integer -> [[:float]] -> Clusters;
+let kmeans k seed points = if points == [] { Clusters.new () } else {
+    let mean = fn members -> {
+        let n = num.to_float (len members);
+        list.map (fn col -> col / n) (list.fold (fn acc x -> list.zip_with (fn a b -> a + b) acc x)
+            (list.map (fn v -> 0.0) (list.head members)) members)
+    };
+    lloyd sq_dist mean points (seeds sq_dist k (random.seed seed) points) () 0
+};
+
+/// `k` clusters of sparse vectors by angle (spherical k-means), from `seed`.
+let kmeans_sparse : :integer -> :integer -> [text.Sparse] -> Clusters;
+let kmeans_sparse k seed vectors = if vectors == [] { Clusters.new () } else {
+    let units = list.map text.unit vectors;
+    let dist = fn a b -> 1.0 - text.dot a b;
+    let mean = fn members -> text.unit (list.fold text.add map.empty members);
+    lloyd dist mean units (seeds dist k (random.seed seed) units) () 0
+};
+
+/// The members of each cluster, in the order of its centres.
+let members : Clusters -> [a] -> [[a]];
+let members c xs = list.map (fn i -> list.map (fn p -> list.nth 1 p) (list.filter (fn p -> list.head p == i) (list.zip (Clusters.assignment c) xs)))
+    (list.range 0 (len (Clusters.centres c)));
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "two clear groups are found" $({
+            let c = kmeans 2 7 [[0.0, 0.1], [0.2, 0.0], [5.0, 5.1], [5.2, 4.9], [0.1, 0.2]];
+            let a = Clusters.assignment c;
+            test.eq! [true, true, true] [list.nth 0 a == list.nth 1 a, list.nth 2 a == list.nth 3 a, list.nth 0 a != list.nth 2 a]
+        }),
+        test.case "a run is repeatable from its seed" $(test.eq!
+            (Clusters.assignment (kmeans 3 11 [[1.0], [2.0], [10.0], [11.0], [20.0], [21.0]]))
+            (Clusters.assignment (kmeans 3 11 [[1.0], [2.0], [10.0], [11.0], [20.0], [21.0]]))),
+        test.case "documents group by what they share" $({
+            let docs = [%{"git" => 1.0, "push" => 1.0}, %{"git" => 1.0, "commit" => 1.0}, %{"docker" => 1.0, "run" => 1.0},
+                        %{"docker" => 1.0, "build" => 1.0}];
+            let a = Clusters.assignment (kmeans_sparse 2 3 docs);
+            test.eq! [true, true, true] [list.nth 0 a == list.nth 1 a, list.nth 2 a == list.nth 3 a, list.nth 0 a != list.nth 2 a]
+        }),
+        test.case "members come back by cluster" $({
+            let c = Clusters.new () |> Clusters.set_assignment [1, 0, 1] |> Clusters.set_centres [[0.0], [1.0]];
+            test.eq! [["b"], ["a", "c"]] (members c ["a", "b", "c"])
+        }),
+    ];
+}
