@@ -108,7 +108,7 @@ mind install && dream -x hello
 
 Every desktop Linux VM opens windows, the released toolchain's included: GTK
 3 and WebKitGTK are not linked but found when a window is first wanted, as
-`std.ffi` finds a C library (`$DREAM_LIB_WEBKIT2GTK`, `$DREAM_LIBRARY_PATH`,
+`std.ffi` finds a C library (`$DREAM_LIB_WEBKIT2GTK_4_1`, `$DREAM_LIBRARY_PATH`,
 the loader, then Nix's and Homebrew's directories), API 4.1 preferred and 4.0
 accepted ([dream/src/graphics_api.hpp](../../../dream/src/graphics_api.hpp)).
 So the VM still starts where they are missing, and only a window says
