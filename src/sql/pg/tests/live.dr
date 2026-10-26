@@ -486,7 +486,7 @@ let tls_refusals! u = {
     test.eq! :invalid_authorization_specification
              (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :disable })))
     // Roots that did not sign the server's certificate.
-    let other = file.read! (certs! () + "/other_ca.pem");
+    let other = Option.unwrap! (file.read! (certs! () + "/other_ca.pem"));
     test.eq! :certificate_untrusted
              (condition_of! (refused! (secured! "u_ssl" "sslpass" %{ :ssl_mode => :verify_full, :ssl_ca => other })))
     test.eq! :bad_config

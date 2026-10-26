@@ -108,8 +108,8 @@ let context! : [:string] -> :map;
 let context! args = match flag_value "--context" args {
     () => host! (os.cwd! ()),
     f => match file.read! f {
-        () => fail! ("cannot read the context " + f),
-        text => match wire.decode text {
+        Option.none => fail! ("cannot read the context " + f),
+        Option.some(text) => match wire.decode text {
             Result.ok(ctx) if build.is_context ctx => ctx,
             Result.ok(_) => fail! ("the context " + f + " is not a build.Context"),
             Result.error(why) => fail! ("the context " + f + " is not one: " + to_string why),
@@ -278,8 +278,8 @@ let keyed! ctx st s = {
 /// A finished step's record: its key and what it read, `[path, digest]`.
 let record_of! : :string -> :any;
 let record_of! dir = match file.read! (dir + "/.record") {
-    () => (),
-    text => match wire.decode text { Result.ok(r) => r, _ => () },
+    Option.none => (),
+    Option.some(text) => match wire.decode text { Result.ok(r) => r, _ => () },
 };
 
 /// Do the files a step read last time still have the digests they had?
@@ -388,14 +388,14 @@ let op! dir ms o = try! {
             d => Result.error (name + " has the SHA-256 " + d + ", and the build pins it to " + digest),
         },
         build.Op.transform(from, name, f) => {
-            let text = f (list.map (fn n -> match file.read! (dir + "/" + n) { () => "", t => t }) from);
+            let text = f (list.map (fn n -> match file.read! (dir + "/" + n) { Option.none => "", Option.some(t) => t }) from);
             strict! text
             file.write! (target! name) text
             Result.ok ()
         },
         build.Op.expect(name, path, bless) => {
-            let got = str.trim_end (match file.read! (dir + "/" + name) { () => "", t => t });
-            let wanted = str.trim_end (match file.read! path { () => "", t => t });
+            let got = str.trim_end (match file.read! (dir + "/" + name) { Option.none => "", Option.some(t) => t });
+            let wanted = str.trim_end (match file.read! path { Option.none => "", Option.some(t) => t });
             match [got == wanted, bless] {
                 [true, _] => Result.ok (),
                 // The one operation that writes into the package, and only when
@@ -409,9 +409,9 @@ let op! dir ms o = try! {
             false => Result.error (a + " and " + b + " differ"),
         },
         build.Op.empty(name, why) => match file.read! (dir + "/" + name) {
-            () => Result.ok (),
-            "" => Result.ok (),
-            text => Result.error (why + "\n" + tail text),
+            Option.none => Result.ok (),
+            Option.some("") => Result.ok (),
+            Option.some(text) => Result.error (why + "\n" + tail text),
         },
     }
 } catch e { Result.error (to_string e) };
@@ -424,7 +424,7 @@ let asked! dir program args = try! { os.exec_in! dir program args 0 } catch e { 
 
 /// Where `program` is on `PATH`, or `""` (`path.find_program!`).
 let on_path! : :string -> :string;
-let on_path! program = match paths.find_program! program { () => "", p => p };
+let on_path! program = match paths.find_program! program { Option.none => "", Option.some(p) => p };
 
 /// Carry out a step's operations in `scratch`, stopping at the first that
 /// fails, and check it made what it said it would: `[:ok, ()]` or
@@ -544,8 +544,8 @@ let commit! ctx st s key scratch = {
     let dir = dir_of ctx key;
     let read = match build.Step.discovers s {
         true => match file.read! (scratch + "/deps.d") {
-            () => [],
-            text => map (fn p -> absolute ctx p) (depfile_reads text),
+            Option.none => [],
+            Option.some(text) => map (fn p -> absolute ctx p) (depfile_reads text),
         },
         false => [],
     };
@@ -669,8 +669,8 @@ let rec settle! ctx st plan = {
         [] => [plan, mods, done],
         later => {
             let decided = map (fn [i, decide] -> decide (match file.read! (where ctx done i) {
-                () => "",
-                text => text,
+                Option.none => "",
+                Option.some(text) => text,
             })) later;
             strict! decided
             settle! ctx done (build.all (list.cons (build.Plan.set_later [] plan) decided))
@@ -783,8 +783,8 @@ let stamps_file ctx = build.Context.cache ctx + "/stamps";
 /// The stamps a run starts from: what the last run in this cache knew.
 let known_stamps! : :map -> :map;
 let known_stamps! ctx = match file.read! (stamps_file ctx) {
-    () => %{},
-    text => match wire.decode text { Result.ok(m) => m, _ => %{} },
+    Option.none => %{},
+    Option.some(text) => match wire.decode text { Result.ok(m) => m, _ => %{} },
 };
 
 /// One script's plan, carried out from `known` stamps: `[outcome, stamps]`.
@@ -844,8 +844,8 @@ let run_all! scripts = {
     let contexts = match flag_value "--contexts" args {
         () => fail! "run_all! needs --contexts",
         f => match file.read! f {
-            () => fail! ("cannot read the contexts " + f),
-            text => match wire.decode text {
+            Option.none => fail! ("cannot read the contexts " + f),
+            Option.some(text) => match wire.decode text {
                 Result.ok(m) if list.all (fn [_, c] -> build.is_context c) (_map_pairs m) => m,
                 _ => fail! ("the contexts " + f + " are not a map of build.Context"),
             },
@@ -924,7 +924,7 @@ when test {
                            file.read! (first.[:modules] + "/gen/version.dr")];
                 strict! got
                 file.remove_all! cache
-                test.eq! [[5, 0], [0, 5], %{ "answered" => true }, "hello", "let v = 1;"] got
+                test.eq! [[5, 0], [0, 5], %{ "answered" => true }, some "hello", some "let v = 1;"] got
             } ),
         test.case "a changed discovered input runs its step again, and what reads it"
             $( {
@@ -966,7 +966,7 @@ when test {
                            file.read! (dir + "/tried")];
                 strict! got
                 file.remove_all! dir
-                test.eq! [Result.ok (), :ok, :error, :ok, "", :ok, "no"] got
+                test.eq! [Result.ok (), :ok, :error, :ok, some "", :ok, some "no"] got
             } ),
         test.case "transform writes a pure function of some files as another"
             $( {
@@ -978,7 +978,7 @@ when test {
                 let got = file.read! (dir + "/g");
                 strict! got
                 file.remove_all! dir
-                test.eq! "ABCDEF" got
+                test.eq! (some "ABCDEF") got
             } ),
         test.case "a test run builds what its checks read, runs each, and goes on past a failure"
             $( {
@@ -1011,7 +1011,7 @@ when test {
                 let got = [paths.["text"], file.read! (root + "/out/t.txt")];
                 strict! got
                 file.remove_all! dir
-                test.eq! [root + "/out/t.txt", "placed"] got
+                test.eq! [root + "/out/t.txt", some "placed"] got
             } ),
         test.case "a make rule's prerequisites, continued and escaped"
             $( test.eq! ["src/a.cpp", "include/a b.h", "/usr/include/stdio.h", "x$y"]

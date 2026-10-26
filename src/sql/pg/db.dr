@@ -211,10 +211,10 @@ priv let tls_options! c mode = {
 /// Read a file needed for connection setup, reporting a database error when unavailable.
 priv let read_file! : :string -> :string -> :string;
 priv let read_file! path what = {
-    let text = try! { file.read! path } catch e { () };
+    let text = try! { file.read! path } catch e { Option.none };
     match text {
-        () => errors.fail! :bad_config ("cannot read " + what + " " + path),
-        found => found,
+        Option.none => errors.fail! :bad_config ("cannot read " + what + " " + path),
+        Option.some(found) => found,
     }
 };
 

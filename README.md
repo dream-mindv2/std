@@ -186,7 +186,7 @@ whatever the system; `path.join` and the rest answer for the running one.
 and `pathlib` and to glibc's libgen over thousands of generated paths.
 
 The directory helpers read the running process's environment each time and
-return an absolute path with `/` separators, or `()` when unavailable:
+return `Option.some path` with an absolute path using `/` separators, or `Option.none` when unavailable:
 
 | Function | Unix | macOS | Windows |
 |---|---|---|---|
@@ -195,7 +195,7 @@ return an absolute path with `/` separators, or `()` when unavailable:
 | `config_dir! ()` | `$XDG_CONFIG_HOME` or `~/.config` | Same as data | Same as data |
 | `cache_dir! ()` | `$XDG_CACHE_HOME` or `~/.cache` | `~/Library/Caches` | `$LOCALAPPDATA` or `~/AppData/Local` |
 | `state_dir! ()` | `$XDG_STATE_HOME` or `~/.local/state` | Same as data | Same as cache |
-| `runtime_dir! ()` | `$XDG_RUNTIME_DIR` or `()` | `$XDG_RUNTIME_DIR` or `()` | `()` |
+| `runtime_dir! ()` | `$XDG_RUNTIME_DIR` or `Option.none` | `$XDG_RUNTIME_DIR` or `Option.none` | `Option.none` |
 | `temp_dir! ()` | `$TMPDIR` or `/tmp` | `$TMPDIR` or `/tmp` | `$TEMP`, then `$TMP`, then `Temp` below cache |
 
 Empty and relative environment values are ignored, including literal `~`
@@ -213,7 +213,7 @@ Dream-specific data follows the same installation lookup as the installed
 tools: the first directory from `std.install.dirs! ()` (`MINDV2_PATH`, the
 VM's packaged installation, or `~/.mindv2`). With no existing installation,
 the base is `~/.mindv2` even before it exists. An empty installation list
-and no home directory return `()`.
+and no home directory return `Option.none`.
 
 | Path only | Create parents and return the same path | Location |
 |---|---|---|
@@ -222,7 +222,7 @@ and no home directory return `()`.
 | `path.program_data_dir! "my-tool"` | `file.ensure_program_data_dir! "my-tool"` | `<base>/data/my-tool` |
 
 `path.program_dir! "mind"` returns the absolute parent directory of the
-installed image that `dream -x mind` would run, or `()` if no image is found.
+installed image that `dream -x mind` would run, or `Option.none` if no image is found.
 It searches all installation directories, including `.dream` suffixes, and
 ignores working-directory images. For a name such as `tools/my-tool`, it
 returns the directory containing that image (`<installation>/tools`).
@@ -230,7 +230,7 @@ returns the directory containing that image (`<installation>/tools`).
 The program name must be one nonempty component, without `/`, `\`, `:`,
 NUL, or a trailing dot or space. Invalid names raise `:bad_argument`.
 Ensuring a directory is safe to repeat and preserves its contents. Missing
-bases return `()`; filesystem errors, including an installation that cannot
+bases return `Option.none`; filesystem errors, including an installation that cannot
 be written, propagate. No other directory is silently substituted.
 
 `path.temp_dir! ()` locates the temporary directory. `file.temp_file! ()`

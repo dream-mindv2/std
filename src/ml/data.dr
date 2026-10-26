@@ -180,8 +180,8 @@ let scale_y s ds = Dataset.set_y (scale s (y ds)) ds;
 /// field that is not a number raises, naming its line.
 let read_csv! : :string -> [[:float]];
 let read_csv! path = match file.read! path {
-    () => raise! ("cannot read " + path),
-    text => match parse_csv text {
+    Option.none => raise! ("cannot read " + path),
+    Option.some(text) => match parse_csv text {
         Result.ok(table) => table,
         Result.error(why) => raise! (path + ": " + why),
     },

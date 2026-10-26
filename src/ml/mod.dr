@@ -472,8 +472,8 @@ priv let int_of text = match num.parse_int text { () => 0, n => n };
 /// as lists and maps as maps; an array written comes back a list.
 let load! : :string -> :any;
 let load! path = match file.read! path {
-    () => raise! ("cannot read " + path),
-    text => match parse_saved text {
+    Option.none => raise! ("cannot read " + path),
+    Option.some(text) => match parse_saved text {
         Result.ok(t) => t,
         Result.error(why) => raise! (path + ": " + why),
     },

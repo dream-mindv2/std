@@ -19,8 +19,8 @@ stdlib = Path(__file__).resolve().parents[1]
 DISCOVERY = '''
 import std.path;
 import std.console;
-let show! : :string | :unit -> :unit;
-let show! value = console.print! (match value { () => "<none>", p => p });
+let show! : Option :string -> :unit;
+let show! value = console.print! (match value { Option.none => "<none>", Option.some(p) => p });
 let main! = {
     show! (path.home! ())
     show! (path.home_dir! ())
@@ -46,7 +46,7 @@ let check! value = if not value { raise! [:test_failed, "temporary entry check f
 let main! = {
     let dir = file.temp_dir! ();
     check! (file.is_dir! dir)
-    check! (path.dirname dir == path.temp_dir! ())
+    check! (some (path.dirname dir) == path.temp_dir! ())
     let [name, handle] = io.temp_file! dir "open-";
     check! (io.is_open! handle)
     check! (io.size! handle == 0)
@@ -57,9 +57,9 @@ let main! = {
     let child = file.temp_dir_in! dir "space é-";
     let closed = file.temp_file_in! child "closed-";
     let default_file = file.temp_file! ();
-    check! (file.read! closed == "")
-    check! (file.read! default_file == "")
-    check! (path.dirname default_file == path.temp_dir! ())
+    check! (file.read! closed == some "")
+    check! (file.read! default_file == some "")
+    check! (some (path.dirname default_file) == path.temp_dir! ())
     if os.platform () != :windows {
         check! (io.mode! dir == 448)
         check! (io.mode! child == 448)
@@ -79,8 +79,8 @@ let main! = {
     let first_temp = path.temp_dir! ();
     strict! first_temp
     os.set_env! (if os.platform () == :windows { "TEMP" } else { "TMPDIR" }) dir
-    check! (path.temp_dir! () == dir)
-    check! (first_temp != dir)
+    check! (path.temp_dir! () == some dir)
+    check! (first_temp != some dir)
     file.remove_all! default_file
     file.remove_all! dir
     check! (not (file.is_dir! dir))
@@ -91,8 +91,8 @@ let main! = {
 DREAM_DISCOVERY = '''
 import std.path;
 import std.console;
-let show! : (:string | :unit) -> :unit;
-let show! value = console.print! (match value { () => "<none>", p => p });
+let show! : Option :string -> :unit;
+let show! value = console.print! (match value { Option.none => "<none>", Option.some(p) => p });
 let main! = {
     show! (path.dream_dir! ())
     show! (path.dream_data_dir! ())
@@ -113,8 +113,8 @@ let check! value = if not value { raise! "program data directory check failed" }
 let rejected! : :string -> :bool;
 let rejected! name = try! { path.program_data_dir! name; false }
     catch e { error.kind e == :bad_argument };
-let required! : (:string | :unit) -> :string;
-let required! value = match value { () => raise! "expected a data directory", name => name };
+let required! : Option :string -> :string;
+let required! value = Option.expect! "expected a data directory" value;
 
 let main! = {
     let base = required! (path.dream_dir! ());
@@ -123,17 +123,17 @@ let main! = {
     check! (not (io.exists! base))
     check! (not (io.exists! data))
     check! (not (io.exists! program))
-    check! (file.ensure_dream_data_dir! () == data)
+    check! (file.ensure_dream_data_dir! () == some data)
     check! (file.is_dir! data)
     check! (not (io.exists! program))
-    check! (file.ensure_program_data_dir! "my-tool" == program)
+    check! (file.ensure_program_data_dir! "my-tool" == some program)
     check! (file.is_dir! program)
     file.write! (path.join program "saved.txt") "persistent"
-    check! (file.ensure_program_data_dir! "my-tool" == program)
-    check! (file.read! (path.join program "saved.txt") == "persistent")
+    check! (file.ensure_program_data_dir! "my-tool" == some program)
+    check! (file.read! (path.join program "saved.txt") == some "persistent")
     let other = required! (file.ensure_program_data_dir! "another-tool");
     check! (other != program && file.is_dir! other)
-    check! (file.read! (path.join other "saved.txt") == ())
+    check! (file.read! (path.join other "saved.txt") == Option.none)
     let children = list.forced (map (fn _ -> spawn! $( required! (file.ensure_program_data_dir! "concurrent") )) (list.range 0 16));
     let paths = list.forced (map (fn process -> join! process) children);
     check! (len (list.unique paths) == 1)
@@ -141,7 +141,7 @@ let main! = {
     check! (list.all rejected! ["", ".", "..", "../escape", "/absolute", "a/b", "a\\b", "C:x", "bad\0name", ".. ", "name."])
     file.write! (path.join data "occupied") "keep"
     check! (try! { file.ensure_program_data_dir! "occupied"; false } catch _ { true })
-    check! (file.read! (path.join data "occupied") == "keep")
+    check! (file.read! (path.join data "occupied") == some "keep")
     console.print! "program data directories: ok"
 };
 '''
@@ -150,16 +150,16 @@ DREAM_UNAVAILABLE = '''
 import std.file;
 import std.console;
 let main! = {
-    console.print! (file.ensure_dream_data_dir! () == ())
-    console.print! (file.ensure_program_data_dir! "my-tool" == ())
+    console.print! (file.ensure_dream_data_dir! () == Option.none)
+    console.print! (file.ensure_program_data_dir! "my-tool" == Option.none)
 };
 '''
 
 PROGRAM_DIRS = '''
 import std.path;
 import std.console;
-let show! : (:string | :unit) -> :unit;
-let show! value = console.print! (match value { () => "<none>", p => p });
+let show! : Option :string -> :unit;
+let show! value = console.print! (match value { Option.none => "<none>", Option.some(p) => p });
 let main! = {
     show! (path.program_dir! "mind")
     show! (path.program_dir! "second-tool")

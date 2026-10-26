@@ -375,8 +375,8 @@ priv let load_from! : :string -> [:string] -> Result Zone :string;
 priv let rec load_from! name dirs = match dirs {
     [] => Result.error ("no time zone called " + name + " on this machine"),
     [dir, ..rest] => match file.read! (dir + "/" + name) {
-        () => load_from! name rest,
-        bytes => of_tzif name bytes,
+        Option.none => load_from! name rest,
+        Option.some(bytes) => of_tzif name bytes,
     },
 };
 
@@ -418,8 +418,8 @@ priv let localtime! () = {
 /// Load a zone file, falling back to UTC when it cannot be read or decoded.
 priv let from_file_or_utc! : :string -> :string -> Zone;
 priv let from_file_or_utc! name path = match file.read! path {
-    () => utc,
-    bytes => unwrap_or utc (of_tzif name bytes),
+    Option.none => utc,
+    Option.some(bytes) => unwrap_or utc (of_tzif name bytes),
 };
 
 when test {

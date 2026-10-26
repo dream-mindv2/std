@@ -25,28 +25,28 @@ let dirs! : :unit -> [:string];
 let dirs! u = os.install_dirs! ();
 
 /// The first installation directory that has `entry` in it -- a file or a
-/// directory, named relative to it -- or `()`. `holding! "std"` is where the
+/// directory, named relative to it -- or `none`. `holding! "std"` is where the
 /// installed standard library is.
-let holding! : :string -> :string | :unit;
+let holding! : :string -> Option :string;
 let holding! entry = first_dir_holding! entry (dirs! ());
 
 /// The installed image called `name`, as `dream NAME` and `dream -x NAME` find
 /// it -- `DIR/name` or `DIR/name.dream` in the first directory with either --
-/// or `()`.
-let image! : :string -> :string | :unit;
+/// or `none`.
+let image! : :string -> Option :string;
 let image! name = first_file! (flat_map (fn dir -> [dir + "/" + name, dir + "/" + name + ".dream"])
                                               (dirs! ()));
 
-/// Return the first search directory containing the named file, or `()` if absent.
-priv let first_dir_holding! : :string -> [:string] -> :string | :unit;
+/// Return the first search directory containing the named file, or `none` if absent.
+priv let first_dir_holding! : :string -> [:string] -> Option :string;
 priv let rec first_dir_holding! entry dirs = match dirs {
-    [] => (),
-    [dir, ..rest] => if io.exists! (dir + "/" + entry) { dir } else { first_dir_holding! entry rest },
+    [] => Option.none,
+    [dir, ..rest] => if io.exists! (dir + "/" + entry) { Option.some dir } else { first_dir_holding! entry rest },
 };
 
-/// Return the first existing file among the candidate paths, or `()` if absent.
-priv let first_file! : [:string] -> :string | :unit;
+/// Return the first existing file among the candidate paths, or `none` if absent.
+priv let first_file! : [:string] -> Option :string;
 priv let rec first_file! paths = match paths {
-    [] => (),
-    [p, ..rest] => if io.exists! p && not (io.is_dir! p) { p } else { first_file! rest },
+    [] => Option.none,
+    [p, ..rest] => if io.exists! p && not (io.is_dir! p) { Option.some p } else { first_file! rest },
 };

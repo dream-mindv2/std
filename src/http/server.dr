@@ -1173,7 +1173,7 @@ when test {
             let written = file.read! path;
             stop! s
             io.remove! path
-            test.eq! [Result.ok 65536, 65536] [got, len (match written { () => "", t => t })]
+            test.eq! [Result.ok 65536, 65536] [got, len (Option.unwrap_or "" written)]
         } ),
         test.case "a client reuses its connection" $( {
             let s = serve! 0 (router |> get "/who" (fn req -> http.text (http.Request.peer req)));

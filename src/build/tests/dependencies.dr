@@ -40,7 +40,7 @@ let main! = {
         let [_, paths] = run.make! ctx asked;
         let answers = list.map file.read! paths;
         strict! answers
-        if answers != ["yes", "no", "no"] { raise! [:bad_probes, answers] }
+        if answers != [some "yes", some "no", some "no"] { raise! [:bad_probes, answers] }
         file.write! (root + "/consumer.cpp") source
         let target = cc.shared "consumer" ["consumer.cpp"] |> cc.set (cc.Setting.link_file (root + "/pic.a"));
         let input = steps.artifact tc target;
