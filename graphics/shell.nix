@@ -1,6 +1,6 @@
 # What the desktop window is tested with: GTK 3 and WebKitGTK 4.1, which the
-# VM finds on LD_LIBRARY_PATH at run time (it links neither), and Xvfb for
-# the headless test. Inside the Dream workspace this is the workspace's own
+# VM finds on LD_LIBRARY_PATH at run time (it links neither), and Xvfb and
+# Weston for the headless tests, on X11 and on Wayland. Inside the Dream workspace this is the workspace's own
 # shell (LLVM, the static libffi) with those added.
 #
 #   nix-shell mind/std/graphics/shell.nix --run 'just test-graphics-native'
@@ -8,7 +8,7 @@
 let
   workspace = ../../../shell.nix;
   graphics = {
-    packages = [ pkgs.pkg-config pkgs.cmake pkgs.nodejs pkgs.python3 pkgs.xorg-server ];
+    packages = [ pkgs.pkg-config pkgs.cmake pkgs.nodejs pkgs.python3 pkgs.xorg-server pkgs.weston ];
     buildInputs = [ pkgs.gtk3 pkgs.webkitgtk_4_1 pkgs.libffi pkgs.openssl ];
   };
   base = if builtins.pathExists workspace then import workspace { inherit pkgs; } else pkgs.mkShell {};

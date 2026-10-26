@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the VM's real Linux webview under Xvfb."""
+"""Exercise the VM's real Linux webview under Xvfb, and under Wayland where
+Weston is installed: a headless compositor, so GTK takes its Wayland path --
+the one a desktop session takes, and one Xvfb never reaches."""
 import argparse
+import shutil
 import ctypes as C
 import os
 from pathlib import Path
@@ -134,3 +137,37 @@ with tempfile.TemporaryDirectory(prefix='dream-graphics-display-') as tmp:
             os.close(read_fd)
             display.terminate()
             display.wait(timeout=10)
+
+# The same applications on Wayland: GTK's other backend, the one a desktop
+# session uses, with no X server anywhere. Headless Weston has no input
+# devices (GDK says so, harmlessly) and no way to close a window from outside,
+# so the lifecycle check stays the X11 one.
+weston = shutil.which('weston')
+if not weston:
+    print('Wayland: skipped (no weston)')
+else:
+    with tempfile.TemporaryDirectory(prefix='dream-graphics-wayland-') as runtime:
+        os.chmod(runtime, 0o700)
+        wayland_env = dict(os.environ, XDG_RUNTIME_DIR=runtime)
+        with open(runtime + '/weston.log', 'w+') as log:
+            compositor = subprocess.Popen([weston, '--backend=headless', '--socket=wayland-dream',
+                                           '--width=1024', '--height=768'],
+                                          env=wayland_env, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(runtime + '/wayland-dream') and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                assert os.path.exists(runtime + '/wayland-dream'), 'Weston did not start'
+                env.pop('DISPLAY', None)
+                env.update(XDG_RUNTIME_DIR=runtime, WAYLAND_DISPLAY='wayland-dream', GDK_BACKEND='wayland',
+                           LIBGL_ALWAYS_SOFTWARE='1')
+                result = run_app(args.roundtrip)
+                assert result.returncode == 0, result.stderr
+                print('Wayland: Wasm frontend/native Dream backend roundtrip passed')
+                if args.failure:
+                    result = run_app(args.failure)
+                    assert result.returncode != 0 and 'intentional frontend failure' in result.stderr, result
+                    print('Wayland: frontend failure stops the VM with an error')
+            finally:
+                compositor.terminate()
+                compositor.wait(timeout=10)
