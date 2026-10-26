@@ -48,6 +48,7 @@ import std.io;
 import std.list;
 import std.map;
 import std.os;
+import std.path as paths;
 import std.proc;
 import std.progress;
 import std.str;
@@ -421,19 +422,9 @@ let op! dir ms o = try! {
 let asked! : :string -> :string -> [:string] -> :map;
 let asked! dir program args = try! { os.exec_in! dir program args 0 } catch e { %{ :code => 127, :out => "", :err => "" } };
 
-/// Where `program` is on `PATH`, or `""`. The search a shell does, written
-/// out so that it is the same on every system: `;` between directories and
-/// `.exe` on Windows.
+/// Where `program` is on `PATH`, or `""` (`path.find_program!`).
 let on_path! : :string -> :string;
-let on_path! program = {
-    let windows = os.platform () == :windows;
-    let dirs = str.split (if windows { ";" } else { ":" }) (match os.env! "PATH" { () => "", p => p });
-    let names = if windows && not (str.ends_with ".exe" program) { [program + ".exe", program] } else { [program] };
-    let hits = flat_map (fn d -> filter (fn f -> match io.stat! f { [_, _, :file] => true, _ => false })
-                                                (map (fn n -> d + "/" + n) names))
-                             (filter (fn d -> not (str.is_empty d)) dirs);
-    match hits { [] => "", [first, .._] => first }
-};
+let on_path! program = match paths.find_program! program { () => "", p => p };
 
 /// Carry out a step's operations in `scratch`, stopping at the first that
 /// fails, and check it made what it said it would: `[:ok, ()]` or
