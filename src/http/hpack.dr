@@ -123,7 +123,7 @@ priv let read_string s at = {
         [n, start] => if start + n > len s { () }
                       else {
                           let raw = str.slice start n s;
-                          if huffman { match huffman_decode raw { () => (), t => [t, start + n] } } else { [raw, start + n] }
+                          if huffman { match huffman_decode raw { Option.none => (), Option.some(t) => [t, start + n] } } else { [raw, start + n] }
                       },
     }
 };
@@ -131,7 +131,7 @@ priv let read_string s at = {
 /// A Huffman-coded string decoded, or `()` when it is not one: a code that
 /// leads nowhere, the end-of-string symbol inside it, or padding that is
 /// not the high bits of EOS.
-let huffman_decode : :string -> (:string | :unit);
+let huffman_decode : :string -> Option :string;
 let huffman_decode raw = {
     let finish node acc pad = if pad <= 7 && all_ones_path node { str.of_bytes (list.reverse acc) } else { () };
     // Bit `k` of byte `i`, high bit first; `pad` counts the bits since the
@@ -149,7 +149,9 @@ let huffman_decode raw = {
                 else { step i (k - 1) next acc (pad + 1) }
             }
         };
-    if len raw == 0 { "" } else { step 0 7 0 [] 0 }
+    // The walk answers () for a code that is not one, and is left that way:
+    // it is the hot loop of every header block, and the JIT takes it as it is.
+    Option.of (if len raw == 0 { "" } else { step 0 7 0 [] 0 })
 };
 
 /// Whether the path from the root to `node` was all 1s, which is what
@@ -304,9 +306,9 @@ when test {
             [read_int (str.of_bytes [10]) 0 5, read_int (str.of_bytes [31, 154, 10]) 0 5, read_int (str.of_bytes [42]) 0 8] ),
         test.case "and back" $( test.eq! [str.of_bytes [10], str.of_bytes [31, 154, 10]] [write_int 0 5 10, write_int 0 5 1337] ),
         test.case "the Huffman tree has every symbol" $( test.eq! 513 (array.length tree) ),
-        test.case "a Huffman string, from the RFC" $( test.eq! "www.example.com"
+        test.case "a Huffman string, from the RFC" $( test.eq! (Option.some "www.example.com")
             (huffman_decode (match crypto.unhex "f1e3c2e5f23a6ba0ab90f4ff" { () => "", b => b })) ),
-        test.case "bad padding is refused" $( test.eq! () (huffman_decode (str.of_bytes [0])) ),
+        test.case "bad padding is refused" $( test.eq! Option.none (huffman_decode (str.of_bytes [0])) ),
         test.case "blocks a real encoder made, in order, through the dynamic table" $( test.eq! [true, true, true, true]
             (decode_all (decoder 4096) vectors) ),
         test.case "what this encodes decodes" $( {

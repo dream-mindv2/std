@@ -197,23 +197,23 @@ let ends_with : :string -> (:string | :bigstr) -> :bool;
 let ends_with suffix s =
     _str_slice s (len s - len suffix) (len suffix) == suffix;
 
-/// What comes before and after the first `sep`, as `[before, after]`, or `()`
+/// What comes before and after the first `sep`, as `[before, after]`, or `none`
 /// when `sep` does not occur: `split_once "=" "k=v=w"` is `["k", "v=w"]`. The
 /// shape of every `key=value`, `name: value` and `host:port` a program reads.
-let split_once : :string -> :string -> ([:string, :string] | :unit);
+let split_once : :string -> :string -> Option [:string, :string];
 let split_once sep s = {
     let at = _str_find s sep 0;
-    if at < 0 { () }
-    else { [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
+    if at < 0 { Option.none }
+    else { Option.some [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
 };
 
-/// What comes before and after the *last* `sep`, or `()`:
+/// What comes before and after the *last* `sep`, or `none`:
 /// `split_last "." "a.tar.gz"` is `["a.tar", "gz"]`.
-let split_last : :string -> :string -> ([:string, :string] | :unit);
+let split_last : :string -> :string -> Option [:string, :string];
 let split_last sep s = {
     let at = _str_rfind s sep (len s);
-    if at < 0 { () }
-    else { [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
+    if at < 0 { Option.none }
+    else { Option.some [_str_slice s 0 at, _str_slice s (at + len sep) (len s - at - len sep)] }
 };
 
 /// How many times `needle` occurs, not overlapping; `0` for an empty needle.
@@ -806,13 +806,13 @@ when test {
         test.case "lines of one ending" $( test.eq! [""] (lines "\n") ),
         test.case "words"            $( test.eq! ["a", "bc", "d"] (words "  a bc\t\nd ") ),
         test.case "words of blank"   $( test.empty! (words " \t ") ),
-        test.case "split_once"       $( test.eq! [["k", "v=w"], ()] [split_once "=" "k=v=w", split_once ":" "kv"] ),
-        test.case "split_once at the ends" $( test.eq! [["", "v"], ["k", ""]] [split_once "=" "=v", split_once "=" "k="] ),
+        test.case "split_once"       $( test.eq! [Option.some ["k", "v=w"], Option.none] [split_once "=" "k=v=w", split_once ":" "kv"] ),
+        test.case "split_once at the ends" $( test.eq! [Option.some ["", "v"], Option.some ["k", ""]] [split_once "=" "=v", split_once "=" "k="] ),
         test.case "replace"          $( test.eq! "dog and dog" (replace "cat" "dog" "cat and cat") ),
         test.case "replace does not overlap" $( test.eq! "xa" (replace "aa" "x" "aaa") ),
         test.case "replace nothing"  $( test.eq! ["abc", "abc"] [replace "z" "y" "abc", replace "" "y" "abc"] ),
         test.case "replace with a longer text" $( test.eq! "<<a>><<a>>" (replace "a" "<<a>>" "aa") ),
-        test.case "split_last"       $( test.eq! [["a.tar", "gz"], ()] [split_last "." "a.tar.gz", split_last "." "abc"] ),
+        test.case "split_last"       $( test.eq! [Option.some ["a.tar", "gz"], Option.none] [split_last "." "a.tar.gz", split_last "." "abc"] ),
         test.case "occurrences"      $( test.eq! [2, 1, 0, 0] [occurrences "ab" "abcab", occurrences "aa" "aaa",
                                                               occurrences "x" "abc", occurrences "" "abc"] ),
         test.case "indent"           $( test.eq! "  a\n  b" (indent "  " "a\nb\n") ),

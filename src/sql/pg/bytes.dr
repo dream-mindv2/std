@@ -115,13 +115,13 @@ priv let hex_byte b = str.slice (b / 16) 1 hex_digits + str.slice (b % 16) 1 hex
 
 /// The bytes a run of hex digits spells, or `()` when they spell nothing: an
 /// odd count or a character that is not a digit.
-let hex_decode : :string -> :string | :unit;
+let hex_decode : :string -> Option :string;
 let hex_decode s =
-    if len s % 2 != 0 { () }
+    if len s % 2 != 0 { Option.none }
     else {
         let bytes = map (fn i -> pair_value (str.byte (2 * i) s) (str.byte (2 * i + 1) s))
                              (list.range 0 (len s / 2));
-        if list.any (fn b -> b < 0) bytes { () } else { str.of_bytes bytes }
+        if list.any (fn b -> b < 0) bytes { Option.none } else { Option.some (str.of_bytes bytes) }
     };
 
 /// Decode a pair of hexadecimal characters into a byte.
@@ -173,14 +173,14 @@ priv let base64_value c = match c {
 };
 
 /// The bytes `s` spells, or `()` for text that is not base64.
-let base64_decode : :string -> :string | :unit;
+let base64_decode : :string -> Option :string;
 let base64_decode s =
-    if len s % 4 != 0 { () }
+    if len s % 4 != 0 { Option.none }
     else {
         let values = map (fn i -> base64_value (str.byte i s)) (list.range 0 (len s));
         match base64_bytes values [] {
-            () => (),
-            bytes => str.of_bytes bytes,
+            () => Option.none,
+            bytes => Option.some (str.of_bytes bytes),
         }
     };
 
@@ -247,14 +247,14 @@ when test {
             $( test.eq! [["user", 5], ["", 6], ["x", 8]]
                         [cstr_at "user\0\0x" 0, cstr_at "user\0\0x" 5, cstr_at "user\0\0x" 6] ),
         test.case "hex round trip, and what is not hex"
-            $( test.eq! ["00ff41", str.of_bytes [0, 255, 65], (), ()]
+            $( test.eq! ["00ff41", Option.some (str.of_bytes [0, 255, 65]), Option.none, Option.none]
                         [hex_encode (str.of_bytes [0, 255, 65]), hex_decode "00FF41",
                          hex_decode "abc", hex_decode "zz"] ),
         test.case "base64 against RFC 4648's vectors"
             $( test.eq! ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]
                         (list.map base64_encode ["", "f", "fo", "foo", "foob", "fooba", "foobar"]) ),
         test.case "base64 decodes what it encodes, and refuses the rest"
-            $( test.eq! ["foobar", "fo", str.of_bytes [0, 255, 128], (), ()]
+            $( test.eq! [Option.some "foobar", Option.some "fo", Option.some (str.of_bytes [0, 255, 128]), Option.none, Option.none]
                         [base64_decode "Zm9vYmFy", base64_decode "Zm8=",
                          base64_decode (base64_encode (str.of_bytes [0, 255, 128])),
                          base64_decode "Zm9", base64_decode "Zm=v"] ),

@@ -72,18 +72,18 @@ let patch [_, _, n, _] = n;
 let pre : Version -> :string;
 let pre [_, _, _, p] = p;
 
-/// A number of the version, or `()` when the text is not one. A leading zero
+/// A number of the version, or `none` when the text is not one. A leading zero
 /// is refused, as the standard refuses it, since `01` and `1` would otherwise
 /// be two spellings of one version.
-let number : :string -> :integer | :unit;
+let number : :string -> Option :integer;
 let number s =
-    if str.is_empty s || (str.byte_length s > 1 && str.starts_with "0" s) { () }
-    else if list.all (fn c -> c >= '0' && c <= '9') (str.chars s) { _parse_int s }
-    else { () };
+    if str.is_empty s || (str.byte_length s > 1 && str.starts_with "0" s) { Option.none }
+    else if list.all (fn c -> c >= '0' && c <= '9') (str.chars s) { Option.of (_parse_int s) }
+    else { Option.none };
 
 /// The text before the first `sep`, and after it (`""` when there is none).
 let split_at : :string -> :string -> [:string];
-let split_at sep s = match str.split_once sep s { () => [s, ""], parts => parts };
+let split_at sep s = Option.unwrap_or [s, ""] (str.split_once sep s);
 
 /// Whether a pre-release is spelled as the standard allows: identifiers
 /// separated by `.`, none empty, each of ASCII letters, digits and `-`, and a
@@ -109,16 +109,12 @@ let parse text = {
     let bad = Result.error ("`" + text + "` is not a version; write MAJOR.MINOR.PATCH, as in 1.4.0");
     match [parts, valid_pre rest && not (str.ends_with "-" bare && str.is_empty rest)] {
         [_, false] => bad,
-        [[ma], _] if ma != () => Result.ok [ma, 0, 0, rest],
-        [[ma, mi], _] if ma != () && mi != () => Result.ok [ma, mi, 0, rest],
-        [[ma, mi, pa], _] if ma != () && mi != () && pa != () => Result.ok [ma, mi, pa, rest],
+        [[Option.some(ma)], _] => Result.ok [ma, 0, 0, rest],
+        [[Option.some(ma), Option.some(mi)], _] => Result.ok [ma, mi, 0, rest],
+        [[Option.some(ma), Option.some(mi), Option.some(pa)], _] => Result.ok [ma, mi, pa, rest],
         _ => bad,
     }
 };
-
-/// The version, or `()` when the text is not one.
-let parse_or_unit : :string -> Version | :unit;
-let parse_or_unit text = match parse text { Result.ok(v) => v, _ => () };
 
 /// Format a version as major.minor.patch with its optional prerelease suffix.
 let show : Version -> :string;
@@ -140,10 +136,10 @@ priv let by x y = if x < y { 0 - 1 } else if x > y { 1 } else { 0 };
 let compare_pre : :string -> :string -> :integer;
 let compare_pre a b = {
     let one x y = match [number x, number y] {
-        [(), ()] => compare x y,
-        [(), _] => 1,
-        [_, ()] => 0 - 1,
-        [m, n] => by m n,
+        [Option.none, Option.none] => compare x y,
+        [Option.none, _] => 1,
+        [_, Option.none] => 0 - 1,
+        [Option.some(m), Option.some(n)] => by m n,
     };
     let rec go xs ys =
         match [xs, ys] {
@@ -188,9 +184,12 @@ let is_pre v = not (str.is_empty (pre v));
 let sorted : [Version] -> [Version];
 let sorted vs = list.sort_by older vs;
 
-/// The newest, or `()` for none.
-let newest : [Version] -> Version | :unit;
-let newest vs = fold (fn best v -> match best { () => v, b => if newer v b { v } else { b } }) () vs;
+/// The newest, or `none` for none.
+let newest : [Version] -> Option Version;
+let newest vs = fold (fn best v -> match best {
+    Option.none => Option.some v,
+    Option.some(b) => if newer v b { Option.some v } else { best },
+}) Option.none vs;
 
 /// The next release that breaks something: `1.4.2` to `2.0.0`. The
 /// pre-release, if any, is dropped.
@@ -284,9 +283,9 @@ let matches req v = {
     pre_ok && list.all (fn c -> holds c v) req
 };
 
-/// The newest of `vs` that `req` accepts, or `()` when none does: what a
+/// The newest of `vs` that `req` accepts, or `none` when none does: what a
 /// resolver picks from the versions a source offers.
-let newest_matching : Requirement -> [Version] -> Version | :unit;
+let newest_matching : Requirement -> [Version] -> Option Version;
 let newest_matching req vs = newest (list.filter (fn v -> matches req v) vs);
 
 /// Parse both and test: whether `version` meets `requirement`, or the first
@@ -331,10 +330,10 @@ let compatible a b = {
 when test {
     import std.test;
 
-    let v s = parse_or_unit s;
+    let v s = match parse s { Result.ok(x) => x, _ => () };
     let ok r = match r { Result.ok(x) => x, _ => () };
     let sat r s = ok (satisfies r s);
-    let shown found = match found { () => (), w => show w };
+    let shown found = match found { Option.none => (), Option.some(w) => show w };
 
     let tests = [
         test.case "a version may be short, or spelled as a tag"

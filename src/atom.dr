@@ -16,20 +16,20 @@
 let name : :atom -> :string;
 let name a = { let shown = to_string a; _str_slice shown 1 (len shown - 1) };
 
-/// The atom with this name, or `()` if nothing has ever interned it.
-let existing : (:string | :bigstr) -> (:atom | :unit);
-let existing name = _to_existing_atom name;
+/// The atom with this name, or `none` if nothing has ever interned it.
+let existing : (:string | :bigstr) -> Option :atom;
+let existing name = Option.of (_to_existing_atom name);
 
 when test {
     import std.test;
 
     let tests = [
-        test.case "an atom the program names" $( test.eq! :ok (existing "ok") ),
+        test.case "an atom the program names" $( test.eq! (Option.some :ok) (existing "ok") ),
         test.case "one it never names"
-            $( test.eq! () (existing "no atom anywhere is spelled like this") ),
+            $( test.eq! Option.none (existing "no atom anywhere is spelled like this") ),
         test.case "a name is the atom without its colon" $( test.eq! "ok" (name :ok) ),
         test.case "underscores and digits are part of the name"
             $( test.eq! "out_of_memory2" (name :out_of_memory2) ),
-        test.case "a name finds its atom again" $( test.eq! :ready (existing (name :ready)) ),
+        test.case "a name finds its atom again" $( test.eq! (Option.some :ready) (existing (name :ready)) ),
     ];
 }

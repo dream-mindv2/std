@@ -459,7 +459,7 @@ priv let key_of text = {
     let body = str.slice 1 (str.length text - 1) text;
     match str.slice 0 1 text {
         "#" => int_of body,
-        ":" => match atom.existing body { () => body, a => a },
+        ":" => match atom.existing body { Option.none => body, Option.some(a) => a },
         _ => body,
     }
 };

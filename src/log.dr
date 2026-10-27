@@ -71,11 +71,12 @@ let level_name : Level -> :string;
 let level_name level = match level { :trace => "TRACE", :debug => "DEBUG", :info => "INFO", :warn => "WARN",
                                      :error => "ERROR", :off => "OFF" };
 
-/// The level a name spells, in any case, or `()`.
-let parse_level : :string -> (Level | :unit);
+/// The level a name spells, in any case, or `none`.
+let parse_level : :string -> Option Level;
 let parse_level text = match str.lower (str.trim text) {
-    "trace" => :trace, "debug" => :debug, "info" => :info, "warn" => :warn, "warning" => :warn,
-    "error" => :error, "off" => :off, "none" => :off, _ => (),
+    "trace" => Option.some :trace, "debug" => Option.some :debug, "info" => Option.some :info,
+    "warn" => Option.some :warn, "warning" => Option.some :warn, "error" => Option.some :error,
+    "off" => Option.some :off, "none" => Option.some :off, _ => Option.none,
 };
 
 // --- the logger ---------------------------------------------------------------------
@@ -120,8 +121,8 @@ let parse_spec : :string -> [Level, :map];
 let parse_spec spec = {
     let seed : [Level, :map] = [:info, %{}];
     fold (fn [minimum, filters] part -> match str.split "=" (str.trim part) {
-    [name, lv] => match parse_level lv { () => [minimum, filters], l => [minimum, filters.[str.trim name => l]] },
-    [lv] => match parse_level lv { () => [minimum, filters], l => [l, filters] },
+    [name, lv] => match parse_level lv { Option.none => [minimum, filters], Option.some(l) => [minimum, filters.[str.trim name => l]] },
+    [lv] => match parse_level lv { Option.none => [minimum, filters], Option.some(l) => [l, filters] },
     _ => [minimum, filters],
 }) seed (str.split "," spec)
 };
@@ -464,7 +465,7 @@ when test {
             test.true! (str.ends_with "INFO  hello\n" (list.head (agent.value! got)))
             agent.stop! got
         } ),
-        test.case "levels" $( test.eq! [:warn, (), true, false] [parse_level "WARNING", parse_level "loud",
+        test.case "levels" $( test.eq! [Option.some :warn, Option.none, true, false] [parse_level "WARNING", parse_level "loud",
                                                                 enabled new :error, enabled new :debug] ),
     ];
 }

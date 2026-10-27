@@ -51,7 +51,7 @@ mapping Column {
 
 /// The key a column named `name` is read by.
 let column_key : :string -> :any;
-let column_key name = match atom.existing name { () => name, a => a };
+let column_key name = match atom.existing name { Option.none => name, Option.some(a) => a };
 
 /// A whole message from the server.
 union Message {

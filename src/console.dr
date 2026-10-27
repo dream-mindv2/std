@@ -97,17 +97,17 @@ let errorf! template values = error! (format! template values);
 
 // --- input ------------------------------------------------------------------
 
-/// A complete line, without LF or CRLF, or `()` at EOF. An empty line is "".
+/// A complete line, without LF or CRLF, or `none` at EOF. An empty line is "".
 /// Read exactly through the newline so another caller can read the next line.
 /// The limit counts bytes before LF; it bounds memory even on untrusted input.
-let read_line_from! : :integer -> :any -> :string | :unit;
+let read_line_from! : :integer -> :any -> Option :string;
 let read_line_from! limit handle = {
     if limit <= 0 { error.raise_as! :bad_argument "line limit must be positive" }
     let rec read! !size !pieces = match io.read! handle 1 {
-        "" => if size == 0 { () } else { str.concat_all (list.reverse pieces) },
+        "" => if size == 0 { Option.none } else { Option.some (str.concat_all (list.reverse pieces)) },
         "\n" => {
             let line = str.concat_all (list.reverse pieces);
-            if str.ends_with "\r" line { str.slice 0 (str.byte_length line - 1) line } else { line }
+            Option.some (if str.ends_with "\r" line { str.slice 0 (str.byte_length line - 1) line } else { line })
         },
         byte => {
             if size >= limit { error.raise_as! :line_too_long ("line exceeds " + to_string limit + " bytes") }
@@ -128,25 +128,26 @@ mapping Session {
 let session! : :unit -> Session;
 let session! () = Session.new (io.stdin! ()) (io.stderr! ());
 /// Read a line from standard input, with a maximum length of 1 MiB.
-let read_line! : :unit -> :string | :unit;
+let read_line! : :unit -> Option :string;
 let read_line! () = read_line_from! 1048576 (io.stdin! ());
 /// Display a question on the session's output and read a line from its input.
-let prompt_with! : Session -> :any -> :string | :unit;
+let prompt_with! : Session -> :any -> Option :string;
 let prompt_with! session question = {
     write_to! (Session.output session) question
     read_line_from! (Session.max_line session) (Session.input session)
 };
 /// Display a question on standard error and read the answer from standard input.
-let prompt! : :any -> :string | :unit;
+let prompt! : :any -> Option :string;
 let prompt! question = prompt_with! (session! ()) question;
 
-/// The parser returns [:ok, value] or [:error, help]. Invalid input is retried;
-/// EOF always returns (), never the default or an implicit confirmation.
-let ask_with! : Session -> :any -> (:string -> Result a :string) -> a | :unit;
+/// The parser answers `Result.ok value` or `Result.error help`. Invalid input
+/// is retried, with the help shown; EOF always answers `none`, never the
+/// default or an implicit confirmation.
+let ask_with! : Session -> :any -> (:string -> Result a :string) -> Option a;
 let rec ask_with! session question parse = match prompt_with! session question {
-    () => (),
-    line => match parse line {
-        Result.ok(value) => value,
+    Option.none => Option.none,
+    Option.some(line) => match parse line {
+        Result.ok(value) => Option.some value,
         Result.error(help) => {
             print_to! (Session.output session) help
             ask_with! session question parse
@@ -154,7 +155,7 @@ let rec ask_with! session question parse = match prompt_with! session question {
     },
 };
 /// Prompt until `parse` accepts the answer, using the default interactive session.
-let ask! : :any -> (:string -> Result a :string) -> a | :unit;
+let ask! : :any -> (:string -> Result a :string) -> Option a;
 let ask! question parse = ask_with! (session! ()) question parse;
 
 /// Parse a yes/no answer, using `default` for an empty response.
@@ -166,11 +167,11 @@ let confirmation default line = match str.lower (str.trim line) {
     _ => err "Please answer yes or no.",
 };
 /// Ask a yes/no question through the supplied session, with an explicit default.
-let confirm_with! : Session -> :any -> :bool -> :bool | :unit;
+let confirm_with! : Session -> :any -> :bool -> Option :bool;
 let confirm_with! session question default =
     ask_with! session (to_string question + (if default { " [Y/n] " } else { " [y/N] " })) (confirmation default);
 /// Ask a yes/no question through the default session, with an explicit default.
-let confirm! : :any -> :bool -> :bool | :unit;
+let confirm! : :any -> :bool -> Option :bool;
 let confirm! question default = confirm_with! (session! ()) question default;
 
 /// Parse a trimmed integer response, returning a validation error for invalid input.
@@ -180,7 +181,7 @@ let integer line = match num.parse_int (str.trim line) {
     Option.some(n) => ok n,
 };
 /// Prompt repeatedly until the user supplies an integer or input ends.
-let prompt_int! : :any -> :integer | :unit;
+let prompt_int! : :any -> Option :integer;
 let prompt_int! question = ask! question integer;
 
 // --- color ------------------------------------------------------------------

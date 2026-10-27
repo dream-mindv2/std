@@ -276,10 +276,7 @@ priv let json_of text = match js.parse text {
 priv let bytea_of : :string -> :any;
 priv let bytea_of text =
     if str.starts_with "\\x" text {
-        match bytes.hex_decode (str.slice 2 (len text - 2) text) {
-            () => text,
-            raw => raw,
-        }
+        Option.unwrap_or text (bytes.hex_decode (str.slice 2 (len text - 2) text))
     } else { text };
 
 // --- array literals ---------------------------------------------------------------

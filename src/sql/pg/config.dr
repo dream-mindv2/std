@@ -146,8 +146,8 @@ let decode_percent s = {
     if at < 0 { s }
     else {
         match bytes.hex_decode (str.slice (at + 1) 2 s) {
-            () => str.slice 0 (at + 1) s + decode_percent (str.slice (at + 1) (len s) s),
-            b => str.slice 0 at s + b + decode_percent (str.slice (at + 3) (len s) s),
+            Option.none => str.slice 0 (at + 1) s + decode_percent (str.slice (at + 1) (len s) s),
+            Option.some(b) => str.slice 0 at s + b + decode_percent (str.slice (at + 3) (len s) s),
         }
     }
 };

@@ -5,7 +5,7 @@
 //     let date = regex.compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
 //
 //     regex.is_match date "due 2026-10-04"                  // true
-//     regex.find date "due 2026-10-04" |> regex.named "y"   // "2026"
+//     regex.find date "due 2026-10-04" |> Option.and_then (regex.named "y")   // some "2026"
 //     regex.replace_all date "${d}/${m}/${y}" text          // reorder every date
 //     regex.split (regex.compile ",\\s*") "a, b,c"          // ["a", "b", "c"]
 //
@@ -96,14 +96,14 @@ struct Match {
 
 /// A pattern this module accepts. Written as a literal where `compile` is
 /// called, it is checked while compiling.
-type Pattern = :string where fn s -> problem s == ();
+type Pattern = :string where fn s -> Option.is_none (problem s);
 
 /// The flags `compile_with` takes.
 type Flag = :ignore_case | :multiline | :dot_all;
 
 /// What is wrong with a pattern, or `()` when nothing is.
-let problem : :string -> (:string | :unit);
-let problem source = match parse source { Result.ok(_) => (), Result.error(why) => why };
+let problem : :string -> Option :string;
+let problem source = match parse source { Result.ok(_) => Option.none, Result.error(why) => Option.some why };
 
 /// The pattern compiled. A literal is checked while the program is built; a
 /// string made at run time that is not a pattern raises a `:type_error`
@@ -689,12 +689,12 @@ let matches : Regex -> :string -> :bool;
 let matches re s = run (Regex.full re) s 0 4 != ();
 
 /// The first match, or `()`.
-let find : Regex -> :string -> (Match | :unit);
+let find : Regex -> :string -> Option Match;
 let find re s = find_from 0 re s;
 
 /// The first match starting at or after byte `from`.
-let find_from : :integer -> Regex -> :string -> (Match | :unit);
-let find_from from re s = match run (Regex.code re) s from 1 { () => (), caps => match_of re s caps };
+let find_from : :integer -> Regex -> :string -> Option Match;
+let find_from from re s = match run (Regex.code re) s from 1 { () => Option.none, caps => Option.some (match_of re s caps) };
 
 /// Every match, left to right, not overlapping. An empty match is followed by
 /// a search one character further on, so `a*` over "baa" finds "", "aa" and
@@ -713,49 +713,36 @@ let count re s = run (Regex.code re) s 0 3;
 
 // --- reading a match -------------------------------------------------------------------------------
 
-/// The text of group `n` (0 being the whole match), or `()` when it took no
-/// part. A match of `()` answers `()`, so `find re s |> group 1` needs no check.
-let group : :integer -> (Match | :unit) -> (:string | :unit);
-let group n m = match m {
-    () => (),
-    _ => match (Match.spans m).[n else ()] {
-        () => (),
-        #[a, b] => str.slice a (b - a) (Match.subject m),
-    },
+/// The text of group `n` (0 being the whole match), or `none` when it took no
+/// part. Of a match you may not have, `find re s |> Option.and_then (group 1)`.
+let group : :integer -> Match -> Option :string;
+let group n m = match (Match.spans m).[n else ()] {
+    #[a, b] => Option.some (str.slice a (b - a) (Match.subject m)),
+    _ => Option.none,
 };
 
-/// The text of the group called `name`, or `()`.
-let named : :string -> (Match | :unit) -> (:string | :unit);
-let named name m = match m {
-    () => (),
-    _ => match (Match.names m).[name else ()] { () => (), n => group n m },
-};
+/// The text of the group called `name`, or `none`.
+let named : :string -> Match -> Option :string;
+let named name m = match (Match.names m).[name else ()] { () => Option.none, n => group n m };
 
-/// Every group's text, from group 1; `()` for one that took no part, and
-/// `()` for no match at all.
-let groups : (Match | :unit) -> ([(:string | :unit)] | :unit);
-let groups m = match m {
-    () => (),
-    _ => map (fn n -> group n m) (list.range 1 (array.length (Match.spans m))),
-};
+/// Every group's text, from group 1; `none` for one that took no part.
+let groups : Match -> [Option :string];
+let groups m = map (fn n -> group n m) (list.range 1 (array.length (Match.spans m)));
 
 /// Every named group's text, by name.
 let named_groups : Match -> :map;
 let named_groups m = map.from_pairs (map (fn [k, n] -> [k, group n m]) (map.pairs (Match.names m)));
 
-/// The groups of the first match, from group 1, or `()` when there is none:
-/// the one-call way to take text apart.
+/// The groups of the first match, from group 1, or `none` when there is no
+/// match: the one-call way to take text apart.
 ///
-///     regex.captures (regex.compile "(\\w+)@(\\w+)") "ada@example" // ["ada", "example"]
-let captures : Regex -> :string -> ([(:string | :unit)] | :unit);
-let captures re s = groups (find re s);
+///     regex.captures (regex.compile "(\\w+)@(\\w+)") "ada@example" // some [some "ada", some "example"]
+let captures : Regex -> :string -> Option [Option :string];
+let captures re s = Option.map groups (find re s);
 
-/// The byte span of group `n`: `[start, stop]`, or `()`.
-let span : :integer -> (Match | :unit) -> ([:integer, :integer] | :unit);
-let span n m = match m {
-    () => (),
-    _ => match (Match.spans m).[n else ()] { () => (), #[a, b] => [a, b] },
-};
+/// The byte span of group `n`: `[start, stop]`, or `none`.
+let span : :integer -> Match -> Option [:integer, :integer];
+let span n m = match (Match.spans m).[n else ()] { #[a, b] => Option.some [a, b], _ => Option.none };
 
 // --- changing text ---------------------------------------------------------------------------------
 
@@ -772,8 +759,8 @@ let replace_all re template s = replace_all_with re (fill template) s;
 /// The first match replaced by what `f` makes of it.
 let replace_first_with : Regex -> (Match -> :string) -> :string -> :string;
 let replace_first_with re f s = match find re s {
-    () => s,
-    m => str.slice 0 (Match.start m) s + f m + str.slice (Match.stop m) (len s) s,
+    Option.none => s,
+    Option.some(m) => str.slice 0 (Match.start m) s + f m + str.slice (Match.stop m) (len s) s,
 };
 
 /// Every match replaced by what `f` makes of it.
@@ -817,9 +804,9 @@ priv let rec template_pieces t i m =
         }
     };
 
-/// Replace an absent string with an empty string.
-priv let or_empty : (:string | :unit) -> :string;
-priv let or_empty v = match v { () => "", text => text };
+/// A group's text, or `""` for one that took no part.
+priv let or_empty : Option :string -> :string;
+priv let or_empty v = Option.unwrap_or "" v;
 
 /// Read a decimal capture reference from replacement text.
 priv let num_value : :string -> :integer;
@@ -854,7 +841,7 @@ when test {
     import std.test;
 
     let r src = compile src;
-    let first src s = match find (r src) s { () => (), m => Match.text m };
+    let first src s = match find (r src) s { Option.none => (), Option.some(m) => Match.text m };
     let date = compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
     let compiled_at_build = comp compile "[a-c]+";
 
@@ -871,11 +858,11 @@ when test {
         test.case "ignore case"              $( test.eq! ["HeLLo", "X"] [first "(?i)hello" "say HeLLo", first "(?i)[x-z]" "aXb"] ),
         test.case "scoped flags"             $( test.eq! ["aB", ()] [first "a(?i:b)" "aB", first "a(?i:b)" "AB"] ),
         test.case "dot and newlines"         $( test.eq! [(), "a\nb"] [first "a.b" "a\nb", first "(?s)a.b" "a\nb"] ),
-        test.case "groups"                   $( test.eq! ["2026", "10", "04"] (groups (find date "on 2026-10-04!")) ),
-        test.case "named groups"             $( test.eq! ["10", ()] [named "m" (find date "2026-10-04"), named "nope" (find date "2026-10-04")] ),
-        test.case "a group that took no part" $( test.eq! [["a", ()]] [captures (r "(a)|(b)") "a"] ),
-        test.case "nothing to find"          $( test.eq! [(), ()] [find date "no dates", group 1 (find date "no dates")] ),
-        test.case "spans are bytes"          $( test.eq! [[4, 8]] [span 1 (find date "on: 2026-10-04")] ),
+        test.case "groups"                   $( test.eq! (Option.some [Option.some "2026", Option.some "10", Option.some "04"]) (Option.map groups (find date "on 2026-10-04!")) ),
+        test.case "named groups"             $( test.eq! [Option.some "10", Option.none] [Option.and_then (named "m") (find date "2026-10-04"), Option.and_then (named "nope") (find date "2026-10-04")] ),
+        test.case "a group that took no part" $( test.eq! (Option.some [Option.some "a", Option.none]) (captures (r "(a)|(b)") "a") ),
+        test.case "nothing to find"          $( test.eq! [Option.none, Option.none] [find date "no dates", Option.and_then (group 1) (find date "no dates")] ),
+        test.case "spans are bytes"          $( test.eq! (Option.some [4, 8]) (Option.and_then (span 1) (find date "on: 2026-10-04")) ),
         test.case "unicode is characters"    $( test.eq! ["é", "日本", "😀"] [first "." "é", first "\\u{65e5}." "x日本", first "[\\u{1F600}-\\u{1F64F}]" "a😀b"] ),
         test.case "whole-string matches"     $( test.eq! [true, false] [matches (r "\\d+") "123", matches (r "\\d+") "123a"] ),
         test.case "find all"                 $( test.eq! ["1", "22", "333"] (find_all_text (r "\\d+") "a1b22c333") ),
@@ -890,13 +877,13 @@ when test {
         test.case "escape"                   $( test.eq! [true, false] [matches (compile (escape "a.b*")) "a.b*", matches (compile (escape "a.b*")) "axbb"] ),
         test.case "no catastrophic case"     $( test.false! (is_match (r "(a*)*b") (str.repeat 3000 "a")) ),
         test.case "an empty loop terminates" $( test.eq! "" (first "(a*)*" "bbb") ),
-        test.case "problems are explained"   $( test.eq! ["column 10: expected \"|\" or \")\", found the end of the text", ()]
+        test.case "problems are explained"   $( test.eq! [Option.some "column 10: expected \"|\" or \")\", found the end of the text", Option.none]
                                                    [problem "(unclosed", problem "(closed)"] ),
         test.case "lookaround is refused"    $( test.true! (str.contains_str "lookaround is not supported" (or_empty (problem "a(?=b)"))) ),
         test.case "backreferences are refused" $( test.true! (str.contains_str "backreferences" (or_empty (problem "(a)\\1"))) ),
-        test.case "a backwards range is refused" $( test.true! (problem "[z-a]" != ()) ),
+        test.case "a backwards range is refused" $( test.true! (Option.is_some (problem "[z-a]")) ),
         test.case "parse is a result"        $( test.eq! [true, true] [Result.is_ok (parse "a+"), Result.is_error (parse "a{2,1}")] ),
-        test.case "compile-time compiling"   $( test.eq! "abc" (group 0 (find compiled_at_build "xxabcxx")) ),
+        test.case "compile-time compiling"   $( test.eq! (Option.some "abc") (Option.and_then (group 0) (find compiled_at_build "xxabcxx")) ),
         test.case "inside a parser"          $( test.eq! (ok ["key", "42"])
                                                    (p.run (p.seq [token (r "[a-z]+"), p.then (token (r "\\d+")) (p.text "=")]) "key=42") ),
         test.case "the literal prefix"       $( test.eq! ["abc", "ab"] [Regex.prefix (r "abc(d|e)"), Regex.prefix (r "(ab)+")] ),

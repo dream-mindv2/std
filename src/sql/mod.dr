@@ -1680,7 +1680,7 @@ let rows_of outcome = {
 /// made atoms -- that is how a program runs out of them -- so the atom exists
 /// only if the program wrote it, and then it is how the program reads it.
 let column_key : :string -> :any;
-let column_key name = match atom.existing name { () => name, a => a };
+let column_key name = match atom.existing name { Option.none => name, Option.some(a) => a };
 
 /// The rows of a query, each checked against `description` (`std.types`):
 /// `sql.query_as! (types.record %{ "id" => :integer }) db q`.
