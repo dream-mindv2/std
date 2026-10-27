@@ -23,7 +23,7 @@ let to_float n = _to_float n;
 let to_int : (:integer | :float) -> :integer;
 let to_int x = _to_int x;
 
-/// The integer a decimal numeral writes, or `()` for text that is not one.
+/// The integer a decimal numeral writes, or `none` for text that is not one.
 ///
 /// ```dream
 /// import std.num;
@@ -33,10 +33,10 @@ let to_int x = _to_int x;
 ///     console.print! (num.parse_int "42")
 /// };
 /// ```
-let parse_int : :string -> (:integer | :unit);
-let parse_int s = _parse_int s;
+let parse_int : :string -> Option :integer;
+let parse_int s = Option.of (_parse_int s);
 
-/// The float a numeral writes, or `()` for text that is not one.
+/// The float a numeral writes, or `none` for text that is not one.
 ///
 /// ```dream
 /// import std.num;
@@ -46,32 +46,31 @@ let parse_int s = _parse_int s;
 ///     console.print! (num.parse_float "3.5")
 /// };
 /// ```
-let parse_float : :string -> (:float | :unit);
-let parse_float s = _parse_float s;
+let parse_float : :string -> Option :float;
+let parse_float s = Option.of (_parse_float s);
 
 /// How far each unit `parse_size` takes shifts a count, by its lower-case spelling.
 priv let size_units : %{:string => :integer};
 priv let size_units = %{ "" => 0, "b" => 0, "k" => 10, "kb" => 10, "m" => 20, "mb" => 20,
                           "g" => 30, "gb" => 30 };
 
-/// The bytes a size stands for, or `()` for text that is not one: a count of
+/// The bytes a size stands for, or `none` for text that is not one: a count of
 /// bytes, or one followed by `K`, `M` or `G` (and an optional `B`), in either
 /// case, each a power of 1024. `parse_size "64M"` is `67108864`.
 ///
 /// The spelling is the VM's own, for `dream --max-heap` and the `DREAM_MAX_*`
 /// variables, so a size in a manifest reads the way it does on a command line.
 /// Zero is not a size.
-let parse_size : :string -> (:integer | :unit);
+let parse_size : :string -> Option :integer;
 let parse_size s = {
     let digits = str.span "0123456789" 0 s;
     let unit = str.lower (str.slice digits (str.byte_length s - digits) s);
-    let shift = size_units.[unit else ()];
-    match shift {
-        () => (),
+    match size_units.[unit else ()] {
+        () => Option.none,
         k => match (if digits == 0 { () } else { _parse_int (str.slice 0 digits s) }) {
-            () => (),
-            0 => (),
-            n => n * pow 2 k,
+            () => Option.none,
+            0 => Option.none,
+            n => Option.some (n * pow 2 k),
         },
     }
 };
@@ -411,27 +410,22 @@ let hex : :integer -> :integer -> :string;
 let hex width n = to_base_padded 16 width n;
 
 /// The integer `text` writes in `base`, from 2 to 36, either case, an optional
-/// sign in front -- or `()` for text that is not one. No prefix: the caller
+/// sign in front -- or `none` for text that is not one. No prefix: the caller
 /// that accepts `0x` strips it, because only the caller knows whether it may.
-let parse_base : :integer -> :string -> (:integer | :unit);
+let parse_base : :integer -> :string -> Option :integer;
 let parse_base base text = {
     let cs = _str_chars text;
     let digits = match cs { ['-', ..rest] => rest, ['+', ..rest] => rest, _ => cs };
     let negative = match cs { ['-', .._] => true, _ => false };
     let rec go !acc ds = match ds {
-        [] => acc,
+        [] => Option.some acc,
         [d, ..rest] => match char.digit_value d {
-            () => (),
-            v => if v >= base { () } else { go (acc * base + v) rest },
+            Option.some(v) if v < base => go (acc * base + v) rest,
+            _ => Option.none,
         },
     };
-    if base < 2 || base > 36 || list.is_empty digits { () }
-    else {
-        match go 0 digits {
-            () => (),
-            v => if negative { 0 - v } else { v },
-        }
-    }
+    if base < 2 || base > 36 || list.is_empty digits { Option.none }
+    else { Option.map (fn v -> if negative { 0 - v } else { v }) (go 0 digits) }
 };
 
 when test {
@@ -440,14 +434,14 @@ when test {
     let tests = [
         test.case "to and from a float"  $( test.eq! [3.0, 3, 2.5] [to_float 3, to_int 3.9, to_float 2.5] ),
         test.case "toward zero"          $( test.eq! (0 - 3) (to_int (0.0 - 3.9)) ),
-        test.case "a numeral"            $( test.eq! [42, ()] [parse_int "42", parse_int "4x"] ),
-        test.case "a float numeral"      $( test.eq! [2.5, ()] [parse_float "2.5", parse_float "x"] ),
+        test.case "a numeral"            $( test.eq! [Option.some 42, Option.none] [parse_int "42", parse_int "4x"] ),
+        test.case "a float numeral"      $( test.eq! [Option.some 2.5, Option.none] [parse_float "2.5", parse_float "x"] ),
         test.case "a size, as the VM reads one"
-            $( test.eq! [4096, 524288, 67108864, 2147483648, 1024]
+            $( test.eq! (list.map Option.some [4096, 524288, 67108864, 2147483648, 1024])
                         [parse_size "4096", parse_size "512K", parse_size "64M", parse_size "2gb",
                          parse_size "1kB"] ),
         test.case "not a size"
-            $( test.eq! [(), (), (), (), ()]
+            $( test.eq! (list.replicate 5 Option.none)
                         [parse_size "", parse_size "M", parse_size "0", parse_size "12T",
                          parse_size "-1M"] ),
         test.case "eight bytes and back" $( test.eq! [8, 1.5] [len (float_bytes 1.5),
@@ -538,10 +532,10 @@ when test {
         test.case "padded digits in any base"
             $( test.eq! ["0000755", "17", "-0f", "0"]
                         [to_base_padded 8 7 493, to_base_padded 8 1 15, to_base_padded 16 3 (0 - 15), to_base_padded 2 0 0] ),
-        test.case "parse_base"           $( test.eq! [255, 255, 0 - 5, (), (), ()]
+        test.case "parse_base"           $( test.eq! [Option.some 255, Option.some 255, Option.some (0 - 5), Option.none, Option.none, Option.none]
                                                      [parse_base 16 "ff", parse_base 16 "FF", parse_base 2 "-101",
                                                       parse_base 2 "102", parse_base 16 "", parse_base 16 "-"] ),
         test.case "parse_base round trip"
-            $( test.eq! (pow 3 50) (parse_base 7 (to_base 7 (pow 3 50))) ),
+            $( test.eq! (Option.some (pow 3 50)) (parse_base 7 (to_base 7 (pow 3 50))) ),
     ];
 }

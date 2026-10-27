@@ -85,7 +85,7 @@ let for_all_with! options gen holds = {
     let base = match Options.seed options {
         () => match os.env! "DREAM_SEED" {
             () => random.int! 0 2147483647,
-            text => match num.parse_int text { () => text, n => n },
+            text => match num.parse_int text { Option.none => text, Option.some(n) => n },
         },
         s => s,
     };

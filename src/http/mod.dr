@@ -443,7 +443,7 @@ let body_state! headers until_close = {
                     raise! (error.new :bad_message "invalid content length")
                 }
                 match num.parse_int digits {
-                    n if n != () && n >= 0 => [:exact, n],
+                    Option.some(n) if n >= 0 => [:exact, n],
                     _ => raise! (error.new :bad_message "invalid content length"),
                 }
             },
@@ -528,7 +528,7 @@ let read_body! r headers until_close limit = {
 priv let hex_number : :string -> :integer;
 priv let hex_number t =
     if t == "" || str.span "0123456789abcdefABCDEF" 0 t != len t || len t > 15 { 0 - 1 }
-    else { match num.parse_base 16 t { () => 0 - 1, v => v } };
+    else { match num.parse_base 16 t { Option.none => 0 - 1, Option.some(v) => v } };
 
 // --- streams ------------------------------------------------------------------------
 //
@@ -1004,7 +1004,7 @@ priv let rec read_response_with! r head sink following = match read_head! r 6553
     () => raise! (error.new :bad_response "the server closed the connection without answering"),
     [start, headers, r2] => {
         let parts = str.split " " start;
-        let parsed = match parts { [_, c, .._] => num.parse_int c, _ => () };
+        let parsed = match parts { [_, c, .._] => Option.or_unit (num.parse_int c), _ => () };
         match (if str.starts_with "HTTP/" start { parsed } else { () }) {
             () => raise! (error.new :bad_response ("not a status line: " + start)),
             code if code >= 100 && code < 200 => read_response_with! r2 head sink following,

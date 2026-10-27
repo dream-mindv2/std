@@ -775,7 +775,7 @@ priv let byte_range req tag last_modified size = {
             let [from, to] = match str.split "-" (str.trim (str.slice 6 (len spec - 6) spec)) { [a, b] => [a, b], _ => ["x", "x"] };
             let digits t = t != "" && str.span "0123456789" 0 t == len t;
             // Only ever asked of digits, so never `()`.
-            let whole t = match num.parse_int t { () => 0, n => n };
+            let whole t = match num.parse_int t { Option.none => 0, Option.some(n) => n };
             if from == "" && digits to {
                 let n = whole to;
                 if n == 0 || size == 0 { :unsatisfiable } else { [num.max 0 (size - n), size - 1] }

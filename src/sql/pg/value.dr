@@ -233,9 +233,9 @@ priv let decode_builtin : %{:integer => :any} -> :integer -> :string -> :any;
 priv let decode_builtin decoders type_oid text = match type_oid {
     16 => text == "t",
     20 => exact_integer text,
-    21 => num.parse_int text,
-    23 => num.parse_int text,
-    26 => num.parse_int text,
+    21 => Option.or_unit (num.parse_int text),
+    23 => Option.or_unit (num.parse_int text),
+    26 => Option.or_unit (num.parse_int text),
     700 => float_of text,
     701 => float_of text,
     1700 => exact_integer text,
@@ -253,15 +253,15 @@ priv let decode_builtin decoders type_oid text = match type_oid {
 /// `numeric` with a fraction, which no Dream number holds exactly.
 let exact_integer : :string -> :any;
 let exact_integer text = match num.parse_int text {
-    n if type_of n == :integer => n,
+    Option.some(n) if type_of n == :integer => n,
     _ => text,
 };
 
 /// Parse PostgreSQL floating-point text, including special values.
 priv let float_of : :string -> :any;
 priv let float_of text = match num.parse_float text {
-    () => text,
-    x => x,
+    Option.none => text,
+    Option.some(x) => x,
 };
 
 /// Decode PostgreSQL JSON text into a Dream value.

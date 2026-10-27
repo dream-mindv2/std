@@ -108,7 +108,7 @@ priv let parse_authority a = {
     else if port_text == "" { ok [user, password, str.lower host, ()] }
     else {
         match num.parse_int port_text {
-            n if n != () && n >= 0 && n <= 65535 && str.span "0123456789" 0 port_text == len port_text =>
+            Option.some(n) if n >= 0 && n <= 65535 && str.span "0123456789" 0 port_text == len port_text =>
                 ok [user, password, str.lower host, n],
             _ => Result.error ("not a port: " + port_text),
         }

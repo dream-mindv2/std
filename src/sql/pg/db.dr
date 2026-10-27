@@ -257,7 +257,7 @@ let server_version conn = match parameter "server_version" conn {
 let version_number : :string -> :integer;
 let version_number text = {
     let numeric = str.slice 0 (str.span "0123456789." 0 text) text;
-    let parts = map (fn p -> match num.parse_int p { n if type_of n == :integer => n, _ => 0 })
+    let parts = map (fn p -> match num.parse_int p { Option.some(n) if type_of n == :integer => n, _ => 0 })
                          (str.split "." numeric);
     match parts {
         [major, minor, .._] if major >= 10 => major * 10000 + minor,
@@ -536,7 +536,7 @@ priv let row_of columns tuple =
 /// `CREATE TABLE` is `()`.
 let count_of : :string -> :integer | :unit;
 let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
-    n if type_of n == :integer => n,
+    Option.some(n) if type_of n == :integer => n,
     _ => (),
 };
 

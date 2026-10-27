@@ -84,7 +84,7 @@ let scram_final password client_nonce client_bare server_first = {
         match salt {
             () => err "the server's salt is not base64",
             s => match rounds {
-                i if type_of i == :integer && i > 0 => {
+                Option.some(i) if i > 0 => {
                     let salted = pbkdf2_sha256 password s i;
                     let client_key = hmac_sha256 salted "Client Key";
                     let without_proof = "c=biws,r=" + nonce;

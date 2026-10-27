@@ -787,7 +787,7 @@ priv let tagged key found = match found { () => (), [v, next] => [key, v, next] 
 priv let number : :string -> :integer -> :integer -> :integer -> :any;
 priv let number s i least most = {
     let stop = list.minimum [str.span "0123456789" i s, i + most];
-    if stop - i < least { () } else { [num.parse_int (str.slice i (stop - i) s), stop] }
+    if stop - i < least { () } else { [Option.or_unit (num.parse_int (str.slice i (stop - i) s)), stop] }
 };
 
 /// Parse a signed numeric field within the supplied width bounds.
@@ -808,7 +808,7 @@ priv let fraction_digits s i = {
     if stop == i { () }
     else {
         let digits = str.slice i (list.minimum [stop - i, 9]) s;
-        [num.parse_int (digits + str.repeat (9 - len digits) "0"), stop]
+        [Option.or_unit (num.parse_int (digits + str.repeat (9 - len digits) "0")), stop]
     }
 };
 
@@ -1028,7 +1028,7 @@ priv let unit_size u = match u {
 
 /// Decimal digits as their value, `""` as 0.
 priv let digits_value : :string -> :integer;
-priv let digits_value s = match num.parse_int s { () => 0, n => n };
+priv let digits_value s = match num.parse_int s { Option.none => 0, Option.some(n) => n };
 
 /// Compute ten raised to a nonnegative exponent.
 priv let pow10 : :integer -> :integer;

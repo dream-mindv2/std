@@ -447,7 +447,7 @@ priv let headers_done! c id end_stream = {
                     if end_stream { stream_ended! c3 id } else { c3 }
                 },
                 _ => {
-                    let status = match list.filter (fn [k, _] -> k == ":status") headers { [[_, v], .._] => num.parse_int v, _ => () };
+                    let status = match list.filter (fn [k, _] -> k == ":status") headers { [[_, v], .._] => Option.or_unit (num.parse_int v), _ => () };
                     match status {
                         // An interim response (100 Continue, 103) is passed over.
                         code if code != () && code < 200 => put_stream c2 id (Stream.set_block "" s),
@@ -529,7 +529,7 @@ priv let request_of headers body = {
 /// Build an application response from HTTP/2 headers and body.
 priv let response_of : [[:string]] -> :string -> :map;
 priv let response_of headers body = {
-    let status = match filter (fn [k, _] -> k == ":status") headers { [[_, v], .._] => match num.parse_int v { () => 0, n => n }, _ => 0 };
+    let status = match filter (fn [k, _] -> k == ":status") headers { [[_, v], .._] => match num.parse_int v { Option.none => 0, Option.some(n) => n }, _ => 0 };
     %{ :status => status, :headers => filter (fn [n, _] -> not (str.starts_with ":" n)) headers, :body => body }
 };
 

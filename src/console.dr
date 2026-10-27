@@ -176,8 +176,8 @@ let confirm! question default = confirm_with! (session! ()) question default;
 /// Parse a trimmed integer response, returning a validation error for invalid input.
 let integer : :string -> Result :integer :string;
 let integer line = match num.parse_int (str.trim line) {
-    () => err "Please enter an integer.",
-    n => ok n,
+    Option.none => err "Please enter an integer.",
+    Option.some(n) => ok n,
 };
 /// Prompt repeatedly until the user supplies an integer or input ends.
 let prompt_int! : :any -> :integer | :unit;

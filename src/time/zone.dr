@@ -254,7 +254,7 @@ priv let clock_seconds s i = {
 priv let digits : :string -> :integer -> :any;
 priv let digits s i = {
     let stop = str.span "0123456789" i s;
-    if stop == i { () } else { [num.parse_int (str.slice i (stop - i) s), stop] }
+    if stop == i { () } else { [Option.or_unit (num.parse_int (str.slice i (stop - i) s)), stop] }
 };
 
 /// One `date[/time]` of a rule: `[day, seconds]`, the time defaulting to 2am.
@@ -268,11 +268,11 @@ priv let tz_change text = {
     let seconds = match tz_offset time_text 0 { () => (), [v, _] => v };
     let day = match str.byte 0 day_text {
         77 => match map (fn p -> num.parse_int p) (str.split "." (str.slice 1 (len day_text) day_text)) {
-            [m, w, d] if m != () && w != () && d != () => [:m, m, w, d],
+            [Option.some(m), Option.some(w), Option.some(d)] => [:m, m, w, d],
             _ => (),
         },
-        74 => match num.parse_int (str.slice 1 (len day_text) day_text) { () => (), n => [:j, n] },
-        _ => match num.parse_int day_text { () => (), n => [:n, n] },
+        74 => match num.parse_int (str.slice 1 (len day_text) day_text) { Option.none => (), Option.some(n) => [:j, n] },
+        _ => match num.parse_int day_text { Option.none => (), Option.some(n) => [:n, n] },
     };
     if day == () || seconds == () { Result.error ("not a rule date: " + text) }
     else { ok [day, seconds] }

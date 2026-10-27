@@ -414,13 +414,13 @@ let number s at = {
         } else { frac_end };
         let written = str.slice at (exp_end - at) s;
         if exp_end == int_end { ok (whole_number written) exp_end (Problem.make exp_end ["digit"]) }
-        else { ok (match num.parse_float written { () => 0.0, f => f }) exp_end () }
+        else { ok (match num.parse_float written { Option.none => 0.0, Option.some(f) => f }) exp_end () }
     }
 };
 
 /// Digits already checked to be digits, as their value.
 priv let whole_number : :string -> :integer;
-priv let whole_number written = match num.parse_int written { () => 0, n => n };
+priv let whole_number written = match num.parse_int written { Option.none => 0, Option.some(n) => n };
 
 /// A name as most languages write one: a letter or `_`, then letters,
 /// digits and `_`.
@@ -485,7 +485,7 @@ priv let escaped_char s code at =
 priv let hex_value : :string -> :any;
 priv let hex_value h =
     if len h != 4 || str.span "0123456789abcdefABCDEF" 0 h != 4 { () }
-    else { num.parse_base 16 h };
+    else { Option.or_unit (num.parse_base 16 h) };
 
 // --- combining --------------------------------------------------------------------------------
 

@@ -206,15 +206,15 @@ let parse_csv text = {
 
 /// Treat a CSV line as a header when at least one field is not numeric.
 priv let is_header : :string -> :bool;
-priv let is_header line = list.any (fn f -> num.parse_float (str.trim f) == () && num.parse_int (str.trim f) == ()) (str.split "," line);
+priv let is_header line = list.any (fn f -> Option.is_none (num.parse_float (str.trim f)) && Option.is_none (num.parse_int (str.trim f))) (str.split "," line);
 
 /// A field as a float, or `()` when it is not a number.
 priv let field : :string -> :float | :unit;
 priv let field text = {
     let t = str.trim text;
     match num.parse_float t {
-        () => match num.parse_int t { () => (), n => 1.0 * n },
-        f => f,
+        Option.none => match num.parse_int t { Option.none => (), Option.some(n) => 1.0 * n },
+        Option.some(f) => f,
     }
 };
 

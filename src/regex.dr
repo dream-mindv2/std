@@ -330,7 +330,7 @@ priv let escaped s at = match p.char_at s at {
 
 /// Convert hexadecimal source text to an integer code point.
 priv let hex : :string -> :integer;
-priv let hex h = match num.parse_base 16 h { () => 0, v => v };
+priv let hex h = match num.parse_base 16 h { Option.none => 0, Option.some(v) => v };
 
 priv let digit_items : [:any];
 priv let digit_items = [[:range, 48, 57]];
@@ -807,7 +807,7 @@ priv let rec template_pieces t i m =
                 if close < 0 { [literal, str.slice at (len t - at) t] }
                 else {
                     let key = str.slice (after + 1) (close - after - 1) t;
-                    literal :: or_empty (match num.parse_int key { () => named key m, n => group n m }) :: template_pieces t (close + 1) m
+                    literal :: or_empty (match num.parse_int key { Option.none => named key m, Option.some(n) => group n m }) :: template_pieces t (close + 1) m
                 }
             } else {
                 let stop = str.span "0123456789" after t;
@@ -823,7 +823,7 @@ priv let or_empty v = match v { () => "", text => text };
 
 /// Read a decimal capture reference from replacement text.
 priv let num_value : :string -> :integer;
-priv let num_value digits = match num.parse_int digits { () => 0, n => n };
+priv let num_value digits = match num.parse_int digits { Option.none => 0, Option.some(n) => n };
 
 /// The text between the matches.
 let split : Regex -> :string -> [:string];

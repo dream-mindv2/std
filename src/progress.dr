@@ -77,7 +77,7 @@ let drawn! () = match target! () {
 /// The terminal's width as `COLUMNS` says, or eighty.
 let columns! : :unit -> :integer;
 let columns! () = match num.parse_int (match os.env! "COLUMNS" { () => "", c => c }) {
-    n if n != () && n >= 20 => n,
+    Option.some(n) if n >= 20 => n,
     _ => 80,
 };
 

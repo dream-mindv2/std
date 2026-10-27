@@ -832,8 +832,8 @@ priv let rec control f node = if list.contains (Node.tag node) controls { f node
 
 /// Typed text as a number: an integer, a float, or `()` when it is neither.
 priv let number_of s = match num.parse_int s {
-    () => num.parse_float s,
-    n => n,
+    Option.none => Option.or_unit (num.parse_float s),
+    Option.some(n) => n,
 };
 /// A fraction held between 0 and 1.
 priv let clamp x = if x < 0 { 0 } else if x > 1 { 1 } else { x };

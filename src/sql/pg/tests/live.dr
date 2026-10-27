@@ -30,7 +30,7 @@ import std.num;
 
 let port! : :unit -> :integer;
 let port! u = match num.parse_int (os.env! "PG_TEST_PORT") {
-    n if type_of n == :integer => n,
+    Option.some(n) if type_of n == :integer => n,
     _ => 5432,
 };
 

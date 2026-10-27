@@ -466,7 +466,7 @@ priv let key_of text = {
 
 /// A whole number written in `text`, or 0 when it is not one.
 priv let int_of : :string -> :integer;
-priv let int_of text = match num.parse_int text { () => 0, n => n };
+priv let int_of text = match num.parse_int text { Option.none => 0, Option.some(n) => n };
 
 /// The tree `save!` wrote to `path`, its tensors on the host. Lists come back
 /// as lists and maps as maps; an array written comes back a list.

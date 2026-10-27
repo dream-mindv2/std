@@ -212,7 +212,7 @@ priv let apply c k v = match k {
     "host" => Result.ok (Config.set_host v c),
     "hostaddr" => Result.ok (Config.set_host v c),
     "port" => match num.parse_int v {
-        n if type_of n == :integer && n > 0 && n < 65536 => Result.ok (Config.set_port n c),
+        Option.some(n) if type_of n == :integer && n > 0 && n < 65536 => Result.ok (Config.set_port n c),
         _ => Result.error ("`" + v + "` is not a port"),
     },
     "user" => Result.ok (Config.set_user v c),
