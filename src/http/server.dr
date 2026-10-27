@@ -369,7 +369,7 @@ priv let send_response! sock req resp keep head watchdog = {
         s => {
             // A stream whose length is known says so, and is sent as it is:
             // a file, whose client can then show how far along it is.
-            let chunked = http.Request.version req != "HTTP/1.0" && http.header "content-length" resp2 == ();
+            let chunked = http.Request.version req != "HTTP/1.0" && Option.is_none (http.header "content-length" resp2);
             streams.write_all! sock (http.encode_stream_head resp2 chunked)
             if not head { http.write_stream! sock s chunked (still_going! watchdog) }
         },
@@ -450,8 +450,8 @@ priv let body_pull! b u = {
 };
 
 /// Replace an absent string with an empty string.
-priv let or_empty : (:string | :unit) -> :string;
-priv let or_empty v = match v { () => "", t => t };
+priv let or_empty : Option :string -> :string;
+priv let or_empty v = Option.unwrap_or "" v;
 
 /// `/a/b?x=1` as `["/a/b", %{ "x" => "1" }]`. An absolute URL, which a
 /// client talking to a proxy sends, is read the same way.
@@ -501,8 +501,8 @@ priv let answer! handle req options = try! {
 /// The headers every response gets unless the handler set them.
 priv let finish! : :map -> :map -> :map -> :map;
 priv let finish! resp req options = {
-    let with_date = if http.header "date" resp == () { http.with_header "date" (time.http_date (time.now! ())) resp } else { resp };
-    if http.header "server" with_date == () { http.with_header "server" (Options.name options) with_date } else { with_date }
+    let with_date = if Option.is_none (http.header "date" resp) { http.with_header "date" (time.http_date (time.now! ())) resp } else { resp };
+    if Option.is_none (http.header "server" with_date) { http.with_header "server" (Options.name options) with_date } else { with_date }
 };
 
 /// Whether the connection stays open after this exchange.
@@ -675,8 +675,8 @@ let static! o dir req = {
 priv let requested : Static -> :map -> ([:string] | :unit);
 priv let requested o req = {
     let names = match http.param "path" req {
-        () => map url.decode (segments (http.Request.path req)),
-        p => segments p,
+        Option.none => map url.decode (segments (http.Request.path req)),
+        Option.some(p) => segments p,
     };
     if list.any (refused o) names { () } else { names }
 };
@@ -754,14 +754,14 @@ priv let etag size modified = "\"" + to_string size + "-" + to_string modified +
 /// `If-Modified-Since`, to the second, only when it is not.
 priv let fresh : :map -> :string -> :integer -> :bool;
 priv let fresh req tag modified = match http.header "if-none-match" req {
-    () => match http.header "if-modified-since" req {
-        () => false,
-        since => match time.parse_http_date since {
+    Option.none => match http.header "if-modified-since" req {
+        Option.none => false,
+        Option.some(since) => match time.parse_http_date since {
             Result.ok(t) => modified / time.second <= t / time.second,
             Result.error(_) => false,
         },
     },
-    tags => list.any (fn t -> t == "*" || t == tag || t == "W/" + tag) (map str.trim (str.split "," tags)),
+    Option.some(tags) => list.any (fn t -> t == "*" || t == tag || t == "W/" + tag) (map str.trim (str.split "," tags)),
 };
 
 /// The one byte range a request asks for in a file of `size` bytes, as
@@ -769,9 +769,9 @@ priv let fresh req tag modified = match http.header "if-none-match" req {
 /// range, several, a malformed one, or an `If-Range` the file no longer is.
 priv let byte_range : :map -> :string -> :string -> :integer -> ([:integer, :integer] | :atom | :unit);
 priv let byte_range req tag last_modified size = {
-    let current = match http.header "if-range" req { () => true, v => v == tag || v == last_modified };
+    let current = match http.header "if-range" req { Option.none => true, Option.some(v) => v == tag || v == last_modified };
     match http.header "range" req {
-        spec if spec != () && current && str.starts_with "bytes=" spec && not (str.contains ',' spec) => {
+        Option.some(spec) if current && str.starts_with "bytes=" spec && not (str.contains ',' spec) => {
             let [from, to] = match str.split "-" (str.trim (str.slice 6 (len spec - 6) spec)) { [a, b] => [a, b], _ => ["x", "x"] };
             let digits t = t != "" && str.span "0123456789" 0 t == len t;
             // Only ever asked of digits, so never `()`.
@@ -917,16 +917,16 @@ let logged! lg app req = {
 /// server, answering the browser's preflight `OPTIONS` itself.
 let cors : :any -> :any -> :map -> :map;
 let cors origins app req = {
-    let origin = http.header "origin" req;
+    let origin = Option.or_unit (http.header "origin" req);
     let allowed = match origins { "*" => if origin == () { "*" } else { "*" }, os => if list.contains origin os { origin } else { () } };
     let decorate resp = match allowed {
         () => resp,
         a => resp |> http.with_header "access-control-allow-origin" a |> http.with_header "vary" "Origin",
     };
-    if http.Request.method req == "OPTIONS" && http.header "access-control-request-method" req != () {
+    if http.Request.method req == "OPTIONS" && Option.is_some (http.header "access-control-request-method" req) {
         decorate (http.no_content
             |> http.with_header "access-control-allow-methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            |> http.with_header "access-control-allow-headers" (match http.header "access-control-request-headers" req { () => "*", h => h })
+            |> http.with_header "access-control-allow-headers" (match http.header "access-control-request-headers" req { Option.none => "*", Option.some(h) => h })
             |> http.with_header "access-control-max-age" "86400")
     } else { decorate ((handler app) req) }
 };
@@ -936,7 +936,7 @@ let with_headers : :any -> :any -> :map -> :map;
 let with_headers pairs app req = {
     let resp = (handler app) req;
     let ps : [[:string, :any]] = if type_of pairs == :map { map.pairs pairs } else { pairs };
-    fold (fn r [k, v] -> if http.header k r == () { http.with_header k v r } else { r }) resp ps
+    fold (fn r [k, v] -> if Option.is_none (http.header k r) { http.with_header k v r } else { r }) resp ps
 };
 
 /// HTTP Basic authentication: `check user password` decides, and anyone it
@@ -945,8 +945,8 @@ let basic_auth : :string -> (:string -> :string -> :bool) -> :any -> :map -> :ma
 let basic_auth realm check app req = {
     let refuse = http.status_only 401 |> http.with_header "www-authenticate" ("Basic realm=\"" + realm + "\"");
     match http.header "authorization" req {
-        () => refuse,
-        value => if not (str.starts_with "Basic " value) { refuse }
+        Option.none => refuse,
+        Option.some(value) => if not (str.starts_with "Basic " value) { refuse }
                  else {
                      match crypto.unbase64 (str.slice 6 (len value) value) {
                          () => refuse,
@@ -970,12 +970,15 @@ let call! app req = finish! (answer! (handler app) req defaults) req defaults;
 when test {
     import std.agent;
     import std.test;
+
+    // A header's value, or () -- what the tests compare against.
+    let hdr name m = Option.or_unit (http.header name m);
     import std.vm;
 
-    let hello req = http.text ("hello, " + (match http.query_value "name" req { () => "world", n => n }));
+    let hello req = http.text ("hello, " + (match http.query_value "name" req { Option.none => "world", Option.some(n) => n }));
     let app = router
         |> get "/" hello
-        |> get "/users/:id" (fn req -> http.json %{ "id" => http.param "id" req })
+        |> get "/users/:id" (fn req -> http.json %{ "id" => Option.or_unit (http.param "id" req) })
         |> post "/echo" (fn req -> http.respond 200 (http.body req) |> http.with_header "content-type" (or_empty (http.header "content-type" req)))
         |> get "/files/*rest" (fn req -> http.text (or_empty (http.param "rest" req)))
         |> get "/boom" (fn req -> http.text (to_string test.boom))
@@ -998,15 +1001,15 @@ when test {
         test.case "404 and 405" $( test.eq! [404, 405, "POST"]
             [http.status (call! app (http.Request.new () |> http.Request.set_path "/nope")),
              http.status (call! app (http.Request.new () |> http.Request.set_method "GET" |> http.Request.set_path "/echo")),
-             http.header "allow" (call! app (http.Request.new () |> http.Request.set_method "DELETE" |> http.Request.set_path "/echo"))] ),
+             hdr "allow" (call! app (http.Request.new () |> http.Request.set_method "DELETE" |> http.Request.set_path "/echo"))] ),
         test.case "HEAD falls back to GET" $( test.eq! 200 (http.status (call! app (http.Request.new () |> http.Request.set_method "HEAD"))) ),
         test.case "a raising handler is a 500" $( test.eq! 500 (http.status (call! app (http.Request.new () |> http.Request.set_path "/boom"))) ),
         test.case "a string is text" $( test.eq! ["just a string", "text/plain; charset=utf-8"]
-            { let r = call! app (http.Request.new () |> http.Request.set_path "/string"); [http.body r, http.header "content-type" r] } ),
+            { let r = call! app (http.Request.new () |> http.Request.set_path "/string"); [http.body r, hdr "content-type" r] } ),
         test.case "cors answers a preflight" $( test.eq! [204, "*"]
             { let r = call! (cors "*" app) (http.Request.new () |> http.Request.set_method "OPTIONS"
                                                      |> http.with_header "origin" "http://a" |> http.with_header "access-control-request-method" "POST");
-              [http.status r, http.header "access-control-allow-origin" r] } ),
+              [http.status r, hdr "access-control-allow-origin" r] } ),
         test.case "basic auth" $( {
             let guarded = basic_auth "x" (fn u p -> u == "ada" && p == "pw") app;
             test.eq! [401, 200]
@@ -1091,7 +1094,7 @@ when test {
             let got = http.send! (http.request "GET" (local_url s + "/a") |> http.with_redirects 0);
             stop! s
             match got {
-                Result.ok(r) => test.eq! [302, "/b"] [http.status r, http.header "location" r],
+                Result.ok(r) => test.eq! [302, "/b"] [http.status r, hdr "location" r],
                 other => test.fail! other,
             }
         } ),
@@ -1258,7 +1261,7 @@ when test {
             stop! s
             io.remove_all! dir
             test.eq! [Result.ok ["body {}", "text/css; charset=utf-8"], Result.ok "<p>home</p>", 404, 404]
-                     [Result.map (fn r -> [http.body r, http.header "content-type" r]) css, home,
+                     [Result.map (fn r -> [http.body r, hdr "content-type" r]) css, home,
                       Result.unwrap_or 0 (Result.map http.status escape), Result.unwrap_or 0 (Result.map http.status encoded)]
         } ),
         test.case "what a static directory refuses" $( {
@@ -1286,9 +1289,9 @@ when test {
             let get! headers = call! (files! dir) (fold (fn r [k, v] -> http.with_header k v r)
                                                        (http.Request.new () |> http.Request.set_path "/digits.txt") headers);
             let whole = get! [];
-            let tag = http.header "etag" whole;
+            let tag = hdr "etag" whole;
             let again = get! [["if-none-match", tag]];
-            let since = get! [["if-modified-since", http.header "last-modified" whole]];
+            let since = get! [["if-modified-since", hdr "last-modified" whole]];
             let part = get! [["range", "bytes=2-4"]];
             let tail = get! [["range", "bytes=-3"]];
             let open = get! [["range", "bytes=7-"]];
@@ -1299,10 +1302,10 @@ when test {
             io.remove_all! dir
             test.eq! [[200, "0123456789", "bytes"], 304, 304, [206, "234", "bytes 2-4/10"], "789", "789",
                       [416, "bytes */10"], [200, "0123456789"], 200, ["10", ""]]
-                     [[http.status whole, http.body whole, http.header "accept-ranges" whole], http.status again, http.status since,
-                      [http.status part, http.body part, http.header "content-range" part], http.body tail, http.body open,
-                      [http.status beyond, http.header "content-range" beyond], [http.status several, http.body several],
-                      http.status stale, [http.header "content-length" head, http.stream_text! (http.Response.stream head)]]
+                     [[http.status whole, http.body whole, hdr "accept-ranges" whole], http.status again, http.status since,
+                      [http.status part, http.body part, hdr "content-range" part], http.body tail, http.body open,
+                      [http.status beyond, hdr "content-range" beyond], [http.status several, http.body several],
+                      http.status stale, [hdr "content-length" head, http.stream_text! (http.Response.stream head)]]
         } ),
         test.case "a directory: its slash, its index, its listing" $( {
             let dir = "/tmp/dream-http-dirs-" + to_string (time.now! ());
@@ -1319,7 +1322,7 @@ when test {
             let listed = ask! (Static.new () |> Static.set_listing true) "/bare/";
             io.remove_all! dir
             test.eq! [[301, "/docs/"], "/docs/", "<p>docs</p>", 404, [true, true, false, false]]
-                     [[http.status moved, http.header "location" moved], http.header "location" sneaky, http.body index,
+                     [[http.status moved, hdr "location" moved], hdr "location" sneaky, http.body index,
                       http.status unlisted,
                       [str.contains_str "href=\"inner/\"" (http.body listed), str.contains_str "a &lt;b&gt;.txt" (http.body listed),
                        str.contains_str ".hidden" (http.body listed), str.contains_str "<b>" (http.body listed)]]
@@ -1348,7 +1351,7 @@ when test {
             stop! s
             io.remove_all! dir
             test.eq! [Result.ok [true, "200000"], true, false]
-                     [Result.map (fn r -> [http.body r == big, http.header "content-length" r]) resp,
+                     [Result.map (fn r -> [http.body r == big, hdr "content-length" r]) resp,
                       str.ends_with "\r\n\r\nabcdefghij" ranged, str.contains_str "chunked" (str.lower ranged)]
         } ),
         test.case "one address cannot take every connection" $( {

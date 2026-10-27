@@ -279,8 +279,8 @@ let is_prime n =
     if n < 2 { false }
     else {
         match list.find (fn p -> n % p == 0) small_primes {
-            () => n < 1369 || miller_rabin n,
-            p => n == p,
+            Option.none => n < 1369 || miller_rabin n,
+            Option.some(p) => n == p,
         }
     };
 

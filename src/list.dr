@@ -620,22 +620,25 @@ let contains x xs = any (fn y -> y == x) xs;
 let count : (a -> :bool) -> [a] -> :integer;
 let count pred xs = fold (fn acc x -> if pred x { acc + 1 } else { acc }) 0 xs;
 
-/// The first element satisfying `pred`, or `()` when none does. Stops at the
-/// first match, so it finds one in an endless list.
-let find : (a -> :bool) -> [a] -> a;
+/// The first element satisfying `pred`, or `none` when none does. Stops at the
+/// first match, so it finds one in an endless list -- and an element that is
+/// itself `()` is found like any other.
+let find : (a -> :bool) -> [a] -> Option a;
 let rec find pred xs =
-    if _list_is_empty xs { () }
-    else if pred (xs.[0]) { xs.[0] }
+    if _list_is_empty xs { Option.none }
+    else if pred (xs.[0]) { Option.some (xs.[0]) }
     else { find pred (_list_tail xs) };
 
-/// The first answer of `f` that is not `()`, or `()` when there is none --
+/// The first answer of `f` that is `some`, or `none` when there is none --
 /// `find` and `map` in one walk that stops as soon as it has something.
-let find_map : (a -> b) -> [a] -> b;
+let find_map : (a -> Option b) -> [a] -> Option b;
 let rec find_map f xs =
-    if _list_is_empty xs { () }
+    if _list_is_empty xs { Option.none }
     else {
-        let y = f (xs.[0]);
-        if y == () { find_map f (_list_tail xs) } else { y }
+        match f (xs.[0]) {
+            Option.none => find_map f (_list_tail xs),
+            found => found,
+        }
     };
 
 /// The index of the first element satisfying `pred`, or -1.
@@ -988,8 +991,9 @@ when test {
         test.case "count"               $( test.eq! 2 (count (fn x -> x > 1) [1, 2, 3]) ),
         test.case "index_of"            $( test.eq! 1 (index_of :b [:a, :b]) ),
         test.case "index_of missing"    $( test.eq! (0 - 1) (index_of :z [:a]) ),
-        test.case "find"                $( test.eq! [3, ()] [find (fn x -> x > 2) [1, 3, 4], find (fn x -> x > 9) [1]] ),
-        test.case "find in an infinite list" $( test.eq! 10 (find (fn x -> x * x > 90) (from 0)) ),
+        test.case "find"                $( test.eq! [Option.some 3, Option.none] [find (fn x -> x > 2) [1, 3, 4], find (fn x -> x > 9) [1]] ),
+        test.case "find in an infinite list" $( test.eq! (Option.some 10) (find (fn x -> x * x > 90) (from 0)) ),
+        test.case "an element that is () is found" $( test.eq! (Option.some ()) (find (fn x -> x == ()) [1, (), 2]) ),
         test.case "find_index"          $( test.eq! [1, 0 - 1] [find_index (fn x -> x > 2) [1, 3], find_index (fn x -> x > 9) [1]] ),
         test.case "starts_with"         $( test.eq! [true, true, false, false]
                                                     [starts_with [1, 2] [1, 2, 3], starts_with [] [1],
@@ -1055,9 +1059,9 @@ when test {
             $( test.eq! [[0, 1], [2, 3]] (take 2 (chunk_by (fn n -> n / 2) (from 0))) ),
         test.case "zip3"                $( test.eq! [[1, :a, "x"], [2, :b, "y"]] (zip3 [1, 2, 3] [:a, :b] ["x", "y", "z"]) ),
         test.case "none"                $( test.eq! [true, false, true] [none (fn x -> x > 3) [1, 2], none (fn x -> x > 1) [1, 2], none (fn x -> true) []] ),
-        test.case "find_map"            $( test.eq! [20, ()] [find_map (fn x -> if x > 1 { x * 10 } else { () }) [1, 2, 3],
-                                                             find_map (fn x -> ()) [1, 2]] ),
-        test.case "find_map stops early" $( test.eq! 3 (find_map (fn x -> if x == 3 { x } else { () }) (from 0)) ),
+        test.case "find_map"            $( test.eq! [Option.some 20, Option.none] [find_map (fn x -> if x > 1 { Option.some (x * 10) } else { Option.none }) [1, 2, 3],
+                                                             find_map (fn x -> Option.none) [1, 2]] ),
+        test.case "find_map stops early" $( test.eq! (Option.some 3) (find_map (fn x -> if x == 3 { Option.some x } else { Option.none }) (from 0)) ),
         test.case "is_sorted"           $( test.eq! [true, true, true, false] [is_sorted [], is_sorted [1], is_sorted [1, 1, 2], is_sorted [2, 1]] ),
         test.case "each! runs in order" $( {
             let me = self! ();

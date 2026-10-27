@@ -672,8 +672,8 @@ let temp_dir! () = match os.platform () {
 /// and quoted tildes are expanded. Does not create it.
 let dream_dir! : :unit -> Option :string;
 let dream_dir! () = match list.find (fn dir -> not (io.exists! (join dir "toolchain.toml"))) (install.dirs! ()) {
-    () => under_home! ".mindv2",
-    dir => {
+    Option.none => under_home! ".mindv2",
+    Option.some(dir) => {
         let expanded = slashes (expand_home! dir);
         if expanded == "~" || str.starts_with "~/" expanded { Option.none }
         else { Option.some (absolute! expanded) }

@@ -497,11 +497,11 @@ let launch! : :map -> :map -> :map;
 let rec launch! ctx run = {
     let jobs = if build.Context.jobs ctx < 1 { 1 } else { build.Context.jobs ctx };
     let room = jobs - list.length (map.keys (Run.running run));
-    let next = if stopped run { () } else { list.find (fn sh -> ready run sh) (Run.waiting run) };
+    let next = if stopped run { Option.none } else { list.find (fn sh -> ready run sh) (Run.waiting run) };
     match next {
-        () => run,
+        Option.none => run,
         _ if room <= 0 => run,
-        shape => {
+        Option.some(shape) => {
             let s = (Run.steps run).[shape];
             let rest = filter (fn w -> w != shape) (Run.waiting run);
             let [st, key, paths] = keyed! ctx (Run.state run) s;

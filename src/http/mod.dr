@@ -137,12 +137,12 @@ let reason status = match status {
 // These work on a request and a response alike: both keep their headers
 // under `:headers`.
 
-/// The first value of a header, or `()`.
-let header : :string -> :map -> (:string | :unit);
+/// The first value of a header, or `none`.
+let header : :string -> :map -> Option :string;
 let header name msg = {
     let key = str.lower name;
     let headers : [[:string, :string]] = msg.[:headers else []];
-    match filter (fn [k, _] -> k == key) headers { [] => (), [[_, v], .._] => v }
+    match filter (fn [k, _] -> k == key) headers { [] => Option.none, [[_, v], .._] => Option.some v }
 };
 
 /// Every value of a header, in order.
@@ -187,11 +187,8 @@ priv let text_of v = match type_of v { :string => v, :atom => atom.name v, _ => 
 
 /// The media type, without its parameters and in lower case:
 /// `application/json` for `Application/JSON; charset=utf-8`.
-let content_type : :map -> (:string | :unit);
-let content_type msg = match header "content-type" msg {
-    () => (),
-    v => str.lower (str.trim (str.slice 0 (str.upto ";" 0 v) v)),
-};
+let content_type : :map -> Option :string;
+let content_type msg = Option.map (fn v -> str.lower (str.trim (str.slice 0 (str.upto ";" 0 v) v))) (header "content-type" msg);
 
 // --- reading messages ---------------------------------------------------------------
 
@@ -215,13 +212,13 @@ let body_json msg = json.decode (body msg);
 let body_form : :map -> :map;
 let body_form msg = fold (fn m [k, v] -> if map.has k m { m } else { m.[k => v] }) %{} (url.decode_query (body msg));
 
-/// A query parameter of a request, or `()`.
-let query_value : :string -> :map -> (:string | :unit);
-let query_value name req = (Request.query req).[name else ()];
+/// A query parameter of a request, or `none`.
+let query_value : :string -> :map -> Option :string;
+let query_value name req = Option.of (Request.query req).[name else ()];
 
-/// A path parameter a router read (`:id` in `/users/:id`), or `()`.
-let param : :string -> :map -> (:string | :unit);
-let param name req = (Request.params req).[name else ()];
+/// A path parameter a router read (`:id` in `/users/:id`), or `none`.
+let param : :string -> :map -> Option :string;
+let param name req = Option.of (Request.params req).[name else ()];
 
 /// The cookies a request carries, by name.
 let cookies : :map -> :map;
@@ -634,7 +631,7 @@ let encode_stream_head : :map -> :bool -> :string;
 let encode_stream_head resp chunked = {
     let code = Response.status resp;
     let framed = if chunked { without_header "content-length" resp |> with_header "transfer-encoding" "chunked" }
-                 else if header "content-length" resp != () { resp }
+                 else if Option.is_some (header "content-length" resp) { resp }
                  else { with_header "connection" "close" resp };
     str.concat_all (["HTTP/1.1 ", to_string code, " ", reason code, "\r\n"]
                     + (header_lines (Response.headers framed))
@@ -770,7 +767,7 @@ priv let with_client_defaults c req = {
             _ => Request.url req,
         },
     };
-    let with_headers_set = fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req (Client.headers c);
+    let with_headers_set = fold (fn r [k, v] -> if Option.is_none (header k r) { add_header k v r } else { r }) req (Client.headers c);
     with_headers_set |> Request.set_url address |> Request.set_options (map.merge (Client.options c) (Request.options req))
 };
 
@@ -856,8 +853,9 @@ priv let follow! : :map -> :map -> :integer -> :any -> :bool -> :map;
 priv let rec follow! c req left sink first = {
     let resp = exchange! c req sink (left > 0);
     let code = Response.status resp;
-    let location = header "location" resp;
-    if location == () || not (is_redirect code) { resp }
+    // A redirect with nowhere to go is the answer; only one with a place to go is followed.
+    let location = Option.unwrap_or "" (header "location" resp);
+    if location == "" || not (is_redirect code) { resp }
     else if left <= 0 && first { resp }
     else if left <= 0 { raise! (error.new :too_many_redirects ("still redirected after the last allowed, to " + location)) }
     else {
@@ -983,7 +981,7 @@ priv let close_quietly! sock = connections.close_quietly! sock;
 priv let exchange_on! : :any -> :map -> :map -> :any -> :bool -> :bool -> [:map, :bool];
 priv let exchange_on! sock u req sink keep following = {
     let defaults = [["user-agent", "dream-http/1.0"], ["accept", "*/*"], ["connection", if keep { "keep-alive" } else { "close" }]];
-    let prepared = fold (fn r [k, v] -> if header k r == () { add_header k v r } else { r }) req defaults;
+    let prepared = fold (fn r [k, v] -> if Option.is_none (header k r) { add_header k v r } else { r }) req defaults;
     streams.write_all! sock (encode_request prepared (url.target u) (url.host_header u))
     match req.[:stream else ()] { () => (), s => write_stream! sock s true nothing }
     let [resp, reusable] = read_response_with! (reader sock) (Request.method req == "HEAD") sink following;
@@ -1010,13 +1008,13 @@ priv let rec read_response_with! r head sink following = match read_head! r 6553
             code if code >= 100 && code < 200 => read_response_with! r2 head sink following,
             code => {
                 let base = Response.new () |> Response.set_status code |> Response.set_headers headers;
-                let says_close = str.contains_str "close" (str.lower (match header "connection" base { () => "", v => v }));
+                let says_close = str.contains_str "close" (str.lower (match header "connection" base { Option.none => "", Option.some(v) => v }));
                 let http11 = str.starts_with "HTTP/1.1" start;
                 if head || code == 204 || code == 304 { [base, http11 && not says_close] }
                 else {
                     let state = body_state! headers true;
                     let to_end = state == [:to_end];
-                    let collect = sink == () || (following && is_redirect code && header "location" base != ());
+                    let collect = sink == () || (following && is_redirect code && Option.is_some (header "location" base));
                     if collect {
                         let [pieces, _] = fold_body! r2 state max_response [] (fn acc piece -> piece :: acc);
                         [Response.set_body (str.concat_all (list.reverse pieces)) base, http11 && not says_close && not to_end]
@@ -1033,10 +1031,14 @@ priv let rec read_response_with! r head sink following = match read_head! r 6553
 when test {
     import std.test;
 
+    // A header's value, or () -- what the tests compare against.
+    let hdr name m = Option.or_unit (header name m);
+
     let tests = [
         test.case "headers are case-insensitive" $( test.eq! ["a", ["a", "b"], ()]
             { let m = Response.new () |> with_header "X-Thing" "a" |> add_header "x-thing" "b";
-              [header "x-THING" m, header_all "X-Thing" m, header "nope" m] } ),
+              [hdr "x-THING" m, header_all "X-Thing" m, hdr "nope" m] } ),
+        test.case "a header that is not there is none" $( test.eq! Option.none (header "nope" (Response.new ())) ),
         test.case "with_header replaces" $( test.eq! [["x", "2"]] (Response.headers (Response.new () |> with_header "X" 1 |> with_header "x" 2)) ),
         test.case "a header name, method or target that would write a line of its own is refused" $( {
             let refused! f = try! { strict! (str.length (f ())); false } catch e { true };
@@ -1045,11 +1047,11 @@ when test {
                  refused! (fn u -> encode_request (Request.new () |> Request.set_method "GET /x HTTP/1.1\r\nA:") "/" "h"),
                  refused! (fn u -> encode_request (Request.new ()) "/a b\r\nEvil: 1" "h")]
         } ),
-        test.case "line breaks are taken out of values" $( test.eq! "aSet-Cookie: x" (header "x" (with_header "x" "a\r\nSet-Cookie: x" (Response.new ()))) ),
+        test.case "line breaks are taken out of values" $( test.eq! "aSet-Cookie: x" (hdr "x" (with_header "x" "a\r\nSet-Cookie: x" (Response.new ()))) ),
         test.case "content type without parameters" $( test.eq! "application/json"
-            (content_type (with_header "Content-Type" "Application/JSON; charset=utf-8" (Response.new ()))) ),
+            (Option.or_unit (content_type (with_header "Content-Type" "Application/JSON; charset=utf-8" (Response.new ())))) ),
         test.case "a JSON response" $( test.eq! [200, "{\"a\":1}", "application/json"]
-            { let r = json %{ "a" => 1 }; [status r, body r, header "content-type" r] } ),
+            { let r = json %{ "a" => 1 }; [status r, body r, hdr "content-type" r] } ),
         test.case "credentials stay with their origin" $( {
             let u = fn t -> url.parse_or_raise t;
             test.eq! [true, true, false, false, false]
@@ -1059,15 +1061,15 @@ when test {
                  same_origin (u "https://a.example/") (u "https://a.example:8443/"),
                  same_origin (u "https://a.example/") (u "https://b.example/")]
         } ),
-        test.case "a redirect" $( test.eq! [303, "/x"] { let r = redirect_with 303 "/x"; [status r, header "location" r] } ),
+        test.case "a redirect" $( test.eq! [303, "/x"] { let r = redirect_with 303 "/x"; [status r, hdr "location" r] } ),
         test.case "a cookie" $( test.eq! "sid=abc; HttpOnly; Path=/"
-            (header "set-cookie" (with_cookie "sid" "abc" %{ "Path" => "/", "HttpOnly" => true, "Secure" => false } (text ""))) ),
+            (hdr "set-cookie" (with_cookie "sid" "abc" %{ "Path" => "/", "HttpOnly" => true, "Secure" => false } (text ""))) ),
         test.case "reading cookies" $( test.eq! %{ "a" => "1", "b" => "two" }
             (cookies (with_header "cookie" "a=1; b=two" (Request.new ()))) ),
         test.case "a request with JSON and a query" $( test.eq! ["POST", "http://x/p?a=1&b=two+words", "{\"k\":true}"]
             { let r = request "post" "http://x/p?a=1" |> with_query [["b", "two words"]] |> with_json %{ "k" => true };
               [Request.method r, Request.url r, body r] } ),
-        test.case "basic auth" $( test.eq! "Basic YWRhOnB3" (header "authorization" (with_basic_auth "ada" "pw" (request "GET" "http://x"))) ),
+        test.case "basic auth" $( test.eq! "Basic YWRhOnB3" (hdr "authorization" (with_basic_auth "ada" "pw" (request "GET" "http://x"))) ),
         test.case "a form body" $( test.eq! %{ "a" => "1", "b" => "x y" } (body_form (with_form [["a", 1], ["b", "x y"]] (request "POST" "http://x"))) ),
         test.case "encode a request" $( test.eq! "POST /p HTTP/1.1\r\nContent-Type: text/plain\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi"
             (encode_request (request "POST" "http://x/p" |> with_header "content-type" "text/plain" |> with_body "hi") "/p" "x") ),

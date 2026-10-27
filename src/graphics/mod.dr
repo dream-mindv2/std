@@ -429,7 +429,7 @@ priv let rec descend node id = match id {
     [] => Option.some node,
     [s, ..rest] => {
         let kids = live (Node.children node);
-        let found = if type_of s == :string { list.find (fn c -> Node.key c == s) kids }
+        let found = if type_of s == :string { Option.or_unit (list.find (fn c -> Node.key c == s) kids) }
             else if s >= 0 && s < len kids { list.nth s kids } else { () };
         match found {
             () => Option.none,

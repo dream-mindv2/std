@@ -86,15 +86,15 @@ let upgrade! on_open! req = upgrade_with! %{} on_open! req;
 /// the first of the client's that is in the list.
 let upgrade_with! : :map -> (:map -> :any) -> :map -> :map;
 let upgrade_with! config on_open! req = {
-    let key = http.header "sec-websocket-key" req;
-    let wants = str.lower (match http.header "upgrade" req { () => "", u => u });
-    let version = http.header "sec-websocket-version" req;
-    if key == () || wants != "websocket" || http.Request.method req != "GET" {
+    let key = Option.unwrap_or "" (http.header "sec-websocket-key" req);
+    let wants = str.lower (match http.header "upgrade" req { Option.none => "", Option.some(u) => u });
+    let version = Option.unwrap_or "" (http.header "sec-websocket-version" req);
+    if key == "" || wants != "websocket" || http.Request.method req != "GET" {
         http.bad_request "not a WebSocket handshake"
     } else if version != "13" {
         http.status_only 426 |> http.with_header "sec-websocket-version" "13"
     } else {
-        let offered = map str.trim (str.split "," (match http.header "sec-websocket-protocol" req { () => "", p => p }));
+        let offered = map str.trim (str.split "," (match http.header "sec-websocket-protocol" req { Option.none => "", Option.some(p) => p }));
         let chosen = match filter (fn p -> list.contains p (config.[:protocols else []])) offered { [] => (), [p, .._] => p };
         let resp = http.respond 101 ""
             |> http.with_header "upgrade" "websocket"
@@ -159,13 +159,13 @@ priv let open! config address = {
                 io.close! sock
                 raise! (error.new :handshake_refused ("the server answered " + start))
             }
-            if http.header "sec-websocket-accept" msg != accept_for key {
+            if http.header "sec-websocket-accept" msg != Option.some (accept_for key) {
                 io.close! sock
                 raise! (error.new :handshake_refused "the server's Sec-WebSocket-Accept is not the one the key calls for")
             }
             let me = self! ();
             let reader = spawn! $( read_loop! sock r :client me );
-            Socket.make sock :client me reader (http.header "sec-websocket-protocol" msg)
+            Socket.make sock :client me reader (Option.or_unit (http.header "sec-websocket-protocol" msg))
         },
     }
 };

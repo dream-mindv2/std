@@ -54,6 +54,10 @@ let merge a b = list.fold (fn m p -> m.[(list.nth 0 p) => (list.nth 1 p)]) a (_m
 /// ```
 let get : v -> k -> %{ k => v } -> v;
 let get default k m = m.[k else default];
+/// The value under `k`, or `none` when the key is absent. A key holding `()`
+/// is `Option.some(())`: absence is asked of the map, not read off the value.
+let lookup : k -> %{ k => v } -> Option v;
+let lookup k m = if _map_has m k { Option.some (m.[k]) } else { Option.none };
 /// Test whether the map contains key `k`.
 let has : k -> %{ k => v } -> :bool;
 let has k m = _map_has m k;
@@ -242,6 +246,8 @@ when test {
         test.case "a later pair wins"
             $( test.eq! 2 (get 0 :a (from_pairs [[:a, 1], [:a, 2]])) ),
         test.case "a missing key answers the default"  $( test.eq! 0 (get 0 :zz m) ),
+        test.case "lookup finds a key, a held (), and not a missing key"
+            $( test.eq! [Option.some 1, Option.some (), Option.none] [lookup :a m, lookup :u (put :u () m), lookup :zz m] ),
         test.case "size"                   $( test.eq! 2 (size m) ),
         test.case "is_empty"               $( test.true! (is_empty empty) ),
         test.case "sorted_keys"            $( test.eq! [:a, :b] (sorted_keys m) ),
