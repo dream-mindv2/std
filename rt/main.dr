@@ -63,7 +63,8 @@ let ctx_argc = 216;
 let ctx_argv = 224;
 let ctx_k512 = 232;
 let ctx_collections = 240;
-let ctx_size = 256;
+let ctx_ssl = 248;
+let ctx_size = 272;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -457,6 +458,8 @@ let init! () = {
     prim.store64! (p + ctx_table) (prim.c2! "calloc" table_grow word);
     prim.store64! (p + ctx_next_id) 1;
     init_handles! p;
+    // A peer that has gone is an error from the write, not the end of the program.
+    prim.c2! "signal" 13 1;
     make_current! p (new_pcb! p);
     p
 };
@@ -2562,7 +2565,7 @@ let math_floor! !p !v =
 // has no way to say it would block. A stream is non-blocking, and a process that finds
 // nothing to do parks until `poll` says otherwise.
 
-let handle_words = 2;
+let handle_words = 3;
 let kind_file_handle = 0;
 let kind_stream_handle = 1;
 let kind_listener_handle = 2;
@@ -2585,10 +2588,10 @@ let init_handles! !p = {
     prim.store64! (p + ctx_handle_count) 3;
     prim.store64! table 0;
     prim.store64! (table + word) kind_stream_handle;
-    prim.store64! (table + 2 * word) 1;
-    prim.store64! (table + 3 * word) kind_stream_handle;
-    prim.store64! (table + 4 * word) 2;
-    prim.store64! (table + 5 * word) kind_stream_handle;
+    prim.store64! (table + 3 * word) 1;
+    prim.store64! (table + 4 * word) kind_stream_handle;
+    prim.store64! (table + 6 * word) 2;
+    prim.store64! (table + 7 * word) kind_stream_handle;
     0
 };
 
@@ -2602,6 +2605,7 @@ let add_handle! !p !fd !kind = {
     let at = prim.load64! (p + ctx_handles) + id * handle_words * word;
     prim.store64! at fd;
     prim.store64! (at + word) kind;
+    prim.store64! (at + 2 * word) 0;
     prim.store64! (p + ctx_handle_count) (id + 1);
     tag_fix id
 };
@@ -2684,6 +2688,8 @@ let io_close! !p !h = {
     let fd = fd_of! p h;
     if fd < 0 { closed! p "this handle is already closed" }
     else {
+        let s = session_of! p h;
+        if s != 0 { tls_goodbye! p s fd; };
         prim.store64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word) (0 - 1);
         prim.c1! "close" fd;
         unit_word
@@ -2704,6 +2710,7 @@ let io_read_m! !p !sp !self_ !h !n !d = {
     if fd < 0 { closed! p "this handle is closed, or was never opened"; native_failed! p sp 0 0 0 0 }
     else if not (is_fix n) || untag_fix n < 0 { fail! p atom_type_error "read! needs a byte count"; native_failed! p sp 0 0 0 0 }
     else if n == tag_fix 0 { return! p sp (text_of! p "") }
+    else if session_of! p h != 0 { tls_read_m! p sp 0 h n 0 }
     else {
         let want = if untag_fix n > 16777216 { 16777216 } else { untag_fix n };
         let s = new_string! p want;
@@ -2724,6 +2731,7 @@ let io_write_m! !p !sp !self_ !h !s !d = {
     if fd < 0 { closed! p "this handle is closed, or was never opened"; native_failed! p sp 0 0 0 0 }
     else if not (is_string! s) { fail! p atom_type_error "write! needs a string"; native_failed! p sp 0 0 0 0 }
     else if string_len! s == 0 { return! p sp (tag_fix 0) }
+    else if session_of! p h != 0 { tls_write_m! p sp 0 h s 0 }
     else {
         let put = prim.c3! "write" fd (string_bytes s) (string_len! s);
         if put >= 0 { return! p sp (tag_fix put) }
@@ -3216,6 +3224,7 @@ let net_port! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" } el
 };
 
 let net_shutdown! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" } else {
+    if session_of! p h != 0 { tls_goodbye! p (session_of! p h) (fd_of! p h); };
     prim.c2! "shutdown" (fd_of! p h) 1;
     unit_word
 };
@@ -5122,3 +5131,554 @@ let module_of! !p !m !name = {
 };
 
 let module_name! !p !o = prim.load64! (o + 2 * word);
+
+// --- tls ----------------------------------------------------------------------------------------
+//
+// On a socket, upgraded in place: the handle stays and `read!`/`write!` on it carry plaintext.
+// The library is the system's OpenSSL, opened with `dlopen` the first time a program asks, so
+// a program that never does needs nothing, and no C++ is involved. It is driven from memory,
+// as dream/src/tls.hpp lays out: ciphertext goes in and out of BIOs, and the socket and parking
+// are what the rest of this file does for any stream. A C callback cannot be written in the
+// dialect, so the two OpenSSL wants are in the machine's text (`machine.tls_text`).
+//
+// What the VM's backend does that this does not: it reads a stapled OCSP response.
+
+let tls_handles_at = 2;
+
+let s_ssl = 0;
+let s_in = 8;
+let s_out = 16;
+let s_state = 24;
+let s_buf = 32;
+let s_buf_len = 40;
+let s_buf_off = 48;
+let s_eof = 56;
+let s_accepted = 64;
+let s_kind = 72;
+let s_message = 80;
+let s_server = 88;
+let s_bytes = 96;
+
+let tls_handshaking = 0;
+let tls_ready = 1;
+let tls_failed = 2;
+
+let session_of! !p !h = prim.load64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word + tls_handles_at * word);
+let set_session! !p !h !s = prim.store64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word + tls_handles_at * word) s;
+
+let open_first! !a !b !c = {
+    let one = prim.c2! "dlopen" a 258;
+    if one != 0 { one } else {
+        let two = prim.c2! "dlopen" b 258;
+        if two != 0 { two } else { prim.c2! "dlopen" c 258 }
+    }
+};
+
+/// The library's handle, opened once, or 0.
+let ssl_lib! !p = {
+    let have = prim.load64! (p + ctx_ssl);
+    if have != 0 { have } else {
+        // Where a system keeps it is the system's business, except where it is not on the
+        // loader's path at all, which `DREAM_OPENSSL_LIB` is for.
+        let named = prim.c1! "getenv" "DREAM_OPENSSL_LIB";
+        let h = if named != 0 { prim.c2! "dlopen" named 258 } else { open_first! "libssl.so.3" "libssl.so.1.1" "libssl.so" };
+        prim.store64! (p + ctx_ssl) h;
+        if h != 0 {
+            prim.store64! (prim.info "tls_get_error") (prim.c2! "dlsym" h "X509_STORE_CTX_get_error");
+            prim.store64! (prim.info "tls_set_error") (prim.c2! "dlsym" h "X509_STORE_CTX_set_error");
+            prim.store64! (prim.info "tls_next_proto") (prim.c2! "dlsym" h "SSL_select_next_proto");
+        };
+        h
+    }
+};
+
+let sym! !p name = prim.c2! "dlsym" (prim.load64! (p + ctx_ssl)) name;
+
+let last_ssl_error! !p fallback = {
+    let code = prim.ptr0! (sym! p "ERR_get_error");
+    if code == 0 { text_of! p fallback } else {
+        let buf = alloc! p 256;
+        prim.ptr3! (sym! p "ERR_error_string_n") code buf 256;
+        c_text! p buf
+    }
+};
+
+let clear_ssl_errors! !p = prim.ptr0! (sym! p "ERR_clear_error");
+
+let new_mem_bio! !p = prim.ptr1! (sym! p "BIO_new") (prim.ptr0! (sym! p "BIO_s_mem"));
+
+let bio_of_string! !p !s = prim.ptr2! (sym! p "BIO_new_mem_buf") (string_bytes s) (string_len! s);
+
+let load_ca_certs! !p !store !bio !count = {
+    let cert = prim.ptr4! (sym! p "PEM_read_bio_X509") bio 0 0 0;
+    if cert == 0 { count } else {
+        prim.ptr2! (sym! p "X509_STORE_add_cert") store cert;
+        prim.ptr1! (sym! p "X509_free") cert;
+        load_ca_certs! p store bio (count + 1)
+    }
+};
+
+let tls_config_fail! !p s = fail! p (prim.atom "tls_config") s;
+
+let load_ca! !p !ctx !pem = {
+    let store = prim.ptr0! (sym! p "X509_STORE_new");
+    let bio = bio_of_string! p pem;
+    let count = load_ca_certs! p store bio 0;
+    prim.ptr1! (sym! p "BIO_free") bio;
+    clear_ssl_errors! p;
+    if count == 0 {
+        prim.ptr1! (sym! p "X509_STORE_free") store;
+        tls_config_fail! p "`ca` holds no PEM certificate"
+    } else {
+        prim.ptr2! (sym! p "SSL_CTX_set_cert_store") ctx store;
+        1
+    }
+};
+
+let load_crl_entries! !p !store !bio !count = {
+    let crl = prim.ptr4! (sym! p "PEM_read_bio_X509_CRL") bio 0 0 0;
+    if crl == 0 { count } else {
+        prim.ptr2! (sym! p "X509_STORE_add_crl") store crl;
+        prim.ptr1! (sym! p "X509_CRL_free") crl;
+        load_crl_entries! p store bio (count + 1)
+    }
+};
+
+let load_crls! !p !ctx !pem = {
+    let store = prim.ptr1! (sym! p "SSL_CTX_get_cert_store") ctx;
+    let bio = bio_of_string! p pem;
+    let count = load_crl_entries! p store bio 0;
+    prim.ptr1! (sym! p "BIO_free") bio;
+    clear_ssl_errors! p;
+    if count == 0 { tls_config_fail! p "`crl` holds no PEM certificate revocation list" }
+    else {
+        prim.ptr2! (sym! p "X509_STORE_set_flags") store 4;
+        1
+    }
+};
+
+let add_chain! !p !ctx !chain !i !n = if i >= n { 1 } else {
+    let cert = prim.ptr2! (sym! p "OPENSSL_sk_value") chain i;
+    if prim.sext32 (prim.ptr4! (sym! p "SSL_CTX_ctrl") ctx 89 1 cert) != 1 { 0 }
+    else { add_chain! p ctx chain (i + 1) n }
+};
+
+let load_identity! !p !ctx !bundle_bytes !password = {
+    let bio = bio_of_string! p bundle_bytes;
+    let bundle = prim.ptr2! (sym! p "d2i_PKCS12_bio") bio 0;
+    prim.ptr1! (sym! p "BIO_free") bio;
+    if bundle == 0 {
+        fail_value! p (prim.atom "tls_config") (concat2! p (text_of! p "`identity` is not a PKCS#12 bundle: ") (last_ssl_error! p "unreadable"))
+    } else {
+        let out = alloc! p (3 * word);
+        zero_words! out 3;
+        let parsed = prim.sext32 (prim.ptr5! (sym! p "PKCS12_parse") bundle (string_bytes password) out (out + word) (out + 2 * word)) == 1;
+        prim.ptr1! (sym! p "PKCS12_free") bundle;
+        let key = prim.load64! out;
+        let cert = prim.load64! (out + word);
+        let chain = prim.load64! (out + 2 * word);
+        if not parsed || key == 0 || cert == 0 {
+            fail_value! p (prim.atom "tls_config") (concat2! p (text_of! p "cannot open the PKCS#12 identity (is the password right?): ") (last_ssl_error! p "no key or certificate in it"))
+        } else {
+            let used = prim.sext32 (prim.ptr2! (sym! p "SSL_CTX_use_certificate") ctx cert) == 1
+                && prim.sext32 (prim.ptr2! (sym! p "SSL_CTX_use_PrivateKey") ctx key) == 1
+                && prim.sext32 (prim.ptr1! (sym! p "SSL_CTX_check_private_key") ctx) == 1
+                && (chain == 0 || add_chain! p ctx chain 0 (prim.sext32 (prim.ptr1! (sym! p "OPENSSL_sk_num") chain)) == 1);
+            if used { 1 } else {
+                fail_value! p (prim.atom "tls_config") (concat2! p (text_of! p "cannot use the PKCS#12 identity: ") (last_ssl_error! p "rejected"))
+            }
+        }
+    }
+};
+
+/// The wire form of the protocols, kept for as long as the program runs: a server's context
+/// holds on to it, and nothing here frees a context either.
+let malloc_copy! !s = {
+    let n = string_len! s;
+    let at = prim.c1! "malloc" (n + word + 1);
+    prim.store64! at n;
+    prim.c3! "memcpy" (at + word) (string_bytes s) n;
+    at
+};
+
+/// `config` is `[host, ca, crl, identity, password, verify, check_name, alpn]`: strings or
+/// unit, two booleans, and the protocols already in wire form, or unit.
+let cfg! !c !i = prim.load64! (c + (2 + i) * word);
+
+let new_context! !p !server !c = {
+    let method_ = if server { prim.ptr0! (sym! p "TLS_server_method") } else { prim.ptr0! (sym! p "TLS_client_method") };
+    let ctx = prim.ptr1! (sym! p "SSL_CTX_new") method_;
+    if ctx == 0 { fail_value! p (prim.atom "tls_error") (last_ssl_error! p "SSL_CTX_new failed") }
+    else {
+        // TLS 1.2 is the oldest spoken: SSL_CTX_set_min_proto_version, a macro in C.
+        prim.ptr4! (sym! p "SSL_CTX_ctrl") ctx 123 771 0;
+        let roots_ok =
+            if cfg! c 1 != unit_word { load_ca! p ctx (cfg! c 1) }
+            else if server { 1 }
+            else if prim.sext32 (prim.ptr1! (sym! p "SSL_CTX_set_default_verify_paths") ctx) != 1 {
+                fail_value! p (prim.atom "tls_config") (concat2! p (text_of! p "cannot load the system's trusted certificates: ") (last_ssl_error! p "no default paths"))
+            } else { 1 };
+        if roots_ok == 0 { 0 }
+        else if cfg! c 2 != unit_word && load_crls! p ctx (cfg! c 2) == 0 { 0 }
+        else if cfg! c 3 != unit_word && load_identity! p ctx (cfg! c 3) (if cfg! c 4 == unit_word { text_of! p "" } else { cfg! c 4 }) == 0 { 0 }
+        else {
+            if server && cfg! c 7 != unit_word {
+                prim.ptr3! (sym! p "SSL_CTX_set_alpn_select_cb") ctx (prim.info "alpn_stub") (malloc_copy! (cfg! c 7));
+            };
+            ctx
+        }
+    }
+};
+
+let client_identity! !p !ssl !c = {
+    let host = cfg! c 0;
+    let verify = cfg! c 5 == true_word;
+    let check_name = cfg! c 6 == true_word;
+    if host != unit_word {
+        let param = prim.ptr1! (sym! p "SSL_get0_param") ssl;
+        let address = prim.sext32 (prim.ptr2! (sym! p "X509_VERIFY_PARAM_set1_ip_asc") param (string_bytes host)) == 1;
+        clear_ssl_errors! p;
+        if address && not check_name { prim.ptr3! (sym! p "X509_VERIFY_PARAM_set1_ip") param 0 0; };
+        if not address {
+            // SSL_set_tlsext_host_name, a macro in C.
+            prim.ptr4! (sym! p "SSL_ctrl") ssl 55 0 (string_bytes host);
+            if check_name { prim.ptr2! (sym! p "SSL_set1_host") ssl (string_bytes host); };
+        };
+    };
+    prim.ptr3! (sym! p "SSL_set_verify") ssl (if verify { 1 } else { 0 }) (prim.info "verify_stub");
+    if cfg! c 7 != unit_word {
+        prim.ptr3! (sym! p "SSL_set_alpn_protos") ssl (string_bytes (cfg! c 7)) (string_len! (cfg! c 7));
+    };
+    1
+};
+
+/// A session on this handle, its handshake not begun. 0 with the reason in the context.
+let tls_start! !p !h !server !c = {
+    if fd_of! p h < 0 { closed! p "this handle is closed" }
+    else if handle_kind! p h != kind_stream_handle {
+        fail! p (prim.atom "wrong_kind") (if server == true_word { "tls.accept! needs an accepted connection" } else { "tls.connect! needs a connected socket" })
+    }
+    else if session_of! p h != 0 { h }
+    else if ssl_lib! p == 0 { fail! p (prim.atom "tls_error") "no OpenSSL could be opened on this system (libssl.so.3)" }
+    else {
+        let is_server = server == true_word;
+        let ctx = new_context! p is_server c;
+        if ctx == 0 { 0 } else {
+            let ssl = prim.ptr1! (sym! p "SSL_new") ctx;
+            let s = prim.c2! "calloc" 1 s_bytes;
+            let in_ = new_mem_bio! p;
+            let out = new_mem_bio! p;
+            // BIO_set_mem_eof_return: an empty BIO says "not yet", not "the end".
+            prim.ptr4! (sym! p "BIO_ctrl") in_ 130 (0 - 1) 0;
+            prim.ptr3! (sym! p "SSL_set_bio") ssl in_ out;
+            prim.store64! (s + s_ssl) ssl;
+            prim.store64! (s + s_in) in_;
+            prim.store64! (s + s_out) out;
+            prim.store64! (s + s_server) (if is_server { 1 } else { 0 });
+            if is_server {
+                prim.ptr1! (sym! p "SSL_set_accept_state") ssl;
+                if cfg! c 5 == true_word && cfg! c 1 != unit_word {
+                    prim.ptr3! (sym! p "SSL_set_verify") ssl 3 (prim.info "verify_stub");
+                };
+            } else {
+                prim.ptr1! (sym! p "SSL_set_connect_state") ssl;
+                client_identity! p ssl c;
+            };
+            set_session! p h s;
+            h
+        }
+    }
+};
+
+/// What OpenSSL has written, moved to the session's buffer of what the socket has not taken.
+let take_output! !p !s = {
+    let buf = alloc! p 16384;
+    let n = prim.sext32 (prim.ptr3! (sym! p "BIO_read") (prim.load64! (s + s_out)) buf 16384);
+    if n <= 0 { 0 } else {
+        let off = prim.load64! (s + s_buf_off);
+        let len = prim.load64! (s + s_buf_len);
+        let keep = len - off;
+        let old = prim.load64! (s + s_buf);
+        let grown = prim.c1! "malloc" (keep + n + 1);
+        if keep > 0 { prim.c3! "memcpy" grown (old + off) keep; };
+        prim.c3! "memcpy" (grown + keep) buf n;
+        if old != 0 { prim.c1! "free" old; };
+        prim.store64! (s + s_buf) grown;
+        prim.store64! (s + s_buf_off) 0;
+        prim.store64! (s + s_buf_len) (keep + n);
+        take_output! p s
+    }
+};
+
+/// 0 all sent, 1 the socket is full, 2 it failed.
+let flush_tls! !p !s !fd = {
+    let off = prim.load64! (s + s_buf_off);
+    let len = prim.load64! (s + s_buf_len);
+    if off >= len { 0 } else {
+        let put = prim.c3! "write" fd (prim.load64! (s + s_buf) + off) (len - off);
+        if put > 0 {
+            prim.store64! (s + s_buf_off) (off + put);
+            flush_tls! p s fd
+        }
+        else {
+            let e = errno! ();
+            if e == 11 { 1 } else if e == 4 { flush_tls! p s fd } else { 2 }
+        }
+    }
+};
+
+/// 0 something came in, 1 nothing yet, 2 it failed.
+let pull_tls! !p !s !fd = {
+    let buf = alloc! p 16384;
+    let got = prim.c3! "read" fd buf 16384;
+    if got > 0 {
+        prim.ptr3! (sym! p "BIO_write") (prim.load64! (s + s_in)) buf got;
+        0
+    } else if got == 0 {
+        prim.store64! (s + s_eof) 1;
+        prim.ptr4! (sym! p "BIO_ctrl") (prim.load64! (s + s_in)) 130 0 0;
+        0
+    } else {
+        let e = errno! ();
+        if e == 11 { 1 } else if e == 4 { pull_tls! p s fd } else { 2 }
+    }
+};
+
+let session_failed! !p !s !fd !kind !message = {
+    prim.store64! (s + s_state) tls_failed;
+    prim.store64! (s + s_kind) kind;
+    prim.store64! (s + s_message) (malloc_copy! message);
+    take_output! p s;
+    flush_tls! p s fd;
+    prim.c2! "shutdown" fd 1;
+    fail_value! p kind message
+};
+
+let refused! !p !s = {
+    let m = prim.load64! (s + s_message);
+    if prim.load64! (s + s_state) == tls_handshaking { fail! p (prim.atom "tls_error") "this connection's TLS handshake has not finished" }
+    else {
+        let text = new_string! p (prim.load64! m);
+        prim.c3! "memcpy" (string_bytes text) (m + word) (prim.load64! m);
+        fail_value! p (prim.load64! (s + s_kind)) (concat2! p (text_of! p "TLS on this connection already failed: ") text)
+    }
+};
+
+let verify_failed! !p !s !fd !code = {
+    let why = c_text! p (prim.ptr1! (sym! p "X509_verify_cert_error_string") code);
+    if code == 62 || code == 64 { session_failed! p s fd (prim.atom "hostname_mismatch") (concat2! p (text_of! p "the certificate is not for this host: ") why) }
+    else if code == 23 { session_failed! p s fd (prim.atom "certificate_revoked") (concat2! p (text_of! p "the certificate has been revoked: ") why) }
+    else if code == 10 || code == 9 { session_failed! p s fd (prim.atom "certificate_expired") (concat2! p (text_of! p "the certificate is outside its validity period: ") why) }
+    else { session_failed! p s fd (prim.atom "certificate_untrusted") (concat2! p (text_of! p "the certificate is not trusted: ") why) }
+};
+
+/// What an OpenSSL call that did not succeed comes to: 2 wants more of the network, 3 the
+/// peer closed, and 0 failed with the reason in the context.
+let ssl_outcome! !p !s !fd !r !handshaking = {
+    let err = prim.sext32 (prim.ptr2! (sym! p "SSL_get_error") (prim.load64! (s + s_ssl)) r);
+    if err == 2 || err == 3 { 2 }
+    else if err == 6 { 3 }
+    else if err == 1 || err == 5 {
+        let verify = if handshaking { prim.ptr1! (sym! p "SSL_get_verify_result") (prim.load64! (s + s_ssl)) } else { 0 };
+        if handshaking && verify != 0 { verify_failed! p s fd verify }
+        else {
+            let code = prim.ptr0! (sym! p "ERR_peek_error");
+            if not handshaking && code == 0 { 3 }
+            else if handshaking && code == 0 {
+                session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the peer closed the connection during the handshake")
+            }
+            else if handshaking {
+                session_failed! p s fd (prim.atom "handshake_failed") (last_ssl_error! p "TLS failed")
+            }
+            else { session_failed! p s fd (prim.atom "tls_error") (last_ssl_error! p "TLS failed") }
+        }
+    }
+    else { session_failed! p s fd (prim.atom "tls_error") (text_of! p "an unexpected TLS state") }
+};
+
+let tls_handshake_m! !p !sp !self_ !h !c !d = {
+    let fd = fd_of! p h;
+    let s = session_of! p h;
+    if fd < 0 || s == 0 { closed! p "this handle is closed"; native_failed! p sp 0 0 0 0 }
+    else if prim.load64! (s + s_state) == tls_failed { refused! p s; native_failed! p sp 0 0 0 0 }
+    else {
+        let flushed = flush_tls! p s fd;
+        if flushed == 1 {
+            prim.store64! (current! p + pcb_wait_write) 1;
+            wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
+        }
+        else if flushed == 2 {
+            session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the connection failed");
+            native_failed! p sp 0 0 0 0
+        }
+        else if prim.load64! (s + s_state) == tls_ready { return! p sp h }
+        else {
+            clear_ssl_errors! p;
+            let r = prim.sext32 (prim.ptr1! (sym! p "SSL_do_handshake") (prim.load64! (s + s_ssl)));
+            take_output! p s;
+            if r == 1 {
+                prim.store64! (s + s_state) tls_ready;
+                tls_handshake_m! p sp 0 h 0 0
+            } else {
+                let o = ssl_outcome! p s fd r true;
+                if o == 0 { native_failed! p sp 0 0 0 0 }
+                else if o == 3 {
+                    session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the peer closed the connection during the handshake");
+                    native_failed! p sp 0 0 0 0
+                }
+                else {
+                    let more = flush_tls! p s fd;
+                    if more == 1 {
+                        prim.store64! (current! p + pcb_wait_write) 1;
+                        wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
+                    }
+                    else {
+                        let pulled = pull_tls! p s fd;
+                        if pulled == 1 { wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd }
+                        else if pulled == 2 {
+                            session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the connection failed");
+                            native_failed! p sp 0 0 0 0
+                        }
+                        else { tls_handshake_m! p sp 0 h 0 0 }
+                    }
+                }
+            }
+        }
+    }
+};
+
+let tls_read_m! !p !sp !self_ !h !n !d = {
+    let fd = fd_of! p h;
+    let s = session_of! p h;
+    if prim.load64! (s + s_state) != tls_ready { refused! p s; native_failed! p sp 0 0 0 0 }
+    else {
+        let flushed = flush_tls! p s fd;
+        if flushed == 1 {
+            prim.store64! (current! p + pcb_wait_write) 1;
+            wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd
+        }
+        else if flushed == 2 { fail_errno! p (text_of! p "write"); native_failed! p sp 0 0 0 0 }
+        else {
+            let want = if untag_fix n > 16777216 { 16777216 } else { untag_fix n };
+            let out = new_string! p want;
+            let got = alloc! p word;
+            clear_ssl_errors! p;
+            let r = prim.sext32 (prim.ptr4! (sym! p "SSL_read_ex") (prim.load64! (s + s_ssl)) (string_bytes out) want got);
+            take_output! p s;
+            if r == 1 {
+                let count = prim.load64! got;
+                prim.store64! (out + word) count;
+                prim.store8! (string_bytes out + count) 0;
+                return! p sp out
+            } else {
+                let o = ssl_outcome! p s fd 0 false;
+                if o == 0 { native_failed! p sp 0 0 0 0 }
+                else if o == 3 || prim.load64! (s + s_eof) != 0 { return! p sp (text_of! p "") }
+                else {
+                    let more = flush_tls! p s fd;
+                    if more == 1 {
+                        prim.store64! (current! p + pcb_wait_write) 1;
+                        wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd
+                    }
+                    else {
+                        let pulled = pull_tls! p s fd;
+                        if pulled == 1 { wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd }
+                        else if pulled == 2 { fail_errno! p (text_of! p "read"); native_failed! p sp 0 0 0 0 }
+                        else { tls_read_m! p sp 0 h n 0 }
+                    }
+                }
+            }
+        }
+    }
+};
+
+let tls_write_m! !p !sp !self_ !h !text !d = {
+    let fd = fd_of! p h;
+    let s = session_of! p h;
+    if prim.load64! (s + s_state) != tls_ready { refused! p s; native_failed! p sp 0 0 0 0 }
+    else {
+        let flushed = flush_tls! p s fd;
+        if flushed == 1 {
+            prim.store64! (current! p + pcb_wait_write) 1;
+            wait_fd! p sp (prim.load64! (prim.info "m_write")) h text fd
+        }
+        else if flushed == 2 { fail_errno! p (text_of! p "write"); native_failed! p sp 0 0 0 0 }
+        else if prim.load64! (s + s_accepted) != 0 {
+            let n = prim.load64! (s + s_accepted);
+            prim.store64! (s + s_accepted) 0;
+            return! p sp (tag_fix n)
+        }
+        else {
+            let take = if string_len! text > 65536 { 65536 } else { string_len! text };
+            let done = alloc! p word;
+            clear_ssl_errors! p;
+            let r = prim.sext32 (prim.ptr4! (sym! p "SSL_write_ex") (prim.load64! (s + s_ssl)) (string_bytes text) take done);
+            take_output! p s;
+            if r != 1 && take != 0 {
+                let o = ssl_outcome! p s fd 0 false;
+                if o == 0 { native_failed! p sp 0 0 0 0 }
+                else { fail! p (prim.atom "connection_lost") "the connection closed during a write"; native_failed! p sp 0 0 0 0 }
+            } else {
+                prim.store64! (s + s_accepted) take;
+                if take == 0 { prim.store64! (s + s_accepted) 0; return! p sp (tag_fix 0) }
+                else { tls_write_m! p sp 0 h text 0 }
+            }
+        }
+    }
+};
+
+/// The close alert, sent if it can be without waiting.
+let tls_goodbye! !p !s !fd = if prim.load64! (s + s_state) == tls_ready {
+    clear_ssl_errors! p;
+    prim.ptr1! (sym! p "SSL_shutdown") (prim.load64! (s + s_ssl));
+    clear_ssl_errors! p;
+    take_output! p s;
+    flush_tls! p s fd;
+    0
+} else { 0 };
+
+let tls_text_of! !p !at = if at == 0 { unit_word } else { c_text! p at };
+
+/// `[version, cipher, alpn, peer]`, the library making a map of it.
+let tls_info_parts! !p !h = {
+    if fd_of! p h < 0 { closed! p "this handle is closed" }
+    else {
+        let s = session_of! p h;
+        if s == 0 { unit_word } else {
+            let ssl = prim.load64! (s + s_ssl);
+            let version = tls_text_of! p (prim.ptr1! (sym! p "SSL_get_version") ssl);
+            let cipher_at = prim.ptr1! (sym! p "SSL_get_current_cipher") ssl;
+            let cipher = if cipher_at == 0 { unit_word } else { tls_text_of! p (prim.ptr1! (sym! p "SSL_CIPHER_get_name") cipher_at) };
+            let alpn_at = alloc! p (2 * word);
+            zero_words! alpn_at 2;
+            prim.ptr3! (sym! p "SSL_get0_alpn_selected") ssl alpn_at (alpn_at + word);
+            let alpn_bytes = prim.load64! alpn_at;
+            let alpn = if alpn_bytes == 0 { unit_word } else {
+                let n = prim.load32! (alpn_at + word);
+                let t = new_string! p n;
+                prim.c3! "memcpy" (string_bytes t) alpn_bytes n;
+                t
+            };
+            let getter = sym! p "SSL_get1_peer_certificate";
+            let peer_cert = prim.ptr1! (if getter != 0 { getter } else { sym! p "SSL_get_peer_certificate" }) ssl;
+            let peer = if peer_cert == 0 { unit_word } else {
+                let bio = new_mem_bio! p;
+                prim.ptr4! (sym! p "X509_NAME_print_ex") bio (prim.ptr1! (sym! p "X509_get_subject_name") peer_cert) 0 17892119;
+                let text = alloc! p word;
+                prim.store64! text 0;
+                let n = prim.ptr4! (sym! p "BIO_ctrl") bio 3 0 text;
+                let t = new_string! p n;
+                if n > 0 { prim.c3! "memcpy" (string_bytes t) (prim.load64! text) n; };
+                prim.ptr1! (sym! p "BIO_free") bio;
+                prim.ptr1! (sym! p "X509_free") peer_cert;
+                t
+            };
+            new_cons! p version (new_cons! p cipher (new_cons! p alpn (new_cons! p peer nil_word)))
+        }
+    }
+};
+
+let tls_backend! !p !unit = {
+    if ssl_lib! p == 0 { text_of! p "no OpenSSL could be opened" }
+    else { c_text! p (prim.ptr1! (sym! p "OpenSSL_version") 0) }
+};

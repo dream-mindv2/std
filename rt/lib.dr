@@ -1363,3 +1363,68 @@ let table_lines table !at prefix = {
         } else { rest }
     }
 };
+
+// --- tls, what a map of options is -------------------------------------------------------------
+
+let string_option m key what = match native.match_key m key {
+    [] => (),
+    [v] => match type_of v {
+        :string => v,
+        :unit => (),
+        _ => lib_raise (native.error_new :bad_argument what),
+    },
+};
+
+let bool_option m key fallback what = match native.match_key m key {
+    [] => fallback,
+    [v] => if type_of v == :bool { v } else { lib_raise (native.error_new :bad_argument what) },
+};
+
+let alpn_wire xs = match xs {
+    [] => "",
+    [n, ..rest] => {
+        if type_of n != :string { lib_raise (native.error_new :bad_argument "`:alpn` is a list of protocol names") }
+        else if native.size n == 0 || native.size n > 255 { alpn_wire rest }
+        else { native.concat3 (le_field (native.size n) 1) n (alpn_wire rest) }
+    },
+};
+
+let tls_config options server = {
+    let m = match type_of options {
+        :unit => native.map_empty (),
+        :map => options,
+        _ => lib_raise (native.error_new :bad_argument "the options are a map, such as %{ :host => \"example.com\" }"),
+    };
+    let host = string_option m :host "`:host` is a string";
+    let verify = bool_option m :verify (not server) "`:verify` is true or false";
+    let check_name = bool_option m :check_name true "`:check_name` is true or false";
+    let identity = string_option m :identity "`:identity` is a string holding a PKCS#12 bundle";
+    let alpn = match native.match_key m :alpn {
+        [] => (),
+        [xs] => if type_of xs == :list { alpn_wire xs } else { lib_raise (native.error_new :bad_argument "`:alpn` is a list of protocol names") },
+    };
+    if not server && verify && check_name && type_of host != :string {
+        lib_raise (native.error_new :bad_argument "a client that verifies needs `:host`, the name the certificate must carry; `:check_name => false` checks the chain alone, and `:verify => false` checks nothing")
+    }
+    else if server && type_of identity != :string {
+        lib_raise (native.error_new :bad_argument "a server needs `:identity`, a PKCS#12 bundle of its certificate and key")
+    }
+    else {
+        forced_array [host, string_option m :ca "`:ca` is a string of PEM certificates",
+                      string_option m :crl "`:crl` is a string of PEM revocation lists", identity,
+                      string_option m :password "`:password` is a string", verify, check_name, alpn]
+    }
+};
+
+let tls_upgrade! h options server = {
+    let handle = native.tls_start h server (tls_config options server);
+    native.tls_handshake_m handle
+};
+
+let tls_connect! h options = tls_upgrade! h options false;
+let tls_accept! h options = tls_upgrade! h options true;
+
+let tls_info! h = match native.tls_info_parts h {
+    () => (),
+    [version, cipher, alpn, peer] => %{:version => version, :cipher => cipher, :alpn => alpn, :peer => peer},
+};
