@@ -151,7 +151,7 @@ adopts numbered SQL from elsewhere as a fragment.
 | `query! conn q` | a `Reply`: `rows`, `tuples`, `columns`, `command`, `count`, `status`, `notices`, `notifications` |
 | `rows! conn q` | the rows, as maps |
 | `one! conn q` | the one row; `:no_rows` or `:too_many_rows` otherwise |
-| `first! conn q` | the first row, or `()` |
+| `first! conn q` | the first row, `Option.some row`, or `Option.none` |
 | `scalar! conn q` | the first column of the first row, or `()` |
 | `column! conn q` | the first column of every row |
 | `exec! conn q` | the number of rows affected |

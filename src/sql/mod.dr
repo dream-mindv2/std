@@ -1687,9 +1687,9 @@ let column_key name = match atom.existing name { Option.none => name, Option.som
 let query_as! : :any -> Connection -> Runnable -> [Row];
 let query_as! description c x = map (fn row -> types.check description row) (query! c x);
 
-/// The first row, or `()`.
-let first! : Connection -> Runnable -> (Row | :unit);
-let first! c x = list.first_or () (query! c x);
+/// The first row, or `none` when there are no rows.
+let first! : Connection -> Runnable -> Option Row;
+let first! c x = match query! c x { [] => Option.none, [row, .._] => Option.some row };
 
 /// The only row. Raises unless there is exactly one.
 let one! : Connection -> Runnable -> Row;
@@ -1862,6 +1862,78 @@ let rec retrying! c attempts options work = {
 let serializable! : Connection -> :integer -> (Connection -> a) -> a;
 let serializable! c attempts work =
     retrying! c attempts (Transaction.new () |> Transaction.set_isolation :serializable) work;
+
+// --- refusals as answers ------------------------------------------------------------
+//
+// Everything above raises a database's refusal, because most of the time one
+// is a mistake to stop at: a statement written wrong, a table that is not
+// there. Some refusals are answers the program expects -- an insert that may
+// meet a duplicate key, a value a CHECK may refuse, a server that may be down
+// -- and for those each has a `try_` form that answers a `Result`: `ok` with
+// what the plain form answers, `error` with the same `:sql_error` it would
+// have raised, so `error_code` still says `:unique` or `:connection_lost`.
+//
+//     match sql.try_exec! db (sql.insert_into "users" |> sql.values u) {
+//         Result.ok(_) => :created,
+//         Result.error(e) => if sql.error_code e == :unique { :taken } else { raise! e },
+//     }
+//
+// Only a refusal is answered. Anything else raised on the way -- a bug in the
+// program's own code inside a transaction, a library that would not load --
+// is raised still: a `Result` whose error might be either is one a caller can
+// only re-raise.
+
+/// `work! ()`, forced all the way down before it answers, or `Result.error e`
+/// for a database's refusal (`is_sql_error`); any other failure is raised
+/// again. The answer is forced inside the `try!` for the reason
+/// `transaction!` forces its own: a lazy answer would run its statements
+/// after this had stopped catching what they raise.
+let attempt! : (:unit -> a) -> Result a :error;
+let attempt! work! = try! {
+    let v = work! ();
+    strict! v
+    Result.ok v
+} catch e { if is_sql_error e { Result.error e } else { raise! e } };
+
+/// `exec!`, its refusal answered.
+let try_exec! : Connection -> Runnable -> Result %{ :atom => :any } :error;
+let try_exec! c x = attempt! (fn () -> exec! c x);
+
+/// `query!`, its refusal answered.
+let try_query! : Connection -> Runnable -> Result [Row] :error;
+let try_query! c x = attempt! (fn () -> query! c x);
+
+/// `first!`, its refusal answered: no rows is `Result.ok Option.none`, which
+/// is an answer, not a refusal.
+let try_first! : Connection -> Runnable -> Result (Option Row) :error;
+let try_first! c x = attempt! (fn () -> first! c x);
+
+/// `one!`, its refusal answered -- and finding none or several is one, code
+/// `:not_one`, as `one!` raises it.
+let try_one! : Connection -> Runnable -> Result Row :error;
+let try_one! c x = attempt! (fn () -> one! c x);
+
+/// `scalar!`, its refusal answered.
+let try_scalar! : Connection -> Runnable -> Result :any :error;
+let try_scalar! c x = attempt! (fn () -> scalar! c x);
+
+/// `column!`, its refusal answered.
+let try_column! : Connection -> Runnable -> Result [:any] :error;
+let try_column! c x = attempt! (fn () -> column! c x);
+
+/// `exec_many!`, its refusal answered. The statements before the refused one
+/// have run; inside `try_transaction!` they are undone with it.
+let try_exec_many! : Connection -> [Runnable] -> Result :integer :error;
+let try_exec_many! c xs = attempt! (fn () -> exec_many! c xs);
+
+/// `script!`, its refusal answered.
+let try_script! : Connection -> Script -> Result :unit :error;
+let try_script! c text = attempt! (fn () -> script! c text);
+
+/// `transaction!`, a refusal anywhere in it -- in `work`, or the commit
+/// itself -- answered once the transaction is rolled back.
+let try_transaction! : Connection -> (Connection -> a) -> Result a :error;
+let try_transaction! c work = attempt! (fn () -> transaction! c work);
 
 // --- streaming ----------------------------------------------------------------
 //

@@ -7,7 +7,7 @@
 //     let train2 = data.scale_x scaler train;
 //     data.batches 32 (data.shuffle 1 train2)           // a list of batches
 //
-//     let ds = data.of_csv! "iris.csv" %{ :target => 4 } // the fifth column is y
+//     let? ds = data.of_csv! "iris.csv" %{ :target => 4 }; // the fifth column is y
 //
 // **A dataset is two tensors with a row per example** (`Dataset`): `x`, the
 // inputs, and `y`, the targets -- a class per example, rows of
@@ -177,14 +177,12 @@ let scale_y s ds = Dataset.set_y (scale s (y ds)) ds;
 
 /// The rows of a CSV file of numbers, as lists of floats. A first line that
 /// is not numbers is taken as a header and skipped, as are blank lines. A
-/// field that is not a number raises, naming its line.
-let read_csv! : :string -> [[:float]];
+/// file that cannot be read, or a field that is not a number, is
+/// `Result.error why`, which names the file and the line.
+let read_csv! : :string -> Result [[:float]] :string;
 let read_csv! path = match file.read! path {
-    Option.none => raise! ("cannot read " + path),
-    Option.some(text) => match parse_csv text {
-        Result.ok(table) => table,
-        Result.error(why) => raise! (path + ": " + why),
-    },
+    Option.none => err ("cannot read " + path),
+    Option.some(text) => Result.map_error (fn why -> path + ": " + why) (parse_csv text),
 };
 
 /// The rows of CSV text, as `read_csv!` reads a file: `Result.ok rows`, or
@@ -225,9 +223,10 @@ mapping Csv {
     target : :integer = -1
 }
 
-/// A dataset from a CSV file of numbers, split as `opts` says (`Csv`).
-let of_csv! : :string -> Csv -> Dataset;
-let of_csv! path opts = of_rows (read_csv! path) (Csv.target opts);
+/// A dataset from a CSV file of numbers, split as `opts` says (`Csv`), or why
+/// the file could not be read as one.
+let of_csv! : :string -> Csv -> Result Dataset :string;
+let of_csv! path opts = Result.map (fn rows -> of_rows rows (Csv.target opts)) (read_csv! path);
 
 /// A dataset from rows of numbers, column `target` the target.
 let of_rows : [[:float]] -> :integer -> Dataset;
@@ -302,6 +301,8 @@ when test {
         test.case "minmax reaches 0 and 1" $( test.eq! [0.0, 1.0] ({ let s = scale (fit_minmax (x ds)) (x ds); [tensor.minimum s, tensor.maximum s] }) ),
         test.case "csv with a header" $( test.eq! (ok [[1.0, 2.0], [3.5, -4.0]]) (parse_csv "a,b\n1,2\n\n3.5, -4\n") ),
         test.case "a bad field names its line" $( test.eq! (err "line 3 has a field that is not a number") (parse_csv "a,b\n1,2\n3,x\n") ),
+        test.case "a file that is not there is an answer, naming it"
+            $( test.eq! (err "cannot read /nonexistent-dream/x.csv") (read_csv! "/nonexistent-dream/x.csv") ),
         test.case "csv rows to a dataset"
             $( test.eq! [[2, 1], [2]] ({ let d = of_rows [[1.0, 9.0], [2.0, 8.0]] 0; [tensor.shape (x d), tensor.shape (y d)] }) ),
         test.case "spirals" $( test.eq! [[300, 2], 3] ({ let d = spirals 1 100 3; [tensor.shape (x d), class_count d] }) ),

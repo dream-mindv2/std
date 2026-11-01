@@ -469,17 +469,16 @@ priv let int_of : :string -> :integer;
 priv let int_of text = match num.parse_int text { Option.none => 0, Option.some(n) => n };
 
 /// The tree `save!` wrote to `path`, its tensors on the host. Lists come back
-/// as lists and maps as maps; an array written comes back a list.
-let load! : :string -> :any;
+/// as lists and maps as maps; an array written comes back a list. A file that
+/// cannot be read, or that `save!` did not write, is `Result.error why`, which
+/// names it: a model is usually loaded from where a person said it was.
+let load! : :string -> Result :any :string;
 let load! path = match file.read! path {
-    Option.none => raise! ("cannot read " + path),
-    Option.some(text) => match parse_saved text {
-        Result.ok(t) => t,
-        Result.error(why) => raise! (path + ": " + why),
-    },
+    Option.none => err ("cannot read " + path),
+    Option.some(text) => Result.map_error (fn why -> path + ": " + why) (parse_saved text),
 };
 
-/// The tree in text `save!` wrote: `[:ok, tree]` or `[:error, why]`.
+/// The tree in text `save!` wrote, or why it is not one.
 let parse_saved : :string -> Result :any :string;
 let parse_saved text =
     if not (str.starts_with "dream-ml 1\n" text) { err "not a file save! wrote" }
@@ -523,6 +522,8 @@ when test {
 
     let tests = [
         test.case "fixed" $( test.eq! ["3.14", "-0.50", "2", "0.0010", "10.00"] [fixed 2 3.14159, fixed 2 (-0.5), fixed 0 1.6, fixed 4 0.001, fixed 2 9.999] ),
+        test.case "a file that is not there is an answer, naming it"
+            $( test.eq! (err "cannot read /nonexistent-dream/x.ml") (load! "/nonexistent-dream/x.ml") ),
         test.case "a saved tree reads back"
             $( test.true! ({
                 let t = [%{"w" => tensor.random 1 [3, 2], "b" => tensor.of_list [0.1, 0.2]}, %{:shift => tensor.of_list [1, 2]}, 2.5];

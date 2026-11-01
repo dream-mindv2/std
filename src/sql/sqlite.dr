@@ -99,6 +99,11 @@ mapping Options {
 let open! : :string -> sql.Connection;
 let open! path = open_with! path (Options.new ());
 
+/// `open!`, a database that cannot be opened answered as `Result.error e` (an
+/// `:sql_error`; see `sql.attempt!`) rather than raised.
+let try_open! : :string -> Result sql.Connection :error;
+let try_open! path = sql.attempt! (fn () -> open! path);
+
 /// A database in memory, gone when it is closed.
 let memory! : :unit -> sql.Connection;
 let memory! u = open_with! ":memory:" (Options.new ());
@@ -678,6 +683,34 @@ when test {
             seeded! db
             test.eq! :unique (kind_of! (fn () -> sql.exec! db (sql.insert_into "people" |> sql.values %{ "name" => "ada" })))
         }) ),
+        test.case "a try_ form answers the refusal its plain form raises" $( with_db! (fn db -> {
+            seeded! db
+            let dup = sql.try_exec! db (sql.insert_into "people" |> sql.values %{ "name" => "ada" });
+            let fresh = sql.try_exec! db (sql.insert_into "people" |> sql.values %{ "name" => "dee" });
+            test.eq! [Result.error :unique, Result.ok 1]
+                     [Result.map_error sql.error_code dup, Result.map (fn r -> r.[:changes]) fresh]
+        }) ),
+        test.case "first! and try_first! say none where there are no rows" $( with_db! (fn db -> {
+            seeded! db
+            let ada = sql.select ["age"] |> sql.from "people" |> sql.where (sql.eq "name" "ada");
+            let nobody = sql.select ["age"] |> sql.from "people" |> sql.where (sql.eq "name" "zed");
+            test.eq! [Option.some 36, Option.none, Result.ok Option.none, Result.error :not_one]
+                     [Option.map age_of (sql.first! db ada), sql.first! db nobody, sql.try_first! db nobody,
+                      Result.map_error sql.error_code (sql.try_one! db nobody)]
+        }) ),
+        test.case "try_transaction! rolls back and answers; a failure that is not SQL is raised" $( with_db! (fn db -> {
+            seeded! db
+            let refused = sql.try_transaction! db (fn tx -> {
+                sql.exec! tx (sql.delete_from "people")
+                sql.exec! tx (sql.insert_into "people" |> sql.values %{ "name" => "x" })
+                sql.exec! tx (sql.insert_into "people" |> sql.values %{ "name" => "x" })
+            });
+            let raised = kind_of! (fn () -> sql.try_transaction! db (fn tx -> raise! (error.new :mine "not the database's")));
+            test.eq! [Result.error :unique, 3, :mine]
+                     [Result.map_error sql.error_code refused, sql.scalar! db (sql.select [sql.count_all] |> sql.from "people"), raised]
+        }) ),
+        test.case "try_open! answers a database that cannot be opened" $(
+            if available! () { test.true! (Result.is_error (try_open! "/nonexistent-dream-dir/x.db")) } else { :ok } ),
         test.case "bad SQL the compiler did not see is a :syntax error" $( with_db! (fn db ->
             test.eq! :syntax (kind_of! (fn () -> sql.query! db (sql.raw "selec 1")))) ),
         test.case "a transaction that raises leaves nothing" $( with_db! (fn db -> {

@@ -25,6 +25,7 @@ import std.sql.pg.sql;
 import std.sql.pg.value;
 import std.sql.pg.tests.standard;
 import std.sql.pg;
+import std.sql as shared;
 import std.sql.tests.contract;
 import std.num;
 
@@ -78,6 +79,9 @@ let nowhere! : :unit -> :any;
 let nowhere! u = {
     test.eq! :invalid_catalog_name (condition_of! (refused! (as! "postgres" ()).[:database => "no_such_db"]))
     test.eq! :connection_failure (condition_of! (refused! %{ :host => "127.0.0.1", :port => 1 }))
+    // The same server, asked through the form that answers.
+    test.eq! (Result.error :connection_lost)
+             (Result.map_error shared.error_code (pg.try_open! %{ :host => "127.0.0.1", :port => 1 }))
 };
 
 let url! : :unit -> :any;
@@ -216,7 +220,7 @@ let cardinality! u = {
     let conn = admin! ();
     test.eq! :no_rows (condition_of! (one_of! conn "SELECT 1 WHERE false"))
     test.eq! :too_many_rows (condition_of! (one_of! conn "SELECT generate_series(1, 2)"))
-    test.eq! [(), 7] [db.first! conn "SELECT 1 WHERE false", (db.first! conn "SELECT 7 AS n").[:n]]
+    test.eq! [Option.none, Option.some 7] [db.first! conn "SELECT 1 WHERE false", Option.map (fn r -> r.[:n]) (db.first! conn "SELECT 7 AS n")]
     test.eq! () (db.scalar! conn "SELECT 1 WHERE false")
     db.close! conn
 };
@@ -236,7 +240,7 @@ let scripts! u = {
         DO $$ BEGIN RAISE NOTICE 'hello from %', 'plpgsql'; END $$;
     ");
     test.eq! ["CREATE TABLE", "INSERT 0 4", "SELECT 1", "DO"] (list.map (fn r -> r.[:command]) results)
-    test.eq! [(), 4, 1, ()] (list.map (fn r -> r.[:count]) results)
+    test.eq! [Option.none, Option.some 4, Option.some 1, Option.none] (list.map (fn r -> r.[:count]) results)
     test.eq! 10 (list.head (list.nth 2 results).[:rows]).[:total]
     test.eq! ["hello from plpgsql"] (list.map (fn n -> n.[:message]) (list.last results).[:notices])
     db.close! conn

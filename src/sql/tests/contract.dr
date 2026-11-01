@@ -124,6 +124,26 @@ let cleanup! open! = sql.using! (open! ()) (fn c -> {
     test.eq! :body_failure (error.kind original)
 });
 
+let refusals! : (:unit -> sql.Connection) -> :any;
+let refusals! open! = sql.using! (open! ()) (fn c -> {
+    sql.exec! c "CREATE TEMP TABLE contract_refusals (id bigint PRIMARY KEY)"
+    let first = sql.try_exec! c "INSERT INTO contract_refusals VALUES (1)";
+    let again = sql.try_exec! c "INSERT INTO contract_refusals VALUES (1)";
+    test.eq! [Result.ok 1, Result.error :unique]
+             [Result.map (fn r -> r.[:changes]) first, Result.map_error sql.error_code again]
+    let undone = sql.try_transaction! c (fn tx -> {
+        sql.exec! tx "INSERT INTO contract_refusals VALUES (2)"
+        sql.exec! tx "INSERT INTO contract_refusals VALUES (1)"
+    });
+    test.eq! [Result.error :unique, [1]]
+             [Result.map_error sql.error_code undone, sql.column! c "SELECT id FROM contract_refusals ORDER BY id"]
+    test.eq! [Result.ok Option.none, Result.error :not_one]
+             [sql.try_first! c "SELECT id FROM contract_refusals WHERE id = 9",
+              Result.map_error sql.error_code (sql.try_one! c "SELECT id FROM contract_refusals WHERE id = 9")]
+    // The connection is still good after every refusal it answered.
+    test.true! (sql.ping! c)
+});
+
 let tests : (:unit -> sql.Connection) -> [:any];
 let tests open! = [
     test.case "commit failure rolls back and cleanup preserves the original error" $( cleanup! open! ),
@@ -131,4 +151,5 @@ let tests open! = [
     test.case "bulk rows preserve values and roll back atomically" $( bulk! open! ),
     test.case "script results, metadata, JSON and inspection" $( scripts! open! ),
     test.case "bounded owner-safe pools, rollback and failed opens" $( pooling! open! ),
+    test.case "a refusal is answered by a try_ form, and leaves the connection good" $( refusals! open! ),
 ];

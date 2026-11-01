@@ -60,7 +60,7 @@ priv let changed : :map -> :integer;
 priv let changed result = {
     let command = db.Reply.command result;
     if list.any (fn prefix -> str.starts_with prefix command) ["INSERT ", "UPDATE ", "DELETE ", "MERGE ", "COPY "] {
-        match db.Reply.count result { () => 0, n => n }
+        Option.unwrap_or 0 (db.Reply.count result)
     } else { 0 }
 };
 

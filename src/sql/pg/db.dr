@@ -85,13 +85,13 @@ mapping Conn {
 /// key is), and `tuples` the same values positionally, which is what a result
 /// with two columns of the same name needs. Both are decoded as they are read.
 /// `count` is what the command tag says it did -- rows inserted, updated,
-/// deleted or selected -- or `()` for a command that does not count.
+/// deleted or selected -- or `none` for a command that does not count.
 mapping Reply {
     columns : [:any] = []
     tuples : [[:any]] = []
     rows : [:map] = []
     command : :string = ""
-    count : :integer | :unit = ()
+    count : Option :integer = Option.none
     status : :atom = :idle
     notices : [:map] = []
     notifications : [:any] = []
@@ -533,11 +533,11 @@ priv let row_of columns tuple =
     fold (fn m [c, v] -> m.[wire.Column.key c => v]) %{} (list.zip columns tuple);
 
 /// The count at the end of a command tag: `INSERT 0 5` is 5, `UPDATE 2` is 2,
-/// `CREATE TABLE` is `()`.
-let count_of : :string -> :integer | :unit;
+/// `CREATE TABLE` is `none`.
+let count_of : :string -> Option :integer;
 let count_of tag = match num.parse_int (list.last (str.split " " tag)) {
-    Option.some(n) if type_of n == :integer => n,
-    _ => (),
+    Option.some(n) if type_of n == :integer => Option.some n,
+    _ => Option.none,
 };
 
 // --- querying ------------------------------------------------------------------------
@@ -583,11 +583,11 @@ let one! conn q = match rows! conn q {
     _ => errors.fail! :too_many_rows ("expected one row and there were several: " + sql.describe q),
 };
 
-/// The first row, or `()` when there is none.
-let first! : Conn -> sql.Query -> :any;
+/// The first row, or `none` when there is none.
+let first! : Conn -> sql.Query -> Option :map;
 let first! conn q = match rows! conn q {
-    [] => (),
-    [row, .._] => row,
+    [] => Option.none,
+    [row, .._] => Option.some row,
 };
 
 /// The first column of the first row, or `()` when there are no rows:
@@ -722,14 +722,14 @@ priv let portal_step! conn step! acc columns raw = try! {
 
 // --- transactions ------------------------------------------------------------------
 
-/// `[:ok, body! arg]`, computed all the way down before this answers, or
-/// `[:error, e]` for what it raised.
+/// `Result.ok (body! arg)`, computed all the way down before this answers, or
+/// `Result.error e` for anything it raised.
 ///
-/// The value is bound and forced as statements, not written into the list:
-/// `[:ok, strict! (body! arg)]` is a list holding a suspension, so the work it
-/// names would happen whenever the list was read -- after a COMMIT, outside
-/// the `try!` -- which is the trap "A reply, a message or a list element is
-/// suspended unless forced" in CLAUDE.md describes.
+/// The value is bound and forced as statements, not written into the record:
+/// `Result.ok (strict! (body! arg))` is a record holding a suspension, so the
+/// work it names would happen whenever the record was read -- after a COMMIT,
+/// outside the `try!` -- which is the trap "A reply, a message or a list
+/// element is suspended unless forced" in CLAUDE.md describes.
 let attempt! : (a -> b) -> a -> Result b :any;
 let attempt! body! arg = try! {
     let v = body! arg;
@@ -897,10 +897,7 @@ let copy_in! conn table columns rows = {
 
 /// Extract a command's affected-row count.
 priv let counted : :map -> :integer;
-priv let counted r = match Reply.count r {
-    () => 0,
-    n => n,
-};
+priv let counted r = Option.unwrap_or 0 (Reply.count r);
 
 /// Convert a name to its SQL identifier text.
 priv let to_string_name : :any -> :string;
@@ -1061,7 +1058,7 @@ when test {
 
     let tests = [
         test.case "a command tag's count"
-            $( test.eq! [5, 2, 10, ()] (list.map count_of ["INSERT 0 5", "UPDATE 2", "SELECT 10", "CREATE TABLE"]) ),
+            $( test.eq! [Option.some 5, Option.some 2, Option.some 10, Option.none] (list.map count_of ["INSERT 0 5", "UPDATE 2", "SELECT 10", "CREATE TABLE"]) ),
         test.case "a version string as a number"
             $( test.eq! [160013, 170000, 90624, 0]
                         (list.map version_number ["16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)", "17beta1", "9.6.24", "x"]) ),
