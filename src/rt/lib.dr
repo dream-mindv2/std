@@ -9,7 +9,6 @@
 
 import rt.native;
 import std.json;
-import std.wire;
 
 // --- rendering --------------------------------------------------------------------
 
@@ -56,6 +55,7 @@ let show v = {
         :impure_fn => show_function v,
         :process => native.process_text v,
         :trunk => native.concat3 "trunk[" (join_items (native.trunk_to_list v)) "]",
+        :tensor => show_tensor v,
         _ => show_record v,
     }
 };
@@ -102,6 +102,7 @@ let settle v = match type_of v {
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
     :bool => true, :unit => true, :pure_fn => true, :impure_fn => true, :process => true,
     :trunk => settle_list (native.trunk_to_list v),
+    :tensor => true,
     _ => settle_list (native.array_to_list (native.record_fields v)),
 };
 
@@ -204,6 +205,10 @@ let compare_values a b = match native.flat_compare a b {
         :list => compare_lists a b,
         :array => compare_lists (native.array_to_list a) (native.array_to_list b),
         :map => compare_lists (native.map_pairs a) (native.map_pairs b),
+        :tensor => match compare_lists (native.tensor_shape a) (native.tensor_shape b) {
+            0 => compare_lists (native.tensor_flat a) (native.tensor_flat b),
+            c => c,
+        },
         _ => if native.is_record_value a && native.is_record_value b {
                  match compare_values (native.atom_name (native.record_id a)) (native.atom_name (native.record_id b)) {
                      0 => compare_lists (native.array_to_list (native.record_fields a)) (native.array_to_list (native.record_fields b)),
@@ -289,9 +294,6 @@ let match_fail v path line col = lib_raise (native.error_new :match_error [v, pa
 
 let error_trace! e = native.error_where e;
 
-let wire_encode v = wire.encode_value v;
-let wire_pack v = wire.encode_value v;
-let wire_decode text = wire.decode_by_hand text;
 let json_encode v = json.encode_value v;
 
 let raise_any! v = native.raise_or_wrap v;
@@ -461,7 +463,7 @@ let share_check v = match type_of v {
     :array => share_list (native.array_to_list v),
     :map => share_list (native.map_pairs v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
-    :bool => true, :unit => true, :process => true, :error => true,
+    :bool => true, :unit => true, :process => true, :error => true, :tensor => true,
     :trunk => share_list (native.trunk_to_list v),
     _ => share_list (native.array_to_list (native.record_fields v)),
 };
@@ -699,3 +701,626 @@ let uncaught! e = {
 // The compiler's own reasons to keep each root: it names them, and a program must
 // have an entry to compile at all.
 let main! () = 0;
+
+// --- tensors: everything but the loops ----------------------------------------------------------
+
+let shape_error why = lib_raise (native.error_new :shape_error why);
+let type_error why = lib_raise (native.error_new :type_error why);
+
+/// Shape and numbers of nested lists and arrays, read off the nesting; every row must match.
+let as_items v = match type_of v {
+    :list => v,
+    :array => native.array_to_list v,
+    _ => (),
+};
+
+let nest_shape v = match as_items v {
+    () => [],
+    [] => shape_error "a tensor cannot be empty",
+    items => length_from items 0 :: nest_shape items.[0],
+};
+
+let check_number w = if native.is_number_value w { w } else {
+    type_error (native.concat2 "a tensor holds numbers, not " (native.describe_value w))
+};
+
+let flat_onto v shape acc = match shape {
+    [] => check_number v :: acc,
+    [n, ..rest] => {
+        let items = as_items v;
+        if type_of items == :unit || length_from items 0 != n {
+            shape_error "every row of a tensor must have the same shape"
+        } else { flat_items items rest acc }
+    },
+};
+
+let flat_items items rest acc = match items {
+    [] => acc,
+    [x, ..more] => flat_items more rest (flat_onto x rest acc),
+};
+
+let as_tensor v = if native.is_tensor_value v { v } else {
+    match type_of v {
+        :list => tensor_from v,
+        :array => tensor_from v,
+        _ => type_error (native.concat2 "a tensor is made from lists or arrays of numbers, not " (native.describe_value v)),
+    }
+};
+
+let tensor_from v = {
+    let shape = nest_shape v;
+    native.tensor_of_flat (forced_array shape) (forced_array (rev_onto (flat_onto v shape []) []))
+};
+
+let read_shape v = match as_items v {
+    () => type_error (native.concat2 "a shape is a list of integers, not " (native.describe_value v)),
+    items => {
+        let n = length_from items 0;
+        if n == 0 || n > 6 { shape_error "a shape has between 1 and 6 axes" }
+        else { check_dims items; forced_array items }
+    },
+};
+
+let check_dims items = match items {
+    [] => true,
+    [d, ..rest] => if type_of d != :integer || d < 0 {
+        shape_error (native.concat2 "a shape's axes are positive integers, not " (show d))
+    } else { check_dims rest },
+};
+
+let tensor_to_list v = {
+    let t = as_tensor v;
+    nest_rows (native.tensor_flat t) (native.tensor_shape t)
+};
+
+let take_n xs !n = if n == 0 { [[], xs] } else {
+    match xs {
+        [x, ..rest] => {
+            let [front, back] = take_n rest (n - 1);
+            [x :: front, back]
+        },
+        [] => [[], []],
+    }
+};
+
+let nest_rows flat shape = match shape {
+    [_] => flat,
+    [n, ..rest] => {
+        let per = list_product rest;
+        let rec go xs !i = if i == 0 { [] } else {
+            let [front, back] = take_n xs per;
+            nest_rows front rest :: go back (i - 1)
+        };
+        go flat n
+    },
+};
+
+let list_product xs = match xs {
+    [] => 1,
+    [x, ..rest] => x * list_product rest,
+};
+
+let rendered_axis flat shape = match shape {
+    [_] => join_items flat,
+    [n, ..rest] => {
+        let per = list_product rest;
+        let rec go xs !i = if i == 0 { [] } else {
+            let [front, back] = take_n xs per;
+            let row = native.concat3 "[" (rendered_axis front rest) "]";
+            if i == 1 { [row] } else { row :: ", " :: go back (i - 1) }
+        };
+        concat_list (go flat n)
+    },
+};
+
+let show_tensor t = {
+    let shape = native.tensor_shape t;
+    if native.tensor_size t > 1000 {
+        native.concat2 "tensor of shape " (native.shape_text t)
+    } else {
+        concat_list ["tensor[", rendered_axis (native.tensor_flat t) shape, "]"]
+    }
+};
+
+let t_zeros s = native.tensor_fill (read_shape s) 0;
+let t_ones s = native.tensor_fill (read_shape s) 1;
+let t_fill s x = if native.is_number_value x { native.tensor_fill (read_shape s) x }
+    else { type_error (native.concat2 "`fill` fills with a number, not " (native.describe_value x)) };
+let t_identity n = native.tensor_identity (forced_array [n, n]);
+let t_range n = native.tensor_range (forced_array [n]);
+let seed_check seed what = if type_of seed != :integer {
+    type_error (concat_list ["`", what, "` takes an integer seed, not ", native.describe_value seed])
+} else { true };
+let t_random seed s = if seed_check seed "random" { native.tensor_random seed (read_shape s) } else { () };
+let t_normal seed s = if seed_check seed "normal" { native.tensor_normal seed (read_shape s) } else { () };
+let t_random_like seed t = if type_of seed != :integer { type_error "`random_like` takes an integer seed" }
+    else { native.tensor_random_like seed (as_tensor t) };
+let t_shape t = native.tensor_shape (as_tensor t);
+let t_rank t = native.tensor_rank (as_tensor t);
+let t_size t = native.tensor_size (as_tensor t);
+let t_device t = { as_tensor t; :host };
+let t_dtype t = { as_tensor t; :f64 };
+
+let t_reshape s v = {
+    let t = as_tensor v;
+    let shape = read_shape s;
+    if list_product (native.array_to_list shape) != native.tensor_size t {
+        shape_error (concat_list ["cannot reshape ", show (native.tensor_size t), " numbers (shape ", native.shape_text t,
+                                  ") to shape ", show_shape (native.array_to_list shape)])
+    } else { native.tensor_reshape shape t }
+};
+
+let show_shape xs = native.concat3 "[" (join_items xs) "]";
+
+let t_transpose v = {
+    let t = as_tensor v;
+    if native.tensor_rank t > 2 {
+        shape_error (native.concat2 "`transpose` takes a matrix or a vector, not shape " (native.shape_text t))
+    } else { native.tensor_transpose t }
+};
+
+let at_offset items shape !offset !axis = match [items, shape] {
+    [[], []] => offset,
+    [[i, ..more], [d, ..rest]] =>
+        if type_of i != :integer || i < 0 || i >= d {
+            lib_raise (native.error_new :out_of_bounds (concat_list ["index ", native.describe_value i, " is outside axis ", show axis, " of length ", show d]))
+        } else { at_offset more rest (offset * d + i) (axis + 1) },
+    _ => 0,
+};
+
+let t_at v indices = {
+    let t = as_tensor v;
+    match as_items indices {
+        () => type_error "`at` takes a list of indices",
+        items => {
+            let shape = native.tensor_shape t;
+            if length_from items 0 != length_from shape 0 {
+                shape_error (concat_list ["`at` needs one index per axis: ", show (length_from shape 0), ", not ", show (length_from items 0)])
+            } else { native.tensor_at t (at_offset items shape 0 0) }
+        },
+    }
+};
+
+let t_matmul x y = {
+    let a = as_tensor x;
+    let b = as_tensor y;
+    let ra = native.tensor_rank a;
+    let rb = native.tensor_rank b;
+    let sa = native.tensor_shape a;
+    let sb = native.tensor_shape b;
+    if ra == 3 && (rb == 3 || rb == 2) {
+        if (rb == 3 && (sa.[0] != sb.[0] || sa.[2] != sb.[1])) || (rb == 2 && sa.[2] != sb.[0]) {
+            mismatch a b
+        } else { native.tensor_matmul a b }
+    }
+    else if ra > 2 || rb > 2 {
+        shape_error (concat_list ["`@` multiplies matrices and vectors (or `[b, m, k] @ [b, k, n]`, ",
+                                  "or `[b, m, k] @ [k, n]`), not tensors of shape ", native.shape_text a, " and ", native.shape_text b])
+    }
+    else {
+        let ka = if ra == 2 { sa.[1] } else { sa.[0] };
+        let kb = sb.[0];
+        if ka != kb { mismatch a b } else { native.tensor_matmul a b }
+    }
+};
+
+let mismatch a b = {
+    let sa = native.tensor_shape a;
+    let sb = native.tensor_shape b;
+    let ka = list_last sa;
+    let kb = if native.tensor_rank b == 3 { sb.[1] } else { sb.[0] };
+    shape_error (concat_list ["`@` needs the inner dimensions to agree: ", show ka, " and ", show kb,
+                              " (shapes ", native.shape_text a, " and ", native.shape_text b, ")"])
+};
+
+let list_last xs = match xs { [x] => x, [_, ..rest] => list_last rest };
+
+let t_dot x y = {
+    let a = as_tensor x;
+    let b = as_tensor y;
+    if native.tensor_rank a != 1 || native.tensor_rank b != 1 {
+        shape_error (concat_list ["`dot` takes two vectors, not shapes ", native.shape_text a, " and ", native.shape_text b, "; `@` multiplies matrices"])
+    } else { t_matmul a b }
+};
+
+let t_outer x y = {
+    let a = as_tensor x;
+    let b = as_tensor y;
+    if native.tensor_rank a != 1 || native.tensor_rank b != 1 { shape_error "`outer` takes two vectors" }
+    else {
+        t_matmul (native.tensor_reshape (forced_array [native.tensor_size a, 1]) a)
+                 (native.tensor_reshape (forced_array [1, native.tensor_size b]) b)
+    }
+};
+
+let t_sum v = native.tensor_sum (as_tensor v);
+let t_sum_tensor v = t_sum v;
+let t_minimum v = native.tensor_min (as_tensor v);
+let t_maximum v = native.tensor_max (as_tensor v);
+let t_mean v = native.tensor_mean (as_tensor v);
+let t_norm v = native.tensor_norm (as_tensor v);
+
+let axis_call op name axis v = {
+    let t = as_tensor v;
+    if type_of axis != :integer || axis < 0 || axis >= native.tensor_rank t {
+        shape_error (concat_list ["`", name, "` takes an axis of shape ", native.shape_text t, ", not ", native.describe_value axis])
+    } else if native.tensor_rank t == 1 {
+        // A vector has nothing left once its axis is gone: the answer is a number, and
+        // for a position, an integer.
+        let one = native.tensor_axis op 0 (native.tensor_reshape (forced_array [1, native.tensor_size t]) t) ;
+        match op {
+            0 => native.tensor_sum t,
+            1 => native.tensor_min t,
+            2 => native.tensor_max t,
+            _ => native.to_int (native.tensor_at (native.tensor_axis op 1 (native.tensor_reshape (forced_array [1, native.tensor_size t]) t)) 0),
+        }
+    } else { native.tensor_axis op axis t }
+};
+
+let t_sum_axis a v = axis_call 0 "sum_axis" a v;
+let t_min_axis a v = axis_call 1 "min_axis" a v;
+let t_max_axis a v = axis_call 2 "max_axis" a v;
+let t_argmin_axis a v = axis_call 3 "argmin_axis" a v;
+let t_argmax_axis a v = axis_call 4 "argmax_axis" a v;
+
+let t_sqrt v = native.tensor_unary 0 (as_tensor v);
+let t_exp v = native.tensor_unary 1 (as_tensor v);
+let t_log v = native.tensor_unary 2 (as_tensor v);
+let t_abs v = native.tensor_unary 3 (as_tensor v);
+let t_tanh v = native.tensor_unary 4 (as_tensor v);
+let t_sin v = native.tensor_unary 5 (as_tensor v);
+let t_cos v = native.tensor_unary 6 (as_tensor v);
+let t_relu v = native.tensor_unary 7 (as_tensor v);
+let t_sigmoid v = native.tensor_unary 8 (as_tensor v);
+let t_floor v = native.tensor_unary 9 (as_tensor v);
+let t_ceil v = native.tensor_unary 10 (as_tensor v);
+let t_round v = native.tensor_unary 11 (as_tensor v);
+let t_sign v = native.tensor_unary 12 (as_tensor v);
+let t_erf v = native.tensor_unary 13 (as_tensor v);
+
+/// A number stays a number, so that it broadcasts; a list becomes a tensor.
+let operand v = if native.is_number_value v { v } else { as_tensor v };
+let binary op a b = native.tensor_binary op (operand a) (operand b);
+let t_max a b = binary 5 a b;
+let t_min a b = binary 6 a b;
+let t_pow a b = binary 7 a b;
+let t_lt a b = binary 8 a b;
+let t_le a b = binary 9 a b;
+let t_gt a b = binary 10 a b;
+let t_ge a b = binary 11 a b;
+let t_eq a b = binary 12 a b;
+let t_ne a b = binary 13 a b;
+
+let t_fill_like v x = if native.is_number_value x { native.tensor_fill_like (as_tensor v) x }
+    else { type_error (native.concat2 "`fill_like` fills with a number, not " (native.describe_value x)) };
+
+let count_arg n what = if type_of n != :integer || n < 0 {
+    type_error (concat_list ["`", what, "` takes a length, not ", native.describe_value n])
+} else { n };
+
+let t_repeat n v = native.tensor_repeat (count_arg n "repeat") (as_tensor v);
+
+let t_slice start count v = {
+    let t = as_tensor v;
+    let rows = native.tensor_len t;
+    if type_of start != :integer || start < 0 || start > rows {
+        lib_raise (native.error_new :out_of_bounds (concat_list ["`slice` starts at row ", native.describe_value start, " of ", show rows]))
+    }
+    else if start + count_arg count "slice" > rows {
+        lib_raise (native.error_new :out_of_bounds (concat_list ["`slice` of ", show count, " rows from row ", show start,
+                                                                 " runs past the end of ", show rows]))
+    }
+    else { native.tensor_take (forced_array (count_up start count)) t }
+};
+
+let count_up !from !n = if n == 0 { [] } else { from :: count_up (from + 1) (n - 1) };
+
+let row_list rows what limit = {
+    let items = if native.is_tensor_value rows { map_to_int (native.tensor_flat rows) } else {
+        match as_items rows {
+            () => type_error (concat_list ["`", what, "` takes a list of row numbers, not ", native.describe_value rows]),
+            xs => xs,
+        }
+    };
+    check_rows items what limit;
+    items
+};
+
+let map_to_int xs = match xs {
+    [] => [],
+    [x, ..rest] => native.to_int x :: map_to_int rest,
+};
+
+let check_rows items what limit = match items {
+    [] => true,
+    [r, ..rest] => if type_of r != :integer || r < 0 || r >= limit {
+        lib_raise (native.error_new :out_of_bounds (concat_list ["`", what, "` row ", native.describe_value r, " is outside ", show limit]))
+    } else { check_rows rest what limit },
+};
+
+let t_take rows v = {
+    let t = as_tensor v;
+    match row_list rows "take" (native.tensor_len t) {
+        [] => shape_error "`take` needs at least one row: a tensor cannot be empty",
+        items => native.tensor_take (forced_array items) t,
+    }
+};
+
+let shape_rest t = match native.tensor_shape t { [_, ..rest] => rest };
+
+let same_tail ts first = match ts {
+    [] => true,
+    [t, ..rest] => if shape_rest t == shape_rest first { same_tail rest first } else {
+        shape_error (concat_list ["`concat` joins tensors whose shapes agree after the first axis, not ",
+                                  native.shape_text first, " and ", native.shape_text t])
+    },
+};
+
+let tensors_of xs = match xs {
+    [] => [],
+    [x, ..rest] => as_tensor x :: tensors_of rest,
+};
+
+let t_concat ts = match as_items ts {
+    () => type_error "`concat` takes a list of tensors",
+    [] => shape_error "`concat` needs at least one tensor",
+    items => {
+        let parts = tensors_of items;
+        same_tail parts parts.[0];
+        native.tensor_concat (forced_array parts)
+    },
+};
+
+let t_one_hot n classes = {
+    let width = count_arg n "one_hot";
+    match row_list classes "one_hot" width {
+        [] => shape_error "`one_hot` needs at least one index",
+        items => native.tensor_one_hot width (forced_array items),
+    }
+};
+
+let t_to_bytes v = native.tensor_to_bytes (as_tensor v);
+let t_of_bytes s b = {
+    let shape = read_shape s;
+    if type_of b != :string { type_error (native.concat2 "`of_bytes` reads a string of bytes, not " (native.describe_value b)) }
+    else {
+        let need = list_product (native.array_to_list shape) * 8;
+        if native.size b != need {
+            shape_error (concat_list ["`of_bytes` needs ", show need, " bytes for shape ", show_shape (native.array_to_list shape), ", not ", show (native.size b)])
+        } else { native.tensor_of_bytes shape b }
+    }
+};
+
+let t_permute axes v = {
+    let t = as_tensor v;
+    let rank = native.tensor_rank t;
+    let items = as_items axes;
+    let unique_axes = fn ok -> ok;
+    match items {
+        () => type_error "`permute` takes a list of axes",
+        _ => if length_from items 0 == rank && axes_ok items rank [] {
+            native.tensor_permute (forced_array items) t
+        } else {
+            shape_error (concat_list ["`permute` takes each axis of shape ", native.shape_text t, " once, in its new order"])
+        },
+    }
+};
+
+let axes_ok items rank seen = match items {
+    [] => true,
+    [a, ..rest] => type_of a == :integer && a >= 0 && a < rank && not (list_has seen a) && axes_ok rest rank (a :: seen),
+};
+
+let list_has xs x = match xs {
+    [] => false,
+    [y, ..rest] => y == x || list_has rest x,
+};
+
+let t_im2col kh kw stride pad v = {
+    let x = as_tensor v;
+    if native.tensor_rank x != 4 { shape_error (native.concat2 "`im2col` takes images `[n, h, w, c]`, not shape " (native.shape_text x)) }
+    else { native.tensor_im2col (forced_array [kh, kw, stride, pad]) x }
+};
+
+let t_col2im shape kh kw stride pad cols = {
+    let c = as_tensor cols;
+    native.tensor_col2im (read_shape shape) (forced_array [kh, kw, stride, pad]) c
+};
+
+let no_gpu t = lib_raise (native.error_new :no_gpu "no GPU is available: a native build has no OpenCL");
+let t_gpu t = no_gpu t;
+let t_gpu64 t = no_gpu t;
+let t_host v = as_tensor v;
+let t_gpu_available u = false;
+let t_gpu_name u = ();
+let t_cpu_kernels u = "baseline";
+
+// --- the wire format --------------------------------------------------------------------------
+//
+// `std.wire`'s, every kind included: records and trunks are spelled here as in
+// dream/src/builtins.cpp, whose format this is, so a native program and the VM read each
+// other's messages. `wire_pack` writes the plain form, which `decode` reads either way:
+// packing is a matter of size, and a native program has no unit cache to shrink.
+
+let le_field v !w = native.str_le v w;
+
+let wire_tagged tag payload = native.concat2 (le_field tag 1) payload;
+let counted tag n rest = tag_and_count tag n :: rest;
+let tag_and_count tag n = native.concat2 (le_field tag 1) (le_field n 4);
+
+let wire_pieces v rest = match type_of v {
+    :unit => le_field 0 1 :: rest,
+    :bool => le_field (if v { 2 } else { 1 }) 1 :: rest,
+    :integer => wire_integer v rest,
+    :float => wire_tagged 4 (native.float_bytes v) :: rest,
+    :string => tag_and_count 5 (native.size v) :: v :: rest,
+    :atom => { let name = native.atom_name v; tag_and_count 6 (native.size name) :: name :: rest },
+    :char => wire_tagged 7 (le_field (native.char_code v) 4) :: rest,
+    :list => { let n = length_from v 0; tag_and_count 8 n :: wire_items v rest },
+    :array => tag_and_count 9 (native.size v) :: wire_items (native.array_to_list v) rest,
+    :map => {
+        let pairs = native.map_pairs v;
+        let n = length_from pairs 0;
+        tag_and_count 10 n :: wire_map_items (merge_sort pairs n) rest
+    },
+    :tensor => wire_tensor v rest,
+    :trunk => tag_and_count 14 (native.trunk_len v) :: wire_items (native.trunk_to_list v) rest,
+    :pure_fn => wire_text v rest,
+    :impure_fn => wire_text v rest,
+    :process => wire_text v rest,
+    :error => wire_text v rest,
+    _ => wire_record v rest,
+};
+
+let wire_text v rest = { let t = show v; tag_and_count 5 (native.size t) :: t :: rest };
+
+let wire_items xs rest = match xs {
+    [] => rest,
+    [x, ..more] => wire_pieces x (wire_items more rest),
+};
+
+let wire_map_items ps rest = match ps {
+    [] => rest,
+    [[k, v], ..more] => wire_pieces k (wire_pieces v (wire_map_items more rest)),
+};
+
+let wire_integer n rest =
+    if n <= native.pow 2 63 - 1 && n >= 0 - native.pow 2 63 { wire_tagged 3 (le_field n 8) :: rest }
+    else {
+        let w = big_width n 9 (native.pow 2 71);
+        tag_and_count 11 w :: le_field n w :: rest
+    };
+
+let big_width n !w half = if n < half && n >= 0 - half { w } else { big_width n (w + 1) (half * 256) };
+
+let wire_record v rest = {
+    let id = native.record_id v;
+    let name = native.atom_name id;
+    let n = native.record_size v;
+    let variant = native.str_find_any (native.record_display id) "." 0 >= 0;
+    tag_and_count 13 (native.size name) :: name :: le_field (if variant { 1 } else { 0 }) 1 :: le_field n 4
+        :: wire_items (native.array_to_list (native.record_fields v)) rest
+};
+
+let wire_tensor t rest = {
+    let dims = native.tensor_shape t;
+    let rec dim_pieces ds = match ds { [] => [native.tensor_to_bytes t], [d, ..more] => le_field d 4 :: dim_pieces more };
+    wire_tagged 12 (le_field (native.tensor_rank t) 1) :: list_append (dim_pieces dims) rest
+};
+
+let list_append xs ys = concat_lists xs ys;
+
+let wire_encode v = { settle v; concat_list (wire_pieces v []) };
+let wire_pack v = wire_encode v;
+
+let le_at s at !n = if n == 0 { 0 } else { le_at s (at + 1) (n - 1) * 256 + native.str_byte_any s at };
+
+let signed_at s at !n = {
+    let v = le_at s at n;
+    if v >= native.pow 2 (8 * n - 1) { v - native.pow 2 (8 * n) } else { v }
+};
+
+/// `[value, next]`, or `()` for what is not one, as `std.wire`'s reader answers.
+let wire_read s at = {
+    let size = native.size s;
+    let has = fn n -> at + n <= size;
+    let next = at + 1;
+    let fits = fn n -> next + n <= size;
+    if not (has 1) { () } else {
+        match native.str_byte_any s at {
+            0 => [(), next],
+            1 => [false, next],
+            2 => [true, next],
+            3 => if fits 8 { [signed_at s next 8, next + 8] } else { () },
+            4 => if fits 8 { [native.float_of_bytes (native.str_slice_any s next 8), next + 8] } else { () },
+            5 => wire_read_bytes s next (fn text -> text),
+            6 => wire_read_bytes s next (fn name -> native.to_existing_atom name),
+            7 => if fits 4 { [native.char_of_code (le_at s next 4), next + 4] } else { () },
+            8 => wire_read_seq s next (fn xs -> xs),
+            9 => wire_read_seq s next (fn xs -> forced_lazy_array xs),
+            14 => wire_read_seq s next (fn xs -> trunk_of xs),
+            10 => if fits 4 { wire_read_map s (next + 4) (le_at s next 4) (native.map_empty ()) } else { () },
+            11 => if fits 4 {
+                let n = le_at s next 4;
+                if next + 4 + n <= size { [signed_at s (next + 4) n, next + 4 + n] } else { () }
+            } else { () },
+            12 => wire_read_tensor s next,
+            13 => wire_read_record s next,
+            _ => (),
+        }
+    }
+};
+
+let forced_lazy_array xs = array_of_list xs;
+
+let wire_read_bytes s at f =
+    if at + 4 > native.size s { () } else {
+        let n = le_at s at 4;
+        if at + 4 + n > native.size s { () }
+        else {
+            let v = f (native.str_slice_any s (at + 4) n);
+            [v, at + 4 + n]
+        }
+    };
+
+let wire_read_items s at !n acc = if n == 0 { [rev_onto acc [], at] } else {
+    match wire_read s at {
+        () => (),
+        [v, next] => wire_read_items s next (n - 1) (v :: acc),
+    }
+};
+
+let wire_read_seq s at f =
+    if at + 4 > native.size s { () } else {
+        match wire_read_items s (at + 4) (le_at s at 4) [] {
+            () => (),
+            [xs, next] => [f xs, next],
+        }
+    };
+
+let wire_read_map s at !n m = if n == 0 { [m, at] } else {
+    match wire_read s at {
+        () => (),
+        [k, next] => match wire_read s next {
+            () => (),
+            [v, after] => wire_read_map s after (n - 1) (native.map_put m k v),
+        },
+    }
+};
+
+let wire_read_record s at =
+    if at + 4 > native.size s { () } else {
+        let n = le_at s at 4;
+        let after = at + 4 + n;
+        if after + 5 > native.size s { () } else {
+            match native.to_existing_atom (native.str_slice_any s (at + 4) n) {
+                () => (),
+                id => match wire_read_items s (after + 5) (le_at s (after + 1) 4) [] {
+                    () => (),
+                    [fields, next] => [native.record_of id (native.str_byte_any s after == 1) (forced_lazy_array fields), next],
+                },
+            }
+        }
+    };
+
+let wire_read_tensor s at =
+    if at + 1 > native.size s { () } else {
+        let rank = native.str_byte_any s at;
+        let dims_at = at + 1;
+        let data_at = dims_at + rank * 4;
+        if data_at > native.size s { () } else {
+            let dims = wire_dims s dims_at rank;
+            let bytes = list_product dims * 8;
+            if data_at + bytes > native.size s { () }
+            else { [native.tensor_of_bytes (forced_array dims) (native.str_slice_any s data_at bytes), data_at + bytes] }
+        }
+    };
+
+let wire_dims s at !n = if n == 0 { [] } else { le_at s at 4 :: wire_dims s (at + 4) (n - 1) };
+
+let wire_decode text = if type_of text != :string { lib_raise (native.error_new :type_error "wire_decode needs a string") } else {
+    match wire_read text 0 {
+        () => Result.error "not a wire value",
+        [v, at] => if at == native.size text { Result.ok v } else { Result.error "trailing bytes after a wire value" },
+    }
+};

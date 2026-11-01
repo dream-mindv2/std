@@ -80,6 +80,7 @@ let kind_big = 12;
 let kind_error = 13;
 let kind_process = 14;
 let kind_trunk = 15;
+let kind_tensor = 16;
 
 // What a frame is, in its info's kind: nothing the unwinder need notice, or one of these.
 let frame_catch = 20;
@@ -169,7 +170,7 @@ let object_words! !o !info = {
     let kind = prim.load64! (info + info_kind);
     if kind == kind_string {
         2 + (prim.load64! (o + word) + word) / word
-    } else if kind == kind_array || kind == kind_pap || kind == kind_map {
+    } else if kind == kind_array || kind == kind_pap || kind == kind_map || kind == kind_tensor {
         2 + untag_fix (prim.load64! (o + word))
     } else if kind == kind_record || kind == kind_big {
         3 + untag_fix (prim.load64! (o + word))
@@ -217,7 +218,7 @@ let scan! !p !at =
         let info = prim.load64! at;
         let kind = prim.load64! (info + info_kind);
         let n = object_words! at info;
-        if kind != kind_float && kind != kind_string && kind != kind_hole && kind != kind_big {
+        if kind != kind_float && kind != kind_string && kind != kind_hole && kind != kind_big && kind != kind_tensor {
             evacuate_range! p (at + word) (at + n * word);
         };
         scan! p (at + n * word)
@@ -572,6 +573,7 @@ let type_of! !p !v =
         else if kind == kind_error { atom_word 12 }
         else if kind == kind_process { atom_process }
         else if kind == kind_trunk { prim.atom "trunk" }
+        else if kind == kind_tensor { prim.atom "tensor" }
         else if kind == kind_record {
             atom_word (prim.load64! (prim.info "atom_types" + word * (prim.load64! (v + 2 * word) >> 8)))
         }
@@ -593,13 +595,30 @@ let size! !p !v = if is_string! v { tag_fix (string_len! v) }
     else if is_kind! v kind_array { prim.load64! (v + word) }
     else if is_kind! v kind_map { prim.load64! (v + 2 * word) }
     else if is_trunk! v { prim.load64! (v + 2 * word) }
+    else if is_tensor! v { tag_fix (t_dim! v 0) }
     else { type_fail! p "len needs a string, a list, an array or a map" };
 
 let str_le! !p !v !width = {
     let n = untag_fix width;
     let out = new_string! p n;
-    let rec_ = write_le! (string_bytes out) (untag_fix v) n;
+    if is_fix v { write_le! (string_bytes out) (untag_fix v) n; }
+    else { big_le! (string_bytes out) v 0 n (if big_sign! v == 1 { 1 } else { 0 }); };
     out
+};
+
+/// A bignum's two's complement, a byte at a time: the limbs, inverted with a carry when
+/// it is negative, and its sign for as long as the field goes on.
+let big_le! !at !v !i !n !carry = if i >= n { 0 } else {
+    let limb = big_limb! v (i / 4);
+    let byte = prim.ushr limb ((i % 4) * 8) & 255;
+    if big_sign! v == 1 {
+        let t = (byte ^ 255) + carry;
+        prim.store8! (at + i) t;
+        big_le! at v (i + 1) n (t >> 8)
+    } else {
+        prim.store8! (at + i) byte;
+        big_le! at v (i + 1) n 0
+    }
 };
 
 let write_le! !at !v !n = if n == 0 { 0 } else {
@@ -1083,18 +1102,20 @@ let int_or_float_op! !p !op !a !b =
 let is_listish! !v = v == nil_word || is_kind! v kind_cons;
 
 let add_slow! !p !a !b =
-    if is_string! a && is_string! b { concat2! p a b }
+    if is_tensor! a || is_tensor! b { tensor_op! p 0 a b }
+    else if is_string! a && is_string! b { concat2! p a b }
     else if is_number! a && is_number! b { int_or_float_op! p 0 a b }
     else if is_listish! a && is_listish! b { deferred2! p (prim.info "lib_concat_lists") a b }
     else { cannot_apply! p "add" a b };
 
-let sub_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 1 a b } else { cannot_apply! p "sub" a b };
-let mul_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 2 a b } else { cannot_apply! p "mul" a b };
-let div_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 3 a b } else { cannot_apply! p "div" a b };
-let mod_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 4 a b } else { cannot_apply! p "mod" a b };
+let sub_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 1 a b } else if is_number! a && is_number! b { int_or_float_op! p 1 a b } else { cannot_apply! p "sub" a b };
+let mul_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 2 a b } else if is_number! a && is_number! b { int_or_float_op! p 2 a b } else { cannot_apply! p "mul" a b };
+let div_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 3 a b } else if is_number! a && is_number! b { int_or_float_op! p 3 a b } else { cannot_apply! p "div" a b };
+let mod_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 4 a b } else if is_number! a && is_number! b { int_or_float_op! p 4 a b } else { cannot_apply! p "mod" a b };
 
 let neg! !p !v =
-    if is_float! v { new_float! p (prim.fneg (prim.load64! (v + word))) }
+    if is_tensor! v { tensor_neg! p v }
+    else if is_float! v { new_float! p (prim.fneg (prim.load64! (v + word))) }
     else if is_int! v { int_or_float_op! p 1 (tag_fix 0) v }
     else { fail_value! p atom_type_error (concat2! p (text_of! p "cannot negate ") (describe! p v)) };
 
@@ -1142,6 +1163,7 @@ let eq_slow! !p !a !b = {
     else if is_string! a && is_string! b { as_word (string_eq! a b) }
     else if a == b && not (is_float! a) { true_word }
     else if is_kind! a kind_process && is_kind! b kind_process { as_word (prim.load64! (a + word) == prim.load64! (b + word)) }
+    else if is_tensor! a && is_tensor! b { tensor_equal! p a b }
     else if is_object a && is_object b && kind_of! a == kind_of! b && kind_of! a != kind_closure {
         deferred2! p (prim.info "lib_equal") a b
     }
@@ -1213,17 +1235,69 @@ let flat_compare! !p !a !b = {
 
 let both_fix !a !b = is_fix a && is_fix b;
 
-let bit_and! !p !a !b = if both_fix a b { a & b } else { number_fail! p "`&` needs two integers" };
-let bit_or! !p !a !b = if both_fix a b { a | b } else { number_fail! p "`|` needs two integers" };
-let bit_xor! !p !a !b = if both_fix a b { tag_fix (untag_fix a ^ untag_fix b) } else { number_fail! p "`^` needs two integers" };
-let bit_not! !p !a = if is_fix a { tag_fix (0 - 1 - untag_fix a) } else { number_fail! p "`~` needs an integer" };
-let shift_left! !p !a !b = if both_fix a b {
-    let n = untag_fix b;
-    if n < 0 { number_fail! p "a negative shift" }
-    else if n >= 62 || (((untag_fix a << n) >> n) != untag_fix a) || (untag_fix a << n) >= (1 << 62) || (untag_fix a << n) < 0 - (1 << 62) {
-        big_shift_left! p a n
-    } else { tag_fix (untag_fix a << n) }
-} else { number_fail! p "`<<` needs two integers" };
+/// A limb of an integer's two's complement, as if it went on for ever.
+let tc_limb! !v !i !carry_at = {
+    let raw = big_limb! v i;
+    if big_sign! v == 0 { raw } else {
+        // Inverted, and one added at the lowest limb that takes it.
+        let lower_zero = limbs_zero! v i;
+        (if lower_zero { (raw ^ limb_mask) + 1 } else { raw ^ limb_mask }) & limb_mask
+    }
+};
+
+let limbs_zero! !v !i = if i == 0 { true } else { big_limb! v (i - 1) == 0 && limbs_zero! v (i - 1) };
+
+let bits_into! !out !a !b !op !i !n = if i >= n { 0 } else {
+    let x = tc_limb! a i 0;
+    let y = tc_limb! b i 0;
+    prim.store64! (limb_at out i) (if op == 0 { x & y } else if op == 1 { x | y } else { x ^ y });
+    bits_into! out a b op (i + 1) n
+};
+
+/// Two's complement the whole way, however long: the answer's top limb says its sign.
+let big_bits! !p !a !b !op = {
+    let x = as_big! p a;
+    let y = as_big! p b;
+    let n = (if big_n! x > big_n! y { big_n! x } else { big_n! y }) + 1;
+    let out = new_big! p n 0;
+    bits_into! out x y op 0 n;
+    if prim.load64! (limb_at out (n - 1)) & 2147483648 != 0 {
+        // Negative: its magnitude is the complement of what is there, plus one.
+        negate_limbs! out 0 n 1;
+        prim.store64! (out + 2 * word) (tag_fix 1);
+    };
+    big_fix! out
+};
+
+let negate_limbs! !out !i !n !carry = if i >= n { 0 } else {
+    let t = (prim.load64! (limb_at out i) ^ limb_mask) + carry;
+    prim.store64! (limb_at out i) (t & limb_mask);
+    negate_limbs! out (i + 1) n (prim.ushr t 32)
+};
+
+let int_pair! !a !b = is_int! a && is_int! b;
+
+let bit_and! !p !a !b = if both_fix a b { a & b } else if int_pair! a b { big_bits! p a b 0 } else { bit_need! p "`&`" a b };
+let bit_or! !p !a !b = if both_fix a b { a | b } else if int_pair! a b { big_bits! p a b 1 } else { bit_need! p "`|`" a b };
+let bit_xor! !p !a !b = if both_fix a b { tag_fix (untag_fix a ^ untag_fix b) } else if int_pair! a b { big_bits! p a b 2 } else { bit_need! p "`^`" a b };
+
+let bit_need! !p what !a !b = fail_value! p atom_type_error
+    (concat2! p (concat_parts! p "" (text_of! p what) " needs two integers, got ")
+                (concat3! p (describe! p a) (text_of! p " and ") (describe! p b)));
+
+let bit_not! !p !a =
+    if is_fix a { tag_fix (0 - 1 - untag_fix a) }
+    else if is_big! a { int_or_float_op! p 1 (tag_fix (0 - 1)) a }
+    else { fail_value! p atom_type_error (concat2! p (text_of! p "`~` needs an integer, got ") (describe! p a)) };
+
+let shift_left! !p !a !b =
+    if not (is_int! a && is_fix b) { bit_need! p "`<<`" a b }
+    else if untag_fix b < 0 { number_fail! p "a negative shift" }
+    else if is_fix a && untag_fix b < 62 && ((untag_fix a << untag_fix b) >> untag_fix b) == untag_fix a
+            && (untag_fix a << untag_fix b) < (1 << 62) && (untag_fix a << untag_fix b) >= 0 - (1 << 62) {
+        tag_fix (untag_fix a << untag_fix b)
+    }
+    else { big_shift_left! p a (untag_fix b) };
 
 /// A shift past a fixnum, by the arithmetic it is short for.
 let big_shift_left! !p !a !n = if n == 0 { a } else {
@@ -1231,11 +1305,16 @@ let big_shift_left! !p !a !n = if n == 0 { a } else {
     big_shift_left! p (big_mul! p (as_big! p a) (as_big! p (tag_fix (1 << step)))) (n - step)
 };
 
-let shift_right! !p !a !b = if both_fix a b {
-    let n = untag_fix b;
-    if n < 0 { number_fail! p "a negative shift" }
-    else { tag_fix (untag_fix a >> (if n > 63 { 63 } else { n })) }
-} else { number_fail! p "`>>` needs two integers" };
+let shift_right! !p !a !b =
+    if not (is_int! a && is_fix b) { bit_need! p "`>>`" a b }
+    else if untag_fix b < 0 { number_fail! p "a negative shift" }
+    else if is_fix a { tag_fix (untag_fix a >> (if untag_fix b > 63 { 63 } else { untag_fix b })) }
+    else {
+        // Towards negative infinity, as a shift of two's complement goes.
+        let unit_ = big_shift_left! p (tag_fix 1) (untag_fix b);
+        let bottom = if big_sign! a == 1 { int_or_float_op! p 1 (int_or_float_op! p 0 a (tag_fix 1)) unit_ } else { a };
+        int_or_float_op! p 3 bottom unit_
+    };
 
 // --- numbers ------------------------------------------------------------------------
 
@@ -1855,6 +1934,9 @@ let peek! !p !c !k =
     else if is_trunk! c {
         if is_fix k && untag_fix k >= 0 && untag_fix k < trunk_size! c { trunk_read! p k c } else { 0 }
     }
+    else if is_fix k && is_tensor! c {
+        if untag_fix k >= 0 && untag_fix k < t_dim! c 0 { tensor_index! p c k } else { 0 }
+    }
     else if is_fix k && (is_kind! c kind_array || is_record! c) {
         let i = untag_fix k;
         let off = if is_record! c { 3 } else { 2 };
@@ -1864,7 +1946,11 @@ let peek! !p !c !k =
 
 /// Why `peek!` found nothing, as the raise that follows when no `else` was written.
 let index_absent! !p !c !k =
-    if is_trunk! c {
+    if is_tensor! c {
+        fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "index " (describe! p k) " is outside a tensor of length ")
+                                                  (int_to_string! p (tag_fix (t_dim! c 0))))
+    }
+    else if is_trunk! c {
         fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "index " (describe! p k) " is outside a trunk of ")
                                                   (int_to_string! p (prim.load64! (c + 2 * word))))
     }
@@ -4207,3 +4293,786 @@ let regex_run! !p !code !s !from !mode = {
         else { rx_all! p r at m 0 nil_word }
     }
 };
+
+// --- tensors ----------------------------------------------------------------------------------
+//
+// Doubles with a shape, inside the object: `[info, n, rank, 6 dims, count, numbers..]`, the
+// `n` tagged and counting what follows it, all of it raw to the collector. The kernels are
+// loops over raw words that LLVM is left to vectorize, and everything about lists, shapes
+// and what to say when they are wrong is the library's. Nothing is deferred: a chain of
+// operations is that many passes. That is a difference in speed against the VM's fused
+// kernels, not in any answer, and is worth doing here only when a program measures it.
+
+let t_rank_at = 2;
+let t_dims_at = 3;
+let t_count_at = 9;
+let t_data_at = 10;
+let t_max_rank = 6;
+
+let is_tensor! !v = is_kind! v kind_tensor;
+let t_rank! !t = prim.load64! (t + t_rank_at * word);
+let t_dim! !t !i = prim.load64! (t + (t_dims_at + i) * word);
+let t_count! !t = prim.load64! (t + t_count_at * word);
+let t_data !t = t + t_data_at * word;
+
+let t_blank! !p !rank !count = {
+    let n = t_data_at - 2 + count;
+    let o = alloc! p ((n + 2) * word);
+    prim.store64! o (prim.info "tensor");
+    prim.store64! (o + word) (tag_fix n);
+    prim.store64! (o + t_rank_at * word) rank;
+    prim.store64! (o + t_count_at * word) count;
+    o
+};
+
+let t_set_dim! !t !i !d = prim.store64! (t + (t_dims_at + i) * word) d;
+
+/// The same shape as `t`, its numbers not written yet.
+let t_like! !p !t = {
+    let o = t_blank! p (t_rank! t) (t_count! t);
+    copy_words! (t + t_dims_at * word) (o + t_dims_at * word) t_max_rank;
+    o
+};
+
+let product_of! !a !i !n !acc = if i >= n { acc } else {
+    product_of! a (i + 1) n (acc * untag_fix (prim.load64! (a + (2 + i) * word)))
+};
+
+let t_dims_from! !t !a !i !n = if i >= n { 0 } else {
+    t_set_dim! t i (untag_fix (prim.load64! (a + (2 + i) * word)));
+    t_dims_from! t a (i + 1) n
+};
+
+/// A new tensor of the shape in an array of integers.
+let t_new! !p !shape = {
+    let rank = untag_fix (prim.load64! (shape + word));
+    let t = t_blank! p rank (product_of! shape 0 rank 1);
+    t_dims_from! t shape 0 rank;
+    t
+};
+
+let t_shape_list! !p !t !i = if i >= t_rank! t { nil_word } else {
+    new_cons! p (tag_fix (t_dim! t i)) (t_shape_list! p t (i + 1))
+};
+let tensor_shape! !p !t = t_shape_list! p t 0;
+let tensor_rank! !p !t = tag_fix (t_rank! t);
+let tensor_size! !p !t = tag_fix (t_count! t);
+let tensor_len! !p !t = tag_fix (t_dim! t 0);
+let is_tensor_value! !p !v = as_word (is_tensor! v);
+
+/// From a flat array of forced numbers.
+let t_store_numbers! !to !a !i !n = if i >= n { 0 } else {
+    prim.store64! (to + i * word) (float_bits! (prim.load64! (a + (2 + i) * word)));
+    t_store_numbers! to a (i + 1) n
+};
+
+let tensor_of_flat! !p !shape !numbers = {
+    let t = t_new! p shape;
+    t_store_numbers! (t_data t) numbers 0 (t_count! t);
+    t
+};
+
+let tensor_fill! !p !shape !x = {
+    let t = t_new! p shape;
+    fill_words! (t_data t) (t_count! t) (float_bits! x);
+    t
+};
+
+let tensor_fill_like! !p !t !x = {
+    let o = t_like! p t;
+    fill_words! (t_data o) (t_count! o) (float_bits! x);
+    o
+};
+
+let write_range! !at !i !n = if i >= n { 0 } else {
+    prim.store64! (at + i * word) (prim.i2f i);
+    write_range! at (i + 1) n
+};
+
+let tensor_range! !p !shape = {
+    let t = t_new! p shape;
+    write_range! (t_data t) 0 (t_count! t);
+    t
+};
+
+let write_identity! !at !n !i = if i >= n { 0 } else {
+    prim.store64! (at + (i * n + i) * word) (prim.i2f 1);
+    write_identity! at n (i + 1)
+};
+
+let tensor_identity! !p !shape = {
+    let t = t_new! p shape;
+    fill_words! (t_data t) (t_count! t) (prim.i2f 0);
+    write_identity! (t_data t) (t_dim! t 0) 0;
+    t
+};
+
+// The stream `random` and `normal` draw from: SplitMix64, so that one seed is one tensor on
+// every machine and in every kind of build.
+
+let splitmix_gamma = (2654435769 << 32) | 2135587861;
+let splitmix_a = (3210233709 << 32) | 484763065;
+let splitmix_b = (2496678331 << 32) | 321982955;
+
+let splitmix !x = {
+    let z1 = (x ^ prim.ushr x 30) * splitmix_a;
+    let z2 = (z1 ^ prim.ushr z1 27) * splitmix_b;
+    z2 ^ prim.ushr z2 31
+};
+
+/// `[0, 1)`: 53 bits, each step's state being `x + gamma * (i + 1)`.
+let uniform_bits !state = prim.fmul (prim.i2f (prim.ushr (splitmix state) 11)) (prim.fdiv (prim.i2f 1) (prim.i2f 9007199254740992));
+
+let write_random! !at !i !n !x = if i >= n { 0 } else {
+    let next = x + splitmix_gamma;
+    prim.store64! (at + i * word) (uniform_bits next);
+    write_random! at (i + 1) n next
+};
+
+let tensor_random! !p !seed !shape = {
+    let t = t_new! p shape;
+    write_random! (t_data t) 0 (t_count! t) (untag_fix seed);
+    t
+};
+
+let tensor_random_like! !p !seed !t = {
+    let o = t_like! p t;
+    write_random! (t_data o) 0 (t_count! o) (untag_fix seed);
+    o
+};
+
+let prim_two_pi! () = prim.fmul (prim.i2f 8) (prim.d1! "atan" (prim.i2f 1));
+
+let write_normal! !at !i !n !x = if i >= n { 0 } else {
+    let x1 = x + splitmix_gamma;
+    let x2 = x1 + splitmix_gamma;
+    let u1 = prim.fsub (prim.i2f 1) (uniform_bits x1);
+    let u2 = uniform_bits x2;
+    let r = prim.d1! "sqrt" (prim.fmul (prim.fneg (prim.i2f 2)) (prim.d1! "log" u1));
+    let angle = prim.fmul (prim_two_pi! ()) u2;
+    prim.store64! (at + i * word) (prim.fmul r (prim.d1! "cos" angle));
+    if i + 1 < n { prim.store64! (at + (i + 1) * word) (prim.fmul r (prim.d1! "sin" angle)); };
+    write_normal! at (i + 2) n x2
+};
+
+let tensor_normal! !p !seed !shape = {
+    let t = t_new! p shape;
+    write_normal! (t_data t) 0 (t_count! t) (untag_fix seed ^ ((1779033703 << 32) | 4089235721));
+    t
+};
+
+let tensor_at! !p !t !offset = new_float! p (prim.load64! (t_data t + untag_fix offset * word));
+
+let t_vector! !p !at !n !tail = if n == 0 { tail } else {
+    t_vector! p at (n - 1) (new_cons! p (new_float! p (prim.load64! (at + (n - 1) * word))) tail)
+};
+
+/// One axis of `tensor.to_list`, its rows made by the library when there are any.
+let tensor_flat! !p !t = t_vector! p (t_data t) (t_count! t) nil_word;
+
+// --- elementwise ------------------------------------------------------------------------------
+
+let kernel_add! !out !a !astep !b !bstep !n = if n == 0 { 0 } else {
+    prim.store64! out (prim.fadd (prim.load64! a) (prim.load64! b));
+    kernel_add! (out + word) (a + astep) astep (b + bstep) bstep (n - 1)
+};
+let kernel_sub! !out !a !astep !b !bstep !n = if n == 0 { 0 } else {
+    prim.store64! out (prim.fsub (prim.load64! a) (prim.load64! b));
+    kernel_sub! (out + word) (a + astep) astep (b + bstep) bstep (n - 1)
+};
+let kernel_mul! !out !a !astep !b !bstep !n = if n == 0 { 0 } else {
+    prim.store64! out (prim.fmul (prim.load64! a) (prim.load64! b));
+    kernel_mul! (out + word) (a + astep) astep (b + bstep) bstep (n - 1)
+};
+let kernel_div! !out !a !astep !b !bstep !n = if n == 0 { 0 } else {
+    prim.store64! out (prim.fdiv (prim.load64! a) (prim.load64! b));
+    kernel_div! (out + word) (a + astep) astep (b + bstep) bstep (n - 1)
+};
+
+let one_or_zero !bit = prim.i2f (if bit { 1 } else { 0 });
+
+let t_op! !op !x !y =
+    if op == 4 { prim.d2! "fmod" x y }
+    else if op == 5 { if prim.flt x y { y } else { x } }
+    else if op == 6 { if prim.flt y x { y } else { x } }
+    else if op == 7 { prim.d2! "pow" x y }
+    else if op == 8 { one_or_zero (prim.flt x y) }
+    else if op == 9 { one_or_zero (prim.flt x y || prim.feq x y) }
+    else if op == 10 { one_or_zero (prim.flt y x) }
+    else if op == 11 { one_or_zero (prim.flt y x || prim.feq x y) }
+    else if op == 12 { one_or_zero (prim.feq x y) }
+    else { one_or_zero (not (prim.feq x y)) };
+
+let kernel_op! !out !a !b !op !n !steps = if n == 0 { 0 } else {
+    prim.store64! out (t_op! op (prim.load64! a) (prim.load64! b));
+    kernel_op! (out + word) (a + prim.load64! steps) (b + prim.load64! (steps + word)) op (n - 1) steps
+};
+
+/// The numbers of a trailing shape come round again, so an index modulo its count is what
+/// repeating it is.
+let broadcast_op! !out !a !ca !b !cb !op = broadcast_from! out a ca b cb (op * 4294967296);
+
+let broadcast_from! !out !a !ca !b !cb !state = {
+    let i = state & 4294967295;
+    let op = prim.ushr state 32;
+    let n = prim.load64! (out - word);
+    if i >= n { 0 } else {
+        let x = prim.load64! (a + (i % ca) * word);
+        let y = prim.load64! (b + (i % cb) * word);
+        let r = if op == 0 { prim.fadd x y } else if op == 1 { prim.fsub x y } else if op == 2 { prim.fmul x y }
+                else if op == 3 { prim.fdiv x y } else { t_op! op x y };
+        prim.store64! (out + i * word) r;
+        broadcast_from! out a ca b cb (state + 1)
+    }
+};
+
+/// Equal shapes, or one the trailing part of the other. 0 for neither.
+let trailing_of! !a !b !i = {
+    let ra = t_rank! a;
+    let rb = t_rank! b;
+    if i >= rb { true }
+    else { t_dim! a (ra - rb + i) == t_dim! b i && trailing_of! a b (i + 1) }
+};
+
+let shape_compatible! !a !b =
+    if t_rank! a >= t_rank! b { trailing_of! a b 0 } else { trailing_of! b a 0 };
+
+let t_dispatch! !out !a !astep !b !bstep !state = {
+    let op = prim.ushr state 32;
+    let n = state & 4294967295;
+    if op == 0 { kernel_add! out a astep b bstep n }
+    else if op == 1 { kernel_sub! out a astep b bstep n }
+    else if op == 2 { kernel_mul! out a astep b bstep n }
+    else if op == 3 { kernel_div! out a astep b bstep n }
+    else {
+        let steps = out - 2 * word;
+        kernel_op_stepped! out a astep b bstep state
+    }
+};
+
+let kernel_op_stepped! !out !a !astep !b !bstep !state = {
+    let op = prim.ushr state 32;
+    let n = state & 4294967295;
+    if n == 0 { 0 } else {
+        prim.store64! out (t_op! op (prim.load64! a) (prim.load64! b));
+        kernel_op_stepped! (out + word) (a + astep) astep (b + bstep) bstep (state - 1)
+    }
+};
+
+let op_state !op !n = (op << 32) | n;
+
+/// `a op b`, each a tensor or a number; 0 means the shapes do not go together, which the
+/// caller says in its own words.
+let t_binary! !p !op !a !b = {
+    let ta = is_tensor! a;
+    let tb = is_tensor! b;
+    if ta && tb {
+        if not (shape_compatible! a b) { 0 }
+        else if t_count! a == t_count! b {
+            let o = t_like! p (if t_rank! a >= t_rank! b { a } else { b });
+            t_dispatch! (t_data o) (t_data a) word (t_data b) word (op_state op (t_count! o));
+            o
+        } else {
+            let big = if t_count! a > t_count! b { a } else { b };
+            let o = t_like! p big;
+            // The word below the numbers is `count`, which is what the loop runs to.
+            broadcast_op! (t_data o) (t_data a) (t_count! a) (t_data b) (t_count! b) op;
+            o
+        }
+    } else if ta {
+        let cell = alloc! p word;
+        prim.store64! cell (float_bits! b);
+        let o = t_like! p a;
+        t_dispatch! (t_data o) (t_data a) word cell 0 (op_state op (t_count! o));
+        o
+    } else {
+        let cell = alloc! p word;
+        prim.store64! cell (float_bits! a);
+        let o = t_like! p b;
+        t_dispatch! (t_data o) cell 0 (t_data b) word (op_state op (t_count! o));
+        o
+    }
+};
+
+let shape_text! !p !t = {
+    let n = t_rank! t;
+    concat3! p (text_of! p "[") (shape_parts! p t 0 n) (text_of! p "]")
+};
+
+let shape_parts! !p !t !i !n = if i >= n { text_of! p "" }
+    else if i == n - 1 { int_to_string! p (tag_fix (t_dim! t i)) }
+    else { concat3! p (int_to_string! p (tag_fix (t_dim! t i))) (text_of! p ", ") (shape_parts! p t (i + 1) n) };
+
+let describe_operand! !p !v = if is_tensor! v { concat2! p (text_of! p "tensor of shape ") (shape_text! p v) } else { describe! p v };
+
+let op_name_text! !p !op = text_of! p (
+    if op == 0 { "add" } else if op == 1 { "sub" } else if op == 2 { "mul" } else if op == 3 { "div" }
+    else if op == 4 { "mod" } else if op == 5 { "max" } else if op == 6 { "min" } else if op == 7 { "pow" }
+    else if op == 8 { "lt" } else if op == 9 { "le" } else if op == 10 { "gt" } else if op == 11 { "ge" }
+    else if op == 12 { "eq" } else { "ne" });
+
+/// `+` and the rest, when an operand is a tensor.
+let tensor_op! !p !op !a !b = {
+    if not ((is_tensor! a || is_number! a) && (is_tensor! b || is_number! b)) {
+        fail_value! p atom_type_error (concat2! p (concat3! p (text_of! p "cannot apply `") (op_name_text! p op) (text_of! p "` to "))
+            (concat3! p (describe! p a) (text_of! p " and ") (describe! p b)))
+    } else {
+        let r = t_binary! p op a b;
+        if r != 0 { r } else {
+            fail_value! p (prim.atom "shape_error") (concat3! p (concat3! p (text_of! p "`") (op_name_text! p op) (text_of! p "` needs shapes that match, not "))
+                (shape_text! p a) (concat2! p (text_of! p " and ") (shape_text! p b)))
+        }
+    }
+};
+
+let tensor_binary! !p !op !a !b = tensor_op! p (untag_fix op) a b;
+
+let t_unary_value! !f !x =
+    if f == 0 { prim.d1! "sqrt" x } else if f == 1 { prim.d1! "exp" x } else if f == 2 { prim.d1! "log" x }
+    else if f == 3 { prim.fabs x } else if f == 4 { prim.d1! "tanh" x } else if f == 5 { prim.d1! "sin" x }
+    else if f == 6 { prim.d1! "cos" x }
+    else if f == 7 { if prim.flt (prim.i2f 0) x { x } else { prim.i2f 0 } }
+    else if f == 8 { prim.fdiv (prim.i2f 1) (prim.fadd (prim.i2f 1) (prim.d1! "exp" (prim.fneg x))) }
+    else if f == 9 { prim.d1! "floor" x } else if f == 10 { prim.d1! "ceil" x } else if f == 11 { prim.d1! "round" x }
+    else if f == 12 {
+        if prim.flt (prim.i2f 0) x { prim.i2f 1 } else if prim.flt x (prim.i2f 0) { prim.fneg (prim.i2f 1) } else { x }
+    }
+    else if f == 13 { prim.d1! "erf" x }
+    else { prim.fneg x };
+
+let kernel_unary! !out !a !n !f = if n == 0 { 0 } else {
+    prim.store64! out (t_unary_value! f (prim.load64! a));
+    kernel_unary! (out + word) (a + word) (n - 1) f
+};
+
+let tensor_unary! !p !f !t = {
+    let o = t_like! p t;
+    kernel_unary! (t_data o) (t_data t) (t_count! t) (untag_fix f);
+    o
+};
+
+let tensor_neg! !p !t = {
+    let o = t_like! p t;
+    kernel_unary! (t_data o) (t_data t) (t_count! t) 14;
+    o
+};
+
+let sum_from! !a !n !acc = if n == 0 { acc } else { sum_from! (a + word) (n - 1) (prim.fadd acc (prim.load64! a)) };
+let min_from! !a !n !acc = if n == 0 { acc } else {
+    let x = prim.load64! a;
+    min_from! (a + word) (n - 1) (if prim.flt x acc { x } else { acc })
+};
+let max_from! !a !n !acc = if n == 0 { acc } else {
+    let x = prim.load64! a;
+    max_from! (a + word) (n - 1) (if prim.flt acc x { x } else { acc })
+};
+
+let tensor_sum! !p !t = new_float! p (sum_from! (t_data t) (t_count! t) (prim.i2f 0));
+let tensor_min! !p !t = new_float! p (min_from! (t_data t) (t_count! t) (prim.load64! (t_data t)));
+let tensor_max! !p !t = new_float! p (max_from! (t_data t) (t_count! t) (prim.load64! (t_data t)));
+let tensor_mean! !p !t = new_float! p (prim.fdiv (sum_from! (t_data t) (t_count! t) (prim.i2f 0)) (prim.i2f (t_count! t)));
+
+let squares_from! !a !n !acc = if n == 0 { acc } else {
+    let x = prim.load64! a;
+    squares_from! (a + word) (n - 1) (prim.fadd acc (prim.fmul x x))
+};
+let tensor_norm! !p !t = new_float! p (prim.d1! "sqrt" (squares_from! (t_data t) (t_count! t) (prim.i2f 0)));
+
+// One axis out: `outer` blocks of `len` runs of `inner` numbers. Ops: 0 sum, 1 min, 2 max,
+// 3 argmin, 4 argmax, the first place winning a tie.
+
+let axis_one! !src !stride !len !op = axis_walk! src stride 1 len op (prim.load64! src) ;
+
+let axis_walk! !src !stride !i !len !op !best = axis_with_at! src stride (i * 4294967296 + len) op best 0;
+
+let axis_with_at! !src !stride !counts !op !best !at = {
+    let i = prim.ushr counts 32;
+    let len = counts & 4294967295;
+    if i >= len {
+        if op >= 3 { prim.i2f at } else { best }
+    } else {
+        let x = prim.load64! (src + i * stride);
+        let better = if op == 0 { false } else if op == 1 || op == 3 { prim.flt x best } else { prim.flt best x };
+        axis_with_at! src stride (counts + 4294967296) op
+            (if op == 0 { prim.fadd best x } else if better { x } else { best })
+            (if better { i } else { at })
+    }
+};
+
+let axis_cells! !out !src !inner !len !op !counts = {
+    let cell = counts & 4294967295;
+    if cell >= inner { 0 } else {
+        prim.store64! (out + cell * word) (axis_one! (src + cell * word) (inner * word) len op);
+        axis_cells! out src inner len op (counts + 1)
+    }
+};
+
+let axis_blocks! !out !src !inner !len !op !left = if left == 0 { 0 } else {
+    axis_cells! out src inner len op 0;
+    axis_blocks! (out + inner * word) (src + inner * len * word) inner len op (left - 1)
+};
+
+let tail_product! !t !from = if from >= t_rank! t { 1 } else { t_dim! t from * tail_product! t (from + 1) };
+
+let drop_axis_dims! !o !t !axis !i !at = if i >= t_rank! t { 0 } else {
+    if i != axis { t_set_dim! o at (t_dim! t i); };
+    drop_axis_dims! o t axis (i + 1) (if i != axis { at + 1 } else { at })
+};
+
+let tensor_axis! !p !op !axis !t = {
+    let a = untag_fix axis;
+    let len = t_dim! t a;
+    let inner = tail_product! t (a + 1);
+    let o = t_blank! p (t_rank! t - 1) (t_count! t / len);
+    drop_axis_dims! o t a 0 0;
+    axis_blocks! (t_data o) (t_data t) inner len (untag_fix op) (t_count! t / (inner * len));
+    o
+};
+
+// --- shape ------------------------------------------------------------------------------------
+
+let tensor_reshape! !p !shape !t = {
+    let o = t_new! p shape;
+    copy_words! (t_data t) (t_data o) (t_count! t);
+    o
+};
+
+let transpose_rows! !out !src !m !n !i = if i >= m { 0 } else {
+    transpose_row! (out + i * word) n (src + i * n * word) m 0;
+    transpose_rows! out src m n (i + 1)
+};
+
+let transpose_row! !out !n !src !m !j = if j >= n { 0 } else {
+    prim.store64! (out + j * m * word) (prim.load64! (src + j * word));
+    transpose_row! out n src m (j + 1)
+};
+
+let tensor_transpose! !p !t = if t_rank! t == 1 { t } else {
+    let m = t_dim! t 0;
+    let n = t_dim! t 1;
+    let o = t_blank! p 2 (m * n);
+    t_set_dim! o 0 n;
+    t_set_dim! o 1 m;
+    transpose_rows! (t_data o) (t_data t) m n 0;
+    o
+};
+
+/// A row of a matrix, or the number at a place in a vector.
+let tensor_index! !p !t !k = {
+    let i = untag_fix k;
+    if t_rank! t == 1 { new_float! p (prim.load64! (t_data t + i * word)) }
+    else {
+        let per = t_count! t / t_dim! t 0;
+        let o = t_blank! p (t_rank! t - 1) per;
+        copy_words! (t + (t_dims_at + 1) * word) (o + t_dims_at * word) (t_max_rank - 1);
+        copy_words! (t_data t + i * per * word) (t_data o) per;
+        o
+    }
+};
+
+let copy_rows! !out !src !rows !i !n !per = if i >= n { 0 } else {
+    copy_words! (src + untag_fix (prim.load64! (rows + (2 + i) * word)) * per * word) out per;
+    copy_rows! (out + per * word) src rows (i + 1) n per
+};
+
+/// The rows named, as an array of integers, in that order.
+let tensor_take! !p !rows !t = {
+    let n = untag_fix (prim.load64! (rows + word));
+    let per = t_count! t / t_dim! t 0;
+    let o = t_blank! p (t_rank! t) (n * per);
+    copy_words! (t + t_dims_at * word) (o + t_dims_at * word) t_max_rank;
+    t_set_dim! o 0 n;
+    copy_rows! (t_data o) (t_data t) rows 0 n per;
+    o
+};
+
+let concat_rows! !out !parts !i !n = if i >= n { 0 } else {
+    let t = prim.load64! (parts + (2 + i) * word);
+    copy_words! (t_data t) out (t_count! t);
+    concat_rows! (out + t_count! t * word) parts (i + 1) n
+};
+
+let rows_total! !parts !i !n !acc = if i >= n { acc } else {
+    rows_total! parts (i + 1) n (acc + t_dim! (prim.load64! (parts + (2 + i) * word)) 0)
+};
+
+let tensor_concat! !p !parts = {
+    let n = untag_fix (prim.load64! (parts + word));
+    let first = prim.load64! (parts + 2 * word);
+    let rows = rows_total! parts 0 n 0;
+    let o = t_blank! p (t_rank! first) (t_count! first / t_dim! first 0 * rows);
+    copy_words! (first + t_dims_at * word) (o + t_dims_at * word) t_max_rank;
+    t_set_dim! o 0 rows;
+    concat_rows! (t_data o) parts 0 n;
+    o
+};
+
+let one_hot_rows! !out !rows !i !n !width = if i >= n { 0 } else {
+    prim.store64! (out + (i * width + untag_fix (prim.load64! (rows + (2 + i) * word))) * word) (prim.i2f 1);
+    one_hot_rows! out rows (i + 1) n width
+};
+
+let tensor_one_hot! !p !width !rows = {
+    let n = untag_fix (prim.load64! (rows + word));
+    let w = untag_fix width;
+    let o = t_blank! p 2 (n * w);
+    t_set_dim! o 0 n;
+    t_set_dim! o 1 w;
+    fill_words! (t_data o) (n * w) (prim.i2f 0);
+    one_hot_rows! (t_data o) rows 0 n w;
+    o
+};
+
+let repeat_each! !out !src !left !n = if left == 0 { 0 } else {
+    fill_words! out n (prim.load64! src);
+    repeat_each! (out + n * word) (src + word) (left - 1) n
+};
+
+let tensor_repeat! !p !n !t = {
+    let k = untag_fix n;
+    let o = t_blank! p (t_rank! t + 1) (t_count! t * k);
+    copy_words! (t + t_dims_at * word) (o + t_dims_at * word) t_max_rank;
+    t_set_dim! o (t_rank! t) k;
+    repeat_each! (t_data o) (t_data t) (t_count! t) k;
+    o
+};
+
+/// Axis `k` of the answer is axis `axes[k]` of `t`. `idx` counts through the answer's
+/// places, and each number's place in `t` is found from it through the strides.
+let permute_copy! !out !src !o !strides !idx !i = if i >= t_count! o { 0 } else {
+    prim.store64! (out + i * word) (prim.load64! (src + permute_offset! idx strides 0 (t_rank! o) * word));
+    permute_advance! o idx (t_rank! o - 1);
+    permute_copy! out src o strides idx (i + 1)
+};
+
+let permute_offset! !idx !strides !k !n = if k >= n { 0 } else {
+    prim.load64! (idx + k * word) * prim.load64! (strides + k * word) + permute_offset! idx strides (k + 1) n
+};
+
+let permute_advance! !o !idx !k = if k < 0 { 0 } else {
+    let v = prim.load64! (idx + k * word) + 1;
+    if v < t_dim! o k { prim.store64! (idx + k * word) v; 0 }
+    else {
+        prim.store64! (idx + k * word) 0;
+        permute_advance! o idx (k - 1)
+    }
+};
+
+let permute_setup! !o !t !axes !strides !k = if k >= t_rank! t { 0 } else {
+    let from = untag_fix (prim.load64! (axes + (2 + k) * word));
+    t_set_dim! o k (t_dim! t from);
+    prim.store64! (strides + k * word) (tail_product! t (from + 1));
+    permute_setup! o t axes strides (k + 1)
+};
+
+let tensor_permute! !p !axes !t = {
+    let o = t_like! p t;
+    let strides = alloc! p (t_max_rank * word);
+    let idx = alloc! p (t_max_rank * word);
+    zero_words! idx t_max_rank;
+    permute_setup! o t axes strides 0;
+    permute_copy! (t_data o) (t_data t) o strides idx 0;
+    o
+};
+
+let tensor_to_bytes! !p !t = {
+    let s = new_string! p (t_count! t * word);
+    prim.c3! "memcpy" (string_bytes s) (t_data t) (t_count! t * word);
+    s
+};
+
+let tensor_of_bytes! !p !shape !b = {
+    let t = t_new! p shape;
+    prim.c3! "memcpy" (t_data t) (string_bytes b) (t_count! t * word);
+    t
+};
+
+// --- products -----------------------------------------------------------------------------------
+
+let saxpy! !out !row !x !n = if n == 0 { 0 } else {
+    prim.store64! out (prim.fadd (prim.load64! out) (prim.fmul x (prim.load64! row)));
+    saxpy! (out + word) (row + word) x (n - 1)
+};
+
+let product_row! !out !a !b !k !n !p_ = if p_ >= k { 0 } else {
+    saxpy! out (b + p_ * n * word) (prim.load64! (a + p_ * word)) n;
+    product_row! out a b k n (p_ + 1)
+};
+
+/// `[m, k] @ [k, n]`, row by row: the order that reads memory in the order it lies.
+let product_rows! !out !a !b !m !k !n = if m == 0 { 0 } else {
+    product_row! out a b k n 0;
+    product_rows! (out + n * word) (a + k * word) b (m - 1) k n
+};
+
+let dot_from! !a !b !n !acc = if n == 0 { acc } else {
+    dot_from! (a + word) (b + word) (n - 1) (prim.fadd acc (prim.fmul (prim.load64! a) (prim.load64! b)))
+};
+
+/// The shapes have been checked. A vector counts as one row, or one column, as `@` says.
+let tensor_matmul! !p !a !b = {
+    let ra = t_rank! a;
+    let rb = t_rank! b;
+    if ra == 1 && rb == 1 { new_float! p (dot_from! (t_data a) (t_data b) (t_count! a) (prim.i2f 0)) }
+    else if ra == 3 {
+        let batch = t_dim! a 0;
+        let m = t_dim! a 1;
+        let k = t_dim! a 2;
+        let n = if rb == 3 { t_dim! b 2 } else { t_dim! b 1 };
+        let o = t_blank! p 3 (batch * m * n);
+        t_set_dim! o 0 batch;
+        t_set_dim! o 1 m;
+        t_set_dim! o 2 n;
+        fill_words! (t_data o) (t_count! o) (prim.i2f 0);
+        batched! (t_data o) (t_data a) (t_data b) (batch * 4294967296 + (if rb == 3 { k * n } else { 0 })) ((m << 40) | (k << 20) | n) 0;
+        o
+    } else {
+        let m = if ra == 2 { t_dim! a 0 } else { 1 };
+        let k = if ra == 2 { t_dim! a 1 } else { t_dim! a 0 };
+        let n = if rb == 2 { t_dim! b 1 } else { 1 };
+        let o = if ra == 2 && rb == 2 {
+            let m2 = t_blank! p 2 (m * n);
+            t_set_dim! m2 0 m;
+            t_set_dim! m2 1 n;
+            m2
+        } else {
+            let v = t_blank! p 1 (m * n);
+            t_set_dim! v 0 (m * n);
+            v
+        };
+        fill_words! (t_data o) (t_count! o) (prim.i2f 0);
+        product_rows! (t_data o) (t_data a) (t_data b) m k n;
+        o
+    }
+};
+
+let batched! !out !a !b !state !sizes !unused = {
+    let left = prim.ushr state 32;
+    let b_step = state & 4294967295;
+    let m = prim.ushr sizes 40;
+    let k = (sizes >> 20) & 1048575;
+    let n = sizes & 1048575;
+    if left == 0 { 0 } else {
+        product_rows! out a b m k n;
+        batched! (out + m * n * word) (a + m * k * word) (b + b_step * word) (state - 4294967296) sizes 0
+    }
+};
+
+// --- windows of images, for convolutions -----------------------------------------------------------
+
+let win_n = 0;
+let win_h = 8;
+let win_w = 16;
+let win_c = 24;
+let win_kh = 32;
+let win_kw = 40;
+let win_stride = 48;
+let win_pad = 56;
+let win_oh = 64;
+let win_ow = 72;
+let win_bytes = 80;
+
+let window_of! !p !n !h !w !c !spec = {
+    let g = alloc! p win_bytes;
+    let kh = untag_fix (prim.load64! (spec + 2 * word));
+    let kw = untag_fix (prim.load64! (spec + 3 * word));
+    let stride = untag_fix (prim.load64! (spec + 4 * word));
+    let pad = untag_fix (prim.load64! (spec + 5 * word));
+    prim.store64! (g + win_n) n;
+    prim.store64! (g + win_h) h;
+    prim.store64! (g + win_w) w;
+    prim.store64! (g + win_c) c;
+    prim.store64! (g + win_kh) kh;
+    prim.store64! (g + win_kw) kw;
+    prim.store64! (g + win_stride) stride;
+    prim.store64! (g + win_pad) pad;
+    prim.store64! (g + win_oh) ((h + 2 * pad - kh) / stride + 1);
+    prim.store64! (g + win_ow) ((w + 2 * pad - kw) / stride + 1);
+    g
+};
+
+/// The offset in the images of one window element, or -1 when padding is what is there.
+let window_at! !g !b !oy !ox !ky !kx = {
+    let iy = oy * prim.load64! (g + win_stride) + ky - prim.load64! (g + win_pad);
+    let ix = ox * prim.load64! (g + win_stride) + kx - prim.load64! (g + win_pad);
+    let h = prim.load64! (g + win_h);
+    let w = prim.load64! (g + win_w);
+    if iy < 0 || iy >= h || ix < 0 || ix >= w { 0 - 1 }
+    else { ((b * h + iy) * w + ix) * prim.load64! (g + win_c) }
+};
+
+let im2col_elements! !g !images !out !row !k !total = if k >= total { 0 } else {
+    let oh = prim.load64! (g + win_oh);
+    let ow = prim.load64! (g + win_ow);
+    let c = prim.load64! (g + win_c);
+    let kh = prim.load64! (g + win_kh);
+    let kw = prim.load64! (g + win_kw);
+    let ch = k % c;
+    let kx = (k / c) % kw;
+    let ky = k / c / kw;
+    let at = window_at! g (row / (ow * oh)) ((row / ow) % oh) (row % ow) ky kx;
+    prim.store64! (out + k * word) (if at < 0 { prim.i2f 0 } else { prim.load64! (images + (at + ch) * word) });
+    im2col_elements! g images out row (k + 1) total
+};
+
+let im2col_rows! !g !images !out !row !rows !k = if row >= rows { 0 } else {
+    im2col_elements! g images out row 0 k;
+    im2col_rows! g images (out + k * word) (row + 1) rows k
+};
+
+/// `spec` is `[kh, kw, stride, pad]`, checked. Each row of the answer is one window.
+let tensor_im2col! !p !spec !x = {
+    let g = window_of! p (t_dim! x 0) (t_dim! x 1) (t_dim! x 2) (t_dim! x 3) spec;
+    let rows = prim.load64! (g + win_n) * prim.load64! (g + win_oh) * prim.load64! (g + win_ow);
+    let k = prim.load64! (g + win_kh) * prim.load64! (g + win_kw) * prim.load64! (g + win_c);
+    let o = t_blank! p 2 (rows * k);
+    t_set_dim! o 0 rows;
+    t_set_dim! o 1 k;
+    im2col_rows! g (t_data x) (t_data o) 0 rows k;
+    o
+};
+
+let col2im_elements! !g !images !src !row !k !total = if k >= total { 0 } else {
+    let oh = prim.load64! (g + win_oh);
+    let ow = prim.load64! (g + win_ow);
+    let c = prim.load64! (g + win_c);
+    let kw = prim.load64! (g + win_kw);
+    let ch = k % c;
+    let kx = (k / c) % kw;
+    let ky = k / c / kw;
+    let at = window_at! g (row / (ow * oh)) ((row / ow) % oh) (row % ow) ky kx;
+    if at >= 0 {
+        let place = images + (at + ch) * word;
+        prim.store64! place (prim.fadd (prim.load64! place) (prim.load64! (src + k * word)));
+    };
+    col2im_elements! g images src row (k + 1) total
+};
+
+let col2im_rows! !g !images !src !row !rows !k = if row >= rows { 0 } else {
+    col2im_elements! g images src row 0 k;
+    col2im_rows! g images (src + k * word) (row + 1) rows k
+};
+
+/// The reverse: each number the sum of the places `im2col` copied it to.
+let tensor_col2im! !p !shape !spec !cols = {
+    let o = t_new! p shape;
+    fill_words! (t_data o) (t_count! o) (prim.i2f 0);
+    let g = window_of! p (t_dim! o 0) (t_dim! o 1) (t_dim! o 2) (t_dim! o 3) spec;
+    let rows = t_dim! cols 0;
+    let k = t_dim! cols 1;
+    col2im_rows! g (t_data o) (t_data cols) 0 rows k;
+    o
+};
+
+let tensor_equal! !p !a !b = {
+    if t_rank! a != t_rank! b || t_count! a != t_count! b || not (same_dims! a b 0) { false_word }
+    else { as_word (same_numbers! (t_data a) (t_data b) (t_count! a)) }
+};
+
+let same_dims! !a !b !i = i >= t_rank! a || (t_dim! a i == t_dim! b i && same_dims! a b (i + 1));
+let same_numbers! !a !b !n = n == 0 || (prim.feq (prim.load64! a) (prim.load64! b) && same_numbers! (a + word) (b + word) (n - 1));
+
+let is_number_value! !p !v = as_word (is_number! v);
+let describe_value! !p !v = describe! p v;
+
+let char_code_of! !p !c = tag_fix (c >> 8);
