@@ -72,7 +72,11 @@ let ctx_cb_error = 288;
 let ctx_cb_text = 296;
 let ctx_opened = 304;
 let ctx_spare = 312;
-let ctx_size = 320;
+let ctx_wait_ids = 320;
+let ctx_wait_count = 328;
+let ctx_wait_cap = 336;
+let ctx_poll_tick = 344;
+let ctx_size = 352;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -115,6 +119,7 @@ let static_limit = 4294967296;
 let chunk_header = 16;
 let min_chunk = 8388608;
 let stack_bytes = 268435456;
+let first_stack = 32768;
 let stack_margin = 1048576;
 
 let tag_fix !n = n * 2 + 1;
@@ -140,6 +145,9 @@ let fatal! s = {
 /// Memory a collection has finished with is used again before any is mapped: a page the program
 /// has touched costs no fault, and faults were a tenth of a run that allocates. Only what is
 /// near the allocation area's size is worth holding on to.
+/// A power of two, so that what one collection frees fits what the next one asks for.
+let round_chunk! !want !size = if size >= want { size } else { round_chunk! want (size * 2) };
+
 let take_chunk! !p !size = {
     let c = spare_fit! (p + ctx_spare) (prim.load64! (p + ctx_spare)) size;
     if c != 0 { c } else { map_memory! size }
@@ -154,7 +162,7 @@ let spare_fit! !link !c !size =
 
 let new_chunk! !p !bytes = {
     let want = bytes + chunk_header;
-    let size = if want < min_chunk { min_chunk } else { want };
+    let size = round_chunk! want min_chunk;
     let chunk = take_chunk! p size;
     prim.store64! chunk (prim.load64! (p + ctx_chunks));
     prim.store64! (chunk + word) size;
@@ -290,7 +298,7 @@ let scan_processes! !p !id !n = if id >= n { 0 } else {
 
 let free_chunks! !p !c = if c == 0 { 0 } else {
     let next = prim.load64! c;
-    if prim.load64! (c + word) <= 16 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
+    if prim.load64! (c + word) <= 128 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
         prim.store64! c (prim.load64! (p + ctx_spare));
         prim.store64! (p + ctx_spare) c;
     } else {
@@ -303,8 +311,8 @@ let spare_count! !c !n = if c == 0 { n } else { spare_count! (prim.load64! c) (n
 
 let collect! !p !sp = {
     let old = prim.load64! (p + ctx_chunks);
-    let space = prim.load64! (p + ctx_total) + min_chunk;
-    let to = map_memory! space;
+    let space = round_chunk! (prim.load64! (p + ctx_total) + min_chunk) min_chunk;
+    let to = take_chunk! p space;
     let start = to + chunk_header;
     prim.store64! to 0;
     prim.store64! (to + word) space;
@@ -366,7 +374,12 @@ let frame_update! !p !sp !v !b !c !d = {
 /// A collection asked for at a function's entry. The registers are saved as a frame
 /// with the code to go back to, so the collector sees them as it sees any frame.
 let collect_at_entry! !p !sp !a !b !c !d =
-    if prim.ult sp (prim.load64! (p + ctx_floor)) && prim.load64! (p + ctx_want_gc) == 0 {
+    if prim.ult sp (prim.load64! (p + ctx_floor)) && prim.load64! (p + ctx_want_gc) == 0
+        && prim.load64! (current! p + pcb_stack_size) < stack_bytes && prim.load64! (p + ctx_in_callback) == 0 {
+        // A small stack run out: go on from a larger one.
+        let size = prim.load64! (current! p + pcb_stack_size);
+        collect_at_entry! p (move_stack! p sp (size * 2)) a b c d
+    } else if prim.ult sp (prim.load64! (p + ctx_floor)) && prim.load64! (p + ctx_want_gc) == 0 {
         // The guard was the real one, so this is the stack running out.
         prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor) - stack_margin / 2);
         fail! p atom_stack_overflow "recursion too deep";
@@ -2112,7 +2125,9 @@ let pcb_joined = 128;
 let pcb_killing = 136;
 let pcb_wait_fd = 144;
 let pcb_wait_write = 152;
-let pcb_size = 160;
+let pcb_stack_size = 160;
+let pcb_listed = 168;
+let pcb_size = 176;
 
 let state_ready = 0;
 let state_running = 1;
@@ -2180,20 +2195,54 @@ let new_pcb! !p = {
     prim.store64! (pcb + pcb_resume) unit_word;
     prim.store64! (pcb + pcb_wake_at) (0 - 1);
     prim.store64! (pcb + pcb_kill) 0;
-    let stack = map_memory! stack_bytes;
+    let size = if id == 1 { stack_bytes } else { first_stack };
+    let stack = stack_memory! size;
     prim.store64! (pcb + pcb_stack) stack;
-    let top = stack + stack_bytes;
+    prim.store64! (pcb + pcb_stack_size) size;
+    let top = stack + size;
     prim.store64! (top - word) (prim.info "halt");
     prim.store64! (pcb + pcb_sp) (top - word);
     prim.store64! (p + ctx_live) (prim.load64! (p + ctx_live) + 1);
     pcb
 };
 
-let stack_top! !pcb = prim.load64! (pcb + pcb_stack) + stack_bytes;
+let stack_top! !pcb = prim.load64! (pcb + pcb_stack) + prim.load64! (pcb + pcb_stack_size);
+
+// A process starts on a small stack and moves to one twice the size when it runs out, at the one
+// place that can happen, a function's entry. It can move because nothing holds an address on it:
+// frames hold values, and only the running process moves, whose stack pointer is in hand. A call into C is the exception, since C may call back onto this stack
+// while its caller still holds where it was: it makes room first, and a callback cannot grow.
+// The first process does not start small, as it is where a deep recursion usually is, and
+// mapping costs nothing it does not touch.
+
+let stack_memory! !size = if size >= 1048576 { map_memory! size } else { prim.c1! "malloc" size };
+
+let stack_release! !at !size = {
+    if size >= 1048576 { prim.c2! "munmap" at size; } else { prim.c1! "free" at; };
+    0
+};
+
+/// The stack moved to one of `size` bytes: the new stack pointer.
+let move_stack! !p !sp !size = {
+    let pcb = current! p;
+    let top = stack_top! pcb;
+    let used = top - sp;
+    let fresh_ = stack_memory! size;
+    let below = fresh_ + size - used;
+    prim.c3! "memcpy" below sp used;
+    stack_release! (prim.load64! (pcb + pcb_stack)) (prim.load64! (pcb + pcb_stack_size));
+    prim.store64! (pcb + pcb_stack) fresh_;
+    prim.store64! (pcb + pcb_stack_size) size;
+    make_current! p pcb;
+    below
+};
 
 /// The process in hand: what the context's fast fields are of.
 let make_current! !p !pcb = {
-    let floor = prim.load64! (pcb + pcb_stack) + stack_margin;
+    // Room below the guard for what runs between two entries, and at full size for reporting
+    // that the recursion has gone too deep.
+    let size = prim.load64! (pcb + pcb_stack_size);
+    let floor = prim.load64! (pcb + pcb_stack) + (if size >= stack_bytes { stack_margin } else { size / 4 });
     prim.store64! (p + ctx_current) pcb;
     prim.store64! (p + ctx_current_id) (tag_fix (prim.load64! (pcb + pcb_id)));
     prim.store64! (p + ctx_stack_top) (stack_top! pcb);
@@ -2213,15 +2262,52 @@ let now_ns! !p = {
     prim.load64! buf * 1000000000 + prim.load64! (buf + word)
 };
 
-let earliest_at! !p !id !n !best = if id >= n { best } else {
+// Who has a timer or a descriptor to be woken by. Asking this of every process on every switch made
+// a run with many of them quadratic, and few are ever in this state, so those that enter it are
+// listed, by id, and those that have left it are dropped when the list is next read.
+
+let note_waiter! !p !pcb = if prim.load64! (pcb + pcb_listed) != 0 { 0 } else {
+    let n = prim.load64! (p + ctx_wait_count);
+    if n >= prim.load64! (p + ctx_wait_cap) {
+        let cap = if n == 0 { 64 } else { n * 2 };
+        prim.store64! (p + ctx_wait_ids) (prim.c2! "realloc" (prim.load64! (p + ctx_wait_ids)) (cap * word));
+        prim.store64! (p + ctx_wait_cap) cap;
+    };
+    prim.store64! (prim.load64! (p + ctx_wait_ids) + n * word) (prim.load64! (pcb + pcb_id));
+    prim.store64! (p + ctx_wait_count) (n + 1);
+    prim.store64! (pcb + pcb_listed) 1;
+    0
+};
+
+let still_waiting! !pcb = prim.load64! (pcb + pcb_state) == state_waiting
+    && (prim.load64! (pcb + pcb_wake_at) >= 0 || prim.load64! (pcb + pcb_wait_fd) != 0);
+
+let refresh_waiters! !p !i !kept = if i >= prim.load64! (p + ctx_wait_count) {
+    prim.store64! (p + ctx_wait_count) kept;
+    kept
+} else {
+    let ids = prim.load64! (p + ctx_wait_ids);
+    let id = prim.load64! (ids + i * word);
     let pcb = table_at! p id;
+    if pcb != 0 && still_waiting! pcb {
+        prim.store64! (ids + kept * word) id;
+        refresh_waiters! p (i + 1) (kept + 1)
+    } else {
+        if pcb != 0 { prim.store64! (pcb + pcb_listed) 0; };
+        refresh_waiters! p (i + 1) kept
+    }
+};
+
+let waiter_at! !p !i = table_at! p (prim.load64! (prim.load64! (p + ctx_wait_ids) + i * word));
+
+let earliest_at! !p !id !n !best = if id >= n { best } else {
+    let pcb = waiter_at! p id;
     let at = if pcb == 0 { 0 - 1 } else { prim.load64! (pcb + pcb_wake_at) };
     earliest_at! p (id + 1) n
         (if at >= 0 && prim.load64! (pcb + pcb_state) == state_waiting && (best < 0 || at < best) { at } else { best })
 };
-
 let wake_expired! !p !id !n !now = if id >= n { 0 } else {
-    let pcb = table_at! p id;
+    let pcb = waiter_at! p id;
     if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting {
         let at = prim.load64! (pcb + pcb_wake_at);
         if at >= 0 && at <= now { wake! p pcb; };
@@ -2247,14 +2333,14 @@ let dispatch! !p !pcb !b !c !d !e = {
 
 /// Nothing is runnable. Timers may yet make something so; if none can, the run is over.
 let idle! !p !a !b !c !d !e = {
-    let n = prim.load64! (p + ctx_next_id);
-    let at = earliest_at! p 1 n (0 - 1);
+    let n = refresh_waiters! p 0 0;
+    let at = earliest_at! p 0 n (0 - 1);
     let now = now_ns! p;
     let wait = if at < 0 { 0 - 1 } else if at <= now { 0 } else { (at - now) / 1000000 + 1 };
     // Someone is parked on the system, so the system may yet answer: that is not a
     // deadlock, however long it takes.
     if poll_fds! p wait != 0 {
-        wake_expired! p 1 n (now_ns! p);
+        wake_expired! p 0 (prim.load64! (p + ctx_wait_count)) (now_ns! p);
         schedule! p 0 0 0 0 0
     }
     else if at >= 0 {
@@ -2264,7 +2350,7 @@ let idle! !p !a !b !c !d !e = {
             prim.store64! (ts + word) (wait % 1000 * 1000000);
             prim.c2! "nanosleep" ts 0;
         };
-        wake_expired! p 1 n (now_ns! p);
+        wake_expired! p 0 (prim.load64! (p + ctx_wait_count)) (now_ns! p);
         schedule! p 0 0 0 0 0
     }
     else if prim.load64! (p + ctx_live) == 0 { all_done! p 0 0 0 0 0 }
@@ -2272,11 +2358,14 @@ let idle! !p !a !b !c !d !e = {
 };
 
 let schedule! !p !a !b !c !d !e = {
-    let n = prim.load64! (p + ctx_next_id);
-    let at = earliest_at! p 1 n (0 - 1);
-    if at >= 0 { wake_expired! p 1 n (now_ns! p); };
-    // Those waiting on the system get a look in even while others are busy.
-    if prim.load64! (p + ctx_run_head) != 0 { poll_fds! p 0; };
+    let n = refresh_waiters! p 0 0;
+    let at = earliest_at! p 0 n (0 - 1);
+    if at >= 0 { wake_expired! p 0 n (now_ns! p); };
+    // Those waiting on the system get a look in even while others are busy, though not at the
+    // price of a system call for every switch.
+    let tick = prim.load64! (p + ctx_poll_tick) + 1;
+    prim.store64! (p + ctx_poll_tick) tick;
+    if n != 0 && tick & 63 == 0 && prim.load64! (p + ctx_run_head) != 0 { poll_fds! p 0; };
     let next = run_pop! p;
     if next == 0 { idle! p 0 0 0 0 0 } else { dispatch! p next 0 0 0 0 }
 };
@@ -2293,6 +2382,7 @@ let all_done! !p !a !b !c !d !e = {
     let pcb = table_at! p 1;
     let stack = map_memory! stack_bytes;
     prim.store64! (pcb + pcb_stack) stack;
+    prim.store64! (pcb + pcb_stack_size) stack_bytes;
     make_current! p pcb;
     let top = stack + stack_bytes;
     prim.store64! (top - word) (prim.info "halt");
@@ -2353,7 +2443,7 @@ let finish! !p !v !failed !d !e !f = {
     wake_list! p (prim.load64! (pcb + pcb_joiners));
     prim.store64! (pcb + pcb_monitors) nil_word;
     prim.store64! (pcb + pcb_joiners) nil_word;
-    prim.c2! "munmap" (prim.load64! (pcb + pcb_stack)) stack_bytes;
+    stack_release! (prim.load64! (pcb + pcb_stack)) (prim.load64! (pcb + pcb_stack_size));
     prim.store64! (pcb + pcb_stack) 0;
     schedule! p 0 0 0 0 0
 };
@@ -2502,6 +2592,7 @@ let await_message_m! !p !sp !self_ !n !deadline !d = {
     else if at >= 0 && now_ns! p >= at { return! p sp atom_timeout }
     else {
         prim.store64! (pcb + pcb_wake_at) at;
+        if at >= 0 { note_waiter! p pcb; };
         park! p sp (prim.load64! (prim.info "m_await")) n deadline unit_word
     }
 };
@@ -2512,6 +2603,7 @@ let sleep_until_m! !p !sp !self_ !deadline !c !d = {
     if now_ns! p >= at { return! p sp atom_ok }
     else {
         prim.store64! (pcb + pcb_wake_at) at;
+        note_waiter! p pcb;
         park! p sp (prim.load64! (prim.info "m_sleep")) deadline unit_word unit_word
     }
 };
@@ -2743,6 +2835,7 @@ let is_open! !p !h = as_word (fd_of! p h >= 0);
 let wait_fd! !p !sp !code !a !b !fd = {
     let pcb = current! p;
     prim.store64! (pcb + pcb_wait_fd) (fd + 1);
+    note_waiter! p pcb;
     park! p sp code a b unit_word
 };
 
@@ -3276,7 +3369,7 @@ let net_shutdown! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" 
 // --- waiting for the system -------------------------------------------------------------
 
 let fill_polls! !p !buf !id !n !count = if id >= n { count } else {
-    let pcb = table_at! p id;
+    let pcb = waiter_at! p id;
     if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting && prim.load64! (pcb + pcb_wait_fd) != 0 {
         let at = buf + count * 8;
         prim.store32! at (prim.load64! (pcb + pcb_wait_fd) - 1);
@@ -3287,7 +3380,7 @@ let fill_polls! !p !buf !id !n !count = if id >= n { count } else {
 };
 
 let wake_polled! !p !buf !id !n !at = if id >= n { 0 } else {
-    let pcb = table_at! p id;
+    let pcb = waiter_at! p id;
     if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting && prim.load64! (pcb + pcb_wait_fd) != 0 {
         if prim.load16! (buf + at * 8 + 6) != 0 {
             prim.store64! (pcb + pcb_wait_fd) 0;
@@ -3301,12 +3394,12 @@ let wake_polled! !p !buf !id !n !at = if id >= n { 0 } else {
 /// Ask the system which parked processes can go on, waiting up to `ms` (-1 for ever).
 /// Answers how many descriptors were asked about.
 let poll_fds! !p !ms = {
-    let n = prim.load64! (p + ctx_next_id);
-    let buf = alloc! p (n * 8 + 8);
-    let count = fill_polls! p buf 1 n 0;
+    let n = refresh_waiters! p 0 0;
+    let buf = if n == 0 { 0 } else { alloc! p (n * 8 + 8) };
+    let count = fill_polls! p buf 0 n 0;
     if count == 0 { 0 } else {
         prim.c3! "poll" buf count ms;
-        wake_polled! p buf 1 n 0;
+        wake_polled! p buf 0 n 0;
         count
     }
 };
@@ -5832,7 +5925,9 @@ let ffi_answer! !p !k !w =
 
 /// `spec` is `[values, codes, kind]`. A machine function, because a callback from C runs on
 /// this process's stack, below where this stands.
-let ffi_call_m! !p !sp !self_ !f !spec !d = {
+let ffi_call_m! !p !sp0 !self_ !f !spec !d = {
+    // C may call back, onto this stack, which cannot move while it does.
+    let sp = if prim.load64! (current! p + pcb_stack_size) < 1048576 && prim.load64! (p + ctx_in_callback) == 0 { move_stack! p sp0 1048576 } else { sp0 };
     let values = prim.load64! (spec + 2 * word);
     let codes = prim.load64! (spec + 3 * word);
     let k = untag_fix (prim.load64! (spec + 4 * word));
@@ -6147,4 +6242,93 @@ let cb_raised! !p !sp !e !b !c !d = {
 let note_context! !p = {
     prim.store64! (prim.info "cb_context") p;
     0
+};
+
+// --- sorting what needs no calling out ------------------------------------------------------------
+//
+// A stable bottom-up merge over `[key, index]` pairs in memory of its own, for `sort_keyed`. Keys are
+// words here, so a collection could not move them anyway: none can run, as nothing allocates until
+// the answer is built.
+
+let sort_key_at! !t !i = prim.load64! (t + i * 2 * word);
+
+let text_below! !a !b = {
+    let la = string_len! a;
+    let lb = string_len! b;
+    let c = prim.sext32 (prim.c3! "memcmp" (string_bytes a) (string_bytes b) (if la < lb { la } else { lb }));
+    c < 0 || (c == 0 && la < lb)
+};
+
+/// Whether `b` goes before `a`, which is all stability lets it ask.
+let sort_before! !texts !b !a = if texts { text_below! b a } else { b < a };
+
+/// `run` is five words: whether keys are strings, the source, the destination, where the first
+/// half stops and where the second does, since a dialect function has six parameters at most.
+let merge_run! !run !i !j !out = {
+    let texts = prim.load64! run != 0;
+    let src = prim.load64! (run + word);
+    let dst = prim.load64! (run + 2 * word);
+    let mid = prim.load64! (run + 3 * word);
+    let stop = prim.load64! (run + 4 * word);
+    if i >= mid && j >= stop { 0 }
+    else if i < mid && (j >= stop || not (sort_before! texts (sort_key_at! src j) (sort_key_at! src i))) {
+        prim.store64! (dst + out * 2 * word) (sort_key_at! src i);
+        prim.store64! (dst + out * 2 * word + word) (prim.load64! (src + i * 2 * word + word));
+        merge_run! run (i + 1) j (out + 1)
+    } else {
+        prim.store64! (dst + out * 2 * word) (sort_key_at! src j);
+        prim.store64! (dst + out * 2 * word + word) (prim.load64! (src + j * 2 * word + word));
+        merge_run! run i (j + 1) (out + 1)
+    }
+};
+
+let merge_width! !run !n !width !at = if at >= n { 0 } else {
+    let mid = if at + width < n { at + width } else { n };
+    let stop = if at + 2 * width < n { at + 2 * width } else { n };
+    prim.store64! (run + 3 * word) mid;
+    prim.store64! (run + 4 * word) stop;
+    merge_run! run at mid at;
+    merge_width! run n width stop
+};
+
+/// Which table holds the answer.
+let merge_all! !run !src !dst !n !width = if width >= n { src } else {
+    prim.store64! (run + word) src;
+    prim.store64! (run + 2 * word) dst;
+    merge_width! run n width 0;
+    merge_all! run dst src n (width * 2)
+};
+
+let sort_class! !keys !i !n !fixes !texts = if i >= n { if fixes { 1 } else if texts { 2 } else { 0 } } else {
+    let k = prim.load64! (keys + (2 + i) * word);
+    sort_class! keys (i + 1) n (fixes && is_fix k) (texts && is_string! k)
+};
+
+let sort_fill! !keys !t !i !n = if i >= n { 0 } else {
+    prim.store64! (t + i * 2 * word) (prim.load64! (keys + (2 + i) * word));
+    prim.store64! (t + i * 2 * word + word) i;
+    sort_fill! keys t (i + 1) n
+};
+
+let sorted_list! !p !items !t !i !tail = if i < 0 { tail } else {
+    sorted_list! p items t (i - 1)
+        (new_cons! p (prim.load64! (items + (2 + prim.load64! (t + i * 2 * word + word)) * word)) tail)
+};
+
+let sort_prim! !p !keys !items = {
+    let n = untag_fix (prim.load64! (keys + word));
+    let class = sort_class! keys 0 n true true;
+    if n == 0 || class == 0 { unit_word } else {
+        let a = prim.c1! "malloc" (2 * word * n);
+        let b = prim.c1! "malloc" (2 * word * n);
+        sort_fill! keys a 0 n;
+        let run = prim.c1! "malloc" (5 * word);
+        prim.store64! run (if class == 2 { 1 } else { 0 });
+        let answer = merge_all! run a b n 1;
+        prim.c1! "free" run;
+        let out = sorted_list! p items answer (n - 1) nil_word;
+        prim.c1! "free" a;
+        prim.c1! "free" b;
+        out
+    }
 };

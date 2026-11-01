@@ -248,11 +248,17 @@ let lib_raise e = native.raise_value e;
 
 // --- sorting, by keys --------------------------------------------------------------------
 
-let merge_pairs xs ys = match [xs, ys] {
-    [[], _] => ys,
-    [_, []] => xs,
-    [[x, ..xr], [y, ..yr]] =>
-        if compare_values y.[0] x.[0] < 0 { y :: merge_pairs xs yr } else { x :: merge_pairs xr ys },
+// Merging builds its answer backward and turns it round, rather than as a lazy list: a sort forces
+// everything it sorts, and a suspension per element per level is what it would otherwise leave for
+// the collector to copy.
+let merge_pairs xs ys = merge_pairs_onto xs ys [];
+
+let merge_pairs_onto xs ys !acc = match xs {
+    [] => rev_onto acc ys,
+    [[kx, _] as x, ..xr] => match ys {
+        [] => rev_onto acc xs,
+        [[ky, _] as y, ..yr] => if compare_values ky kx < 0 { merge_pairs_onto xs yr (y :: acc) } else { merge_pairs_onto xr ys (x :: acc) },
+    },
 };
 
 let split_at xs !n acc = if n == 0 { [native.array_to_list (array_of_list (rev_onto acc [])), xs] } else {
@@ -282,9 +288,14 @@ let seconds ps = match ps {
     [p, ..rest] => p.[1] :: seconds rest,
 };
 
-let sort_keyed keys items = {
-    let vs = native.array_to_list items;
-    seconds (merge_sort (pair_up keys vs) (length_from vs 0))
+/// Keys that are all small integers or all strings are sorted by the runtime, which needs no
+/// suspension or list cell to do it; anything else is compared here, as only here can it be.
+let sort_keyed keys items = match native.sort_prim (forced_array keys) items {
+    () => {
+        let vs = native.array_to_list items;
+        seconds (merge_sort (pair_up keys vs) (length_from vs 0))
+    },
+    sorted => sorted,
 };
 
 let type_assert ok why v = if ok { v } else { lib_raise (native.error_new :type_error why) };
@@ -320,10 +331,14 @@ let report_failures! es = match es {
 
 // --- files and directories, in terms of what the runtime has ---------------------------
 
-let merge_strings xs ys = match [xs, ys] {
-    [[], _] => ys,
-    [_, []] => xs,
-    [[x, ..xr], [y, ..yr]] => if y < x { y :: merge_strings xs yr } else { x :: merge_strings xr ys },
+let merge_strings xs ys = merge_strings_onto xs ys [];
+
+let merge_strings_onto xs ys !acc = match xs {
+    [] => rev_onto acc ys,
+    [x, ..xr] => match ys {
+        [] => rev_onto acc xs,
+        [y, ..yr] => if y < x { merge_strings_onto xs yr (y :: acc) } else { merge_strings_onto xr ys (x :: acc) },
+    },
 };
 
 let sort_strings xs !n =
