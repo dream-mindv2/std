@@ -290,7 +290,7 @@ let scan_processes! !p !id !n = if id >= n { 0 } else {
 
 let free_chunks! !p !c = if c == 0 { 0 } else {
     let next = prim.load64! c;
-    if prim.load64! (c + word) <= 4 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
+    if prim.load64! (c + word) <= 16 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
         prim.store64! c (prim.load64! (p + ctx_spare));
         prim.store64! (p + ctx_spare) c;
     } else {
@@ -318,7 +318,9 @@ let collect! !p !sp = {
     free_chunks! p old;
     let live = prim.load64! (p + ctx_to) - start;
     prim.store64! (p + ctx_chunks) to;
-    prim.store64! (p + ctx_total) space;
+    // What is in use, not what was mapped for it: counting the unused end of to-space would grow
+    // the next to-space by its own size each time, and then no mapping is ever reused.
+    prim.store64! (p + ctx_total) live;
     prim.store64! (p + ctx_want_gc) 0;
     prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
     prim.store64! (p + ctx_collections) (prim.load64! (p + ctx_collections) + 1);
