@@ -62,6 +62,7 @@ let ctx_handle_count = 208;
 let ctx_argc = 216;
 let ctx_argv = 224;
 let ctx_k512 = 232;
+let ctx_collections = 240;
 let ctx_size = 256;
 
 let kind_thunk = 0;
@@ -81,6 +82,7 @@ let kind_error = 13;
 let kind_process = 14;
 let kind_trunk = 15;
 let kind_tensor = 16;
+let kind_module = 17;
 
 // What a frame is, in its info's kind: nothing the unwinder need notice, or one of these.
 let frame_catch = 20;
@@ -287,6 +289,7 @@ let collect! !p !sp = {
     prim.store64! (p + ctx_total) space;
     prim.store64! (p + ctx_want_gc) 0;
     prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
+    prim.store64! (p + ctx_collections) (prim.load64! (p + ctx_collections) + 1);
     new_chunk! p (live * 2);
     0
 };
@@ -574,6 +577,7 @@ let type_of! !p !v =
         else if kind == kind_process { atom_process }
         else if kind == kind_trunk { prim.atom "trunk" }
         else if kind == kind_tensor { prim.atom "tensor" }
+        else if kind == kind_module { prim.atom "module" }
         else if kind == kind_record {
             atom_word (prim.load64! (prim.info "atom_types" + word * (prim.load64! (v + 2 * word) >> 8)))
         }
@@ -5076,3 +5080,45 @@ let is_number_value! !p !v = as_word (is_number! v);
 let describe_value! !p !v = describe! p v;
 
 let char_code_of! !p !c = tag_fix (c >> 8);
+
+/// A member a host module does not have, reached: the VM's error, in the VM's words.
+let no_such_member! !p !module_ !member = fail_value! p (prim.atom "no_such_member")
+    (concat2! p (concat3! p (text_of! p "module `") module_ (text_of! p "` has no member `")) (concat2! p member (text_of! p "`")));
+
+// What `std.vm` reports about the machine. Those about the VM's own structures have no
+// counterpart here, and say so by being empty.
+let processes_live! !p !unit = tag_fix (prim.load64! (p + ctx_live));
+let collections_done! !p !unit = tag_fix (prim.load64! (p + ctx_collections));
+let heap_bytes! !p !unit = tag_fix (prim.load64! (p + ctx_total));
+let zero_of! !p !v = tag_fix 0;
+let true_of! !p !v = true_word;
+let unit_of! !p !v = unit_word;
+let nil_of! !p !v = nil_word;
+let empty_map_of! !p !v = map_empty! p;
+
+/// `.member` of a value: a module's function, by the map `core.module_value` makes.
+let member_of! !p !o !name = {
+    if is_kind! o kind_module {
+        let m = prim.load64! (o + word);
+        let l = map_find! m (key_hash! name) name 0;
+        if l != 0 { prim.load64! (l + 3 * word) }
+        else {
+            let n = string_len! name;
+            let bare = if n > 0 && prim.load8! (string_bytes name + n - 1) == 33 { str_slice_any! p name (tag_fix 0) (tag_fix (n - 1)) } else { concat2! p name (text_of! p "!") };
+            let twin = map_find! m (key_hash! bare) bare 0;
+            if twin != 0 { prim.load64! (twin + 3 * word) }
+            else { fail_value! p (prim.atom "no_such_member") (concat3! p (text_of! p "this module has no member `") name (text_of! p "`")) }
+        }
+    }
+    else { fail_value! p atom_type_error (concat3! p (describe! p o) (text_of! p " has no member `") (concat2! p name (text_of! p "`"))) }
+};
+
+let module_of! !p !m !name = {
+    let o = alloc! p (3 * word);
+    prim.store64! o (prim.info "module");
+    prim.store64! (o + word) m;
+    prim.store64! (o + 2 * word) name;
+    o
+};
+
+let module_name! !p !o = prim.load64! (o + 2 * word);

@@ -56,6 +56,7 @@ let show v = {
         :process => native.process_text v,
         :trunk => native.concat3 "trunk[" (join_items (native.trunk_to_list v)) "]",
         :tensor => show_tensor v,
+        :module => native.concat3 "<module " (native.module_name v) ">",
         _ => show_record v,
     }
 };
@@ -84,10 +85,7 @@ let length v = match type_of v {
 };
 
 /// All the way down.
-let deep! v = {
-    settle v;
-    v
-};
+let deep! v = if settle v { v } else { v };
 
 let settle_list xs = match xs {
     [] => true,
@@ -103,6 +101,7 @@ let settle v = match type_of v {
     :bool => true, :unit => true, :pure_fn => true, :impure_fn => true, :process => true,
     :trunk => settle_list (native.trunk_to_list v),
     :tensor => true,
+    :module => true,
     _ => settle_list (native.array_to_list (native.record_fields v)),
 };
 
@@ -300,15 +299,9 @@ let raise_any! v = native.raise_or_wrap v;
 
 let cons_of x xs = x :: xs;
 
-let send_value! pid message = {
-    settle message;
-    native.send_forced pid message
-};
+let send_value! pid message = if settle message { native.send_forced pid message } else { () };
 
-let kill_value! pid reason = {
-    settle reason;
-    native.kill_forced pid reason
-};
+let kill_value! pid reason = if settle reason { native.kill_forced pid reason } else { () };
 
 /// The run is over: what failed unjoined is said, and is the exit status.
 let finish! u = {
@@ -452,7 +445,7 @@ let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env
 
 /// `vm.share!`: a value made safe to hand to any process. With one heap, being forced
 /// all the way down is all that takes.
-let share! v = { share_check v; v };
+let share! v = if share_check v { v } else { v };
 
 /// What a process could not read if it were in another heap is refused here as it would
 /// be there, so that a program is told the same on either.
@@ -757,7 +750,8 @@ let read_shape v = match as_items v {
     items => {
         let n = length_from items 0;
         if n == 0 || n > 6 { shape_error "a shape has between 1 and 6 axes" }
-        else { check_dims items; forced_array items }
+        else if check_dims items { forced_array items }
+        else { () }
     },
 };
 
@@ -838,8 +832,8 @@ let t_random_like seed t = if type_of seed != :integer { type_error "`random_lik
 let t_shape t = native.tensor_shape (as_tensor t);
 let t_rank t = native.tensor_rank (as_tensor t);
 let t_size t = native.tensor_size (as_tensor t);
-let t_device t = { as_tensor t; :host };
-let t_dtype t = { as_tensor t; :f64 };
+let t_device t = if native.is_tensor_value (as_tensor t) { :host } else { :host };
+let t_dtype t = if native.is_tensor_value (as_tensor t) { :f64 } else { :f64 };
 
 let t_reshape s v = {
     let t = as_tensor v;
@@ -934,7 +928,7 @@ let t_outer x y = {
 };
 
 let t_sum v = native.tensor_sum (as_tensor v);
-let t_sum_tensor v = t_sum v;
+let t_sum_tensor v = as_tensor [t_sum v];
 let t_minimum v = native.tensor_min (as_tensor v);
 let t_maximum v = native.tensor_max (as_tensor v);
 let t_mean v = native.tensor_mean (as_tensor v);
@@ -1022,8 +1016,7 @@ let row_list rows what limit = {
             xs => xs,
         }
     };
-    check_rows items what limit;
-    items
+    if check_rows items what limit { items } else { [] }
 };
 
 let map_to_int xs = match xs {
@@ -1066,8 +1059,7 @@ let t_concat ts = match as_items ts {
     [] => shape_error "`concat` needs at least one tensor",
     items => {
         let parts = tensors_of items;
-        same_tail parts parts.[0];
-        native.tensor_concat (forced_array parts)
+        if same_tail parts parts.[0] { native.tensor_concat (forced_array parts) } else { () }
     },
 };
 
@@ -1119,12 +1111,37 @@ let list_has xs x = match xs {
 let t_im2col kh kw stride pad v = {
     let x = as_tensor v;
     if native.tensor_rank x != 4 { shape_error (native.concat2 "`im2col` takes images `[n, h, w, c]`, not shape " (native.shape_text x)) }
-    else { native.tensor_im2col (forced_array [kh, kw, stride, pad]) x }
+    else {
+        match native.tensor_shape x {
+            [_, h, w, _] => match window_size "im2col" h w kh kw stride pad {
+                [_, _] => native.tensor_im2col (forced_array [kh, kw, stride, pad]) x,
+            },
+        }
+    }
 };
+
+let window_size what h w kh kw stride pad =
+    if type_of kh != :integer || type_of kw != :integer || type_of stride != :integer || type_of pad != :integer
+       || kh <= 0 || kw <= 0 || stride <= 0 || pad < 0 || h + 2 * pad < kh || w + 2 * pad < kw {
+        shape_error (concat_list ["`", what, "` takes a window that fits images of height ", show h, " and width ", show w])
+    } else { [(h + 2 * pad - kh) / stride + 1, (w + 2 * pad - kw) / stride + 1] };
 
 let t_col2im shape kh kw stride pad cols = {
     let c = as_tensor cols;
-    native.tensor_col2im (read_shape shape) (forced_array [kh, kw, stride, pad]) c
+    let s = read_shape shape;
+    let dims = native.array_to_list s;
+    match dims {
+        [n, h, w, ch] => {
+            let [oh, ow] = window_size "col2im" h w kh kw stride pad;
+            let rows = n * oh * ow;
+            let k = kh * kw * ch;
+            if native.tensor_shape c != [rows, k] {
+                shape_error (concat_list ["`col2im` needs the rows `im2col` makes for images of shape ", show_shape dims,
+                                          ", which are [", show rows, ", ", show k, "], not ", native.shape_text c])
+            } else { native.tensor_col2im s (forced_array [kh, kw, stride, pad]) c }
+        },
+        _ => shape_error (native.concat2 "`col2im` makes images `[n, h, w, c]`, not shape " (show_shape dims)),
+    }
 };
 
 let no_gpu t = lib_raise (native.error_new :no_gpu "no GPU is available: a native build has no OpenCL");
@@ -1210,7 +1227,7 @@ let wire_tensor t rest = {
 
 let list_append xs ys = concat_lists xs ys;
 
-let wire_encode v = { settle v; concat_list (wire_pieces v []) };
+let wire_encode v = if settle v { concat_list (wire_pieces v []) } else { "" };
 let wire_pack v = wire_encode v;
 
 let le_at s at !n = if n == 0 { 0 } else { le_at s (at + 1) (n - 1) * 256 + native.str_byte_any s at };
@@ -1322,5 +1339,27 @@ let wire_decode text = if type_of text != :string { lib_raise (native.error_new 
     match wire_read text 0 {
         () => Result.error "not a wire value",
         [v, at] => if at == native.size text { Result.ok v } else { Result.error "trailing bytes after a wire value" },
+    }
+};
+
+/// `vm.host_members`: `[name, arity]` of a module, in the order they were written, or `()`
+/// for a module there is none of.
+let host_members_in table module_ = {
+    let prefix = native.concat2 module_ ".";
+    let found = table_lines table 0 prefix;
+    match found { [] => (), _ => found }
+};
+
+let table_lines table !at prefix = {
+    if at >= native.size table { [] } else {
+        let nl = native.str_find_any table "\n" at;
+        let stop = if nl < 0 { native.size table } else { nl };
+        let line = native.str_slice_any table at (stop - at);
+        let n = native.size prefix;
+        let rest = table_lines table (stop + 1) prefix;
+        if native.str_slice_any line 0 n == prefix {
+            let space = native.str_find_any line " " n;
+            [native.str_slice_any line n (space - n), native.parse_int (native.str_slice_any line (space + 1) (native.size line))] :: rest
+        } else { rest }
     }
 };
