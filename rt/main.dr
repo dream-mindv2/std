@@ -71,6 +71,7 @@ let ctx_in_callback = 280;
 let ctx_cb_error = 288;
 let ctx_cb_text = 296;
 let ctx_opened = 304;
+let ctx_spare = 312;
 let ctx_size = 320;
 
 let kind_thunk = 0;
@@ -136,10 +137,25 @@ let fatal! s = {
 /// A chunk of at least `bytes`, made the place allocation continues. Nothing moves
 /// here, which is what lets a compiled function hold values in registers across an
 /// allocation: running out only asks for a collection at the next function entry.
+/// Memory a collection has finished with is used again before any is mapped: a page the program
+/// has touched costs no fault, and faults were a tenth of a run that allocates. Only what is
+/// near the allocation area's size is worth holding on to.
+let take_chunk! !p !size = {
+    let c = spare_fit! (p + ctx_spare) (prim.load64! (p + ctx_spare)) size;
+    if c != 0 { c } else { map_memory! size }
+};
+
+let spare_fit! !link !c !size =
+    if c == 0 { 0 }
+    else if prim.load64! (c + word) >= size {
+        prim.store64! link (prim.load64! c);
+        c
+    } else { spare_fit! c (prim.load64! c) size };
+
 let new_chunk! !p !bytes = {
     let want = bytes + chunk_header;
     let size = if want < min_chunk { min_chunk } else { want };
-    let chunk = map_memory! size;
+    let chunk = take_chunk! p size;
     prim.store64! chunk (prim.load64! (p + ctx_chunks));
     prim.store64! (chunk + word) size;
     prim.store64! (p + ctx_chunks) chunk;
@@ -272,11 +288,18 @@ let scan_processes! !p !id !n = if id >= n { 0 } else {
     scan_processes! p (id + 1) n
 };
 
-let free_chunks! !c = if c == 0 { 0 } else {
+let free_chunks! !p !c = if c == 0 { 0 } else {
     let next = prim.load64! c;
-    prim.c2! "munmap" c (prim.load64! (c + word));
-    free_chunks! next
+    if prim.load64! (c + word) <= 4 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
+        prim.store64! c (prim.load64! (p + ctx_spare));
+        prim.store64! (p + ctx_spare) c;
+    } else {
+        prim.c2! "munmap" c (prim.load64! (c + word));
+    };
+    free_chunks! p next
 };
+
+let spare_count! !c !n = if c == 0 { n } else { spare_count! (prim.load64! c) (n + 1) };
 
 let collect! !p !sp = {
     let old = prim.load64! (p + ctx_chunks);
@@ -292,7 +315,7 @@ let collect! !p !sp = {
     let cafs = prim.info "cafs";
     scan_cafs! p cafs 0 (prim.load64! cafs);
     scan! p start;
-    free_chunks! old;
+    free_chunks! p old;
     let live = prim.load64! (p + ctx_to) - start;
     prim.store64! (p + ctx_chunks) to;
     prim.store64! (p + ctx_total) space;
@@ -1118,16 +1141,21 @@ let int_or_float_op! !p !op !a !b =
 
 let is_listish! !v = v == nil_word || is_kind! v kind_cons;
 
+/// The test every float operation asks first, so that one costs a call and not a walk past
+/// tensors, strings and lists.
+let both_float! !a !b = (a | b) & 7 == 0 && prim.load64! a == prim.info "float" && prim.load64! b == prim.info "float";
+
 let add_slow! !p !a !b =
-    if is_tensor! a || is_tensor! b { tensor_op! p 0 a b }
+    if both_float! a b { new_float! p (prim.fadd (prim.load64! (a + word)) (prim.load64! (b + word))) }
+    else if is_tensor! a || is_tensor! b { tensor_op! p 0 a b }
     else if is_string! a && is_string! b { concat2! p a b }
     else if is_number! a && is_number! b { int_or_float_op! p 0 a b }
     else if is_listish! a && is_listish! b { deferred2! p (prim.info "lib_concat_lists") a b }
     else { cannot_apply! p "add" a b };
 
-let sub_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 1 a b } else if is_number! a && is_number! b { int_or_float_op! p 1 a b } else { cannot_apply! p "sub" a b };
-let mul_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 2 a b } else if is_number! a && is_number! b { int_or_float_op! p 2 a b } else { cannot_apply! p "mul" a b };
-let div_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 3 a b } else if is_number! a && is_number! b { int_or_float_op! p 3 a b } else { cannot_apply! p "div" a b };
+let sub_slow! !p !a !b = if both_float! a b { new_float! p (prim.fsub (prim.load64! (a + word)) (prim.load64! (b + word))) } else if is_tensor! a || is_tensor! b { tensor_op! p 1 a b } else if is_number! a && is_number! b { int_or_float_op! p 1 a b } else { cannot_apply! p "sub" a b };
+let mul_slow! !p !a !b = if both_float! a b { new_float! p (prim.fmul (prim.load64! (a + word)) (prim.load64! (b + word))) } else if is_tensor! a || is_tensor! b { tensor_op! p 2 a b } else if is_number! a && is_number! b { int_or_float_op! p 2 a b } else { cannot_apply! p "mul" a b };
+let div_slow! !p !a !b = if both_float! a b { new_float! p (prim.fdiv (prim.load64! (a + word)) (prim.load64! (b + word))) } else if is_tensor! a || is_tensor! b { tensor_op! p 3 a b } else if is_number! a && is_number! b { int_or_float_op! p 3 a b } else { cannot_apply! p "div" a b };
 let mod_slow! !p !a !b = if is_tensor! a || is_tensor! b { tensor_op! p 4 a b } else if is_number! a && is_number! b { int_or_float_op! p 4 a b } else { cannot_apply! p "mod" a b };
 
 let neg! !p !v =
