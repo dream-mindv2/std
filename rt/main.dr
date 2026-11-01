@@ -64,7 +64,14 @@ let ctx_argv = 224;
 let ctx_k512 = 232;
 let ctx_collections = 240;
 let ctx_ssl = 248;
-let ctx_size = 272;
+let ctx_foreign = 256;
+let ctx_foreign_next = 264;
+let ctx_ffi_sp = 272;
+let ctx_in_callback = 280;
+let ctx_cb_error = 288;
+let ctx_cb_text = 296;
+let ctx_opened = 304;
+let ctx_size = 320;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -145,7 +152,7 @@ let new_chunk! !p !bytes = {
 /// The slow path of a compiled allocation, and every allocation made here.
 let more! !p !bytes = {
     prim.store64! (p + ctx_want_gc) 1;
-    prim.store64! (p + ctx_guard) (0 - 1);
+    if prim.load64! (p + ctx_in_callback) == 0 { prim.store64! (p + ctx_guard) (0 - 1); };
     new_chunk! p bytes;
     alloc! p bytes
 };
@@ -281,6 +288,7 @@ let collect! !p !sp = {
     prim.store64! (p + ctx_to) start;
     prim.store64! (current! p + pcb_sp) sp;
     scan_processes! p 1 (prim.load64! (p + ctx_next_id));
+    evacuate_at! p (p + ctx_foreign);
     let cafs = prim.info "cafs";
     scan_cafs! p cafs 0 (prim.load64! cafs);
     scan! p start;
@@ -349,11 +357,12 @@ let collect_at_entry! !p !sp !a !b !c !d =
         prim.store64! (at + 5 * word) b;
         prim.store64! (at + 6 * word) c;
         prim.store64! (at + 7 * word) d;
-        if prim.load64! (p + ctx_want_gc) != 0 { collect! p at; };
+        let inside_c = prim.load64! (p + ctx_in_callback) != 0;
+        if prim.load64! (p + ctx_want_gc) != 0 && not inside_c { collect! p at; };
         prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
         // Asked for by the clock, or by a kill: another's turn, if there is another,
         // and a kill is seen where the process next resumes.
-        if prim.load64! (p + ctx_run_head) != 0 || prim.load64! (current! p + pcb_kill) != 0 {
+        if not inside_c && (prim.load64! (p + ctx_run_head) != 0 || prim.load64! (current! p + pcb_kill) != 0) {
             yield_now! p at unit_word 0 0 0
         } else {
             frame_resume_entry! p at unit_word 0 0 0
@@ -457,6 +466,7 @@ let init! () = {
     prim.store64! (p + ctx_table_cap) table_grow;
     prim.store64! (p + ctx_table) (prim.c2! "calloc" table_grow word);
     prim.store64! (p + ctx_next_id) 1;
+    note_context! p;
     init_handles! p;
     // A peer that has gone is an error from the write, not the end of the program.
     prim.c2! "signal" 13 1;
@@ -2307,6 +2317,7 @@ let finish! !p !v !failed !d !e !f = {
     prim.store64! (pcb + pcb_result) v;
     prim.store64! (pcb + pcb_failed) failed;
     prim.store64! (pcb + pcb_state) state_done;
+    release_owned! p (tag_fix (prim.load64! (pcb + pcb_id)));
     prim.store64! (p + ctx_live) (prim.load64! (p + ctx_live) - 1);
     tell_monitors! p pcb (prim.load64! (pcb + pcb_monitors));
     wake_list! p (prim.load64! (pcb + pcb_joiners));
@@ -2960,7 +2971,10 @@ let os_monotonic! !p !unit = tag_fix (now_ns! p / 1000000);
 let os_pid! !p !unit = tag_fix (prim.sext32 (prim.c0! "getpid"));
 let os_platform! !p !unit = prim.atom "linux";
 let os_arch! !p !unit = prim.atom "x86_64";
-let os_exit! !p !code = if is_fix code { prim.c1! "exit" (untag_fix code) } else { fail! p atom_type_error "exit! needs an exit code" };
+let os_exit! !p !code = if is_fix code {
+    release_owned! p (tag_fix (prim.load64! (current! p + pcb_id)));
+    prim.c1! "exit" (untag_fix code)
+} else { fail! p atom_type_error "exit! needs an exit code" };
 
 /// `$MINDV2_PATH`, or `~/.mindv2`: where an installation is, for a program with no VM
 /// beside it to ask.
@@ -5681,4 +5695,426 @@ let tls_info_parts! !p !h = {
 let tls_backend! !p !unit = {
     if ssl_lib! p == 0 { text_of! p "no OpenSSL could be opened" }
     else { c_text! p (prim.ptr1! (sym! p "OpenSSL_version") 0) }
+};
+
+// --- calling C ---------------------------------------------------------------------------------
+//
+// `std.ffi`. Almost all of it is in the library, in Dream: signatures are data, and a handle is
+// `[:foreign, tag, id]` whose id names an entry in the table here. What cannot be Dream is the
+// call itself. C's calling convention puts whole-number arguments and floating ones in two
+// separate rows of registers, independent of each other, so loading every register of both rows
+// and calling the address reaches every signature of up to six and eight of them; arguments past
+// six words go on the machine stack, which is where C looks next. So there is no libffi and no
+// table of shapes. A C function reads what it was declared to read and ignores the rest.
+//
+// A C callback into Dream is the one thing this does not do: see `lib.dr`.
+
+let foreign_new_id! !p !unit = {
+    let n = prim.load64! (p + ctx_foreign_next) + 1;
+    prim.store64! (p + ctx_foreign_next) n;
+    tag_fix n
+};
+
+let foreign_table! !p !unit = {
+    let m = prim.load64! (p + ctx_foreign);
+    if m == 0 { map_empty! p } else { m }
+};
+
+let foreign_set_table! !p !m = {
+    prim.store64! (p + ctx_foreign) m;
+    unit_word
+};
+
+let current_pid_id! !p !unit = tag_fix (prim.load64! (current! p + pcb_id));
+
+/// Move what a value is for C into the registers' rows. `codes`: 0 a word, 1 a double, 2 a
+/// float, 3 the bytes of a string, 4 somewhere inside one, the offset the next value.
+let ffi_load! !values !codes !ints !doubles !state = {
+    let i = state & 255;
+    let ni = (state >> 8) & 255;
+    let nd = (state >> 16) & 255;
+    let n = untag_fix (prim.load64! (values + word));
+    if i >= n { 0 } else {
+        let v = prim.load64! (values + (2 + i) * word);
+        let code = untag_fix (prim.load64! (codes + (2 + i) * word));
+        if code == 5 {
+            prim.store64! (ints + ni * word) (callback_stub! v);
+            ffi_load! values codes ints doubles (state + 1 + 256)
+        } else if code == 1 {
+            prim.store64! (doubles + nd * word) (float_bits! v);
+            ffi_load! values codes ints doubles (state + 1 + 65536)
+        } else if code == 2 {
+            prim.store64! (doubles + nd * word) (prim.to_f32 (float_bits! v));
+            ffi_load! values codes ints doubles (state + 1 + 65536)
+        } else {
+            prim.store64! (ints + ni * word) (ffi_word! v code);
+            ffi_load! values codes ints doubles (state + 1 + 256)
+        }
+    }
+};
+
+let ffi_word! !v !code =
+    if code == 3 { if v == unit_word || v == nil_word { 0 } else { string_bytes v } }
+    else if is_fix v { untag_fix v }
+    else if is_big! v { prim.load64! (limb_at v 0) | (big_limb! v 1 << 32) | 0 }
+    else if is_float! v { prim.f2i (prim.load64! (v + word)) }
+    else if v == true_word { 1 }
+    else { 0 };
+
+/// A word C answered, as the integer it stands for: narrowed by the `kind`, whose number is
+/// the library's (`ffi_kind_code`).
+let int_of_word! !p !w = {
+    if w >= 0 - (1 << 62) && w < (1 << 62) { tag_fix w }
+    else if w < 0 { neg! p (word_big! p (0 - w)) }
+    else { word_big! p w }
+};
+
+let word_big! !p !m = {
+    let b = new_big! p 2 0;
+    prim.store64! (limb_at b 0) (m & limb_mask);
+    prim.store64! (limb_at b 1) (prim.ushr m 32);
+    big_fix! b
+};
+
+let u64_of_word! !p !w = if w >= 0 && w < (1 << 62) { tag_fix w } else {
+    let b = new_big! p 2 0;
+    prim.store64! (limb_at b 0) (w & limb_mask);
+    prim.store64! (limb_at b 1) (prim.ushr w 32);
+    big_fix! b
+};
+
+/// Kinds: 0 void, 1 bool, 2-5 signed 8 to 64, 6-9 unsigned, 10 float, 11 double, 12 a pointer,
+/// 13 a C string. `w` is the raw word C left, for all but the floating ones.
+let ffi_answer! !p !k !w =
+    if k == 0 { unit_word }
+    else if k == 1 { as_word (w & 255 != 0) }
+    else if k == 2 { tag_fix ((w << 56) >> 56) }
+    else if k == 3 { tag_fix ((w << 48) >> 48) }
+    else if k == 4 { tag_fix ((w << 32) >> 32) }
+    else if k == 5 { int_of_word! p w }
+    else if k == 6 { tag_fix (w & 255) }
+    else if k == 7 { tag_fix (w & 65535) }
+    else if k == 8 { tag_fix (w & 4294967295) }
+    else if k == 9 { u64_of_word! p w }
+    else if k == 12 { if w == 0 { unit_word } else { int_of_word! p w } }
+    else if k == 13 { if w == 0 { unit_word } else { c_text! p w } }
+    else { unit_word };
+
+/// `spec` is `[values, codes, kind]`. A machine function, because a callback from C runs on
+/// this process's stack, below where this stands.
+let ffi_call_m! !p !sp !self_ !f !spec !d = {
+    let values = prim.load64! (spec + 2 * word);
+    let codes = prim.load64! (spec + 3 * word);
+    let k = untag_fix (prim.load64! (spec + 4 * word));
+    let ints = alloc! p (12 * word);
+    let doubles = alloc! p (8 * word);
+    zero_words! ints 12;
+    zero_words! doubles 8;
+    let outer_sp = prim.load64! (p + ctx_ffi_sp);
+    prim.store64! (p + ctx_ffi_sp) sp;
+    ffi_load! values codes ints doubles 0;
+    let address = word_of_int! f;
+    let raw = if k == 11 || k == 10 { prim.ffi_double! address ints doubles } else { prim.ffi_word! address ints doubles };
+    prim.store64! (p + ctx_ffi_sp) outer_sp;
+    let failed = prim.load64! (p + ctx_cb_error);
+    if failed != 0 {
+        prim.store64! (p + ctx_cb_error) 0;
+        unwind! p sp failed 0 0 0
+    } else if prim.load64! (p + ctx_cb_text) != 0 {
+        let text = prim.load64! (p + ctx_cb_text);
+        prim.store64! (p + ctx_cb_text) 0;
+        fail_value! p (prim.atom "ffi_error") text;
+        native_failed! p sp 0 0 0 0
+    } else {
+        if prim.load64! (p + ctx_want_gc) != 0 { prim.store64! (p + ctx_guard) (0 - 1); };
+        return! p sp (
+            if k == 11 { new_float! p raw }
+            else if k == 10 { new_float! p (prim.from_f32 raw) }
+            else { ffi_answer! p k raw })
+    }
+};
+
+let word_of_int! !v = if is_fix v { untag_fix v } else { big_limb! v 0 | (big_limb! v 1 << 32) };
+
+/// What is at an address, by the same kinds.
+let ffi_load_at! !p !k !at =
+    if k == 1 { as_word (prim.load8! at != 0) }
+    else if k == 2 || k == 6 { ffi_answer! p k (prim.load8! at) }
+    else if k == 3 || k == 7 { ffi_answer! p k (prim.load16! at) }
+    else if k == 4 || k == 8 { ffi_answer! p k (prim.load32! at) }
+    else if k == 10 { new_float! p (prim.from_f32 (prim.load32! at)) }
+    else if k == 11 { new_float! p (prim.load64! at) }
+    else { ffi_answer! p k (prim.load64! at) };
+
+let ffi_peek_at! !p !kind !address = ffi_load_at! p (untag_fix kind) (word_of_int! address);
+
+let ffi_store_at! !p !kind !address !v = {
+    let k = untag_fix kind;
+    let at = word_of_int! address;
+    if k == 1 { prim.store8! at (if v == true_word { 1 } else { 0 }); }
+    else if k == 2 || k == 6 { prim.store8! at (ffi_word! v 0); }
+    else if k == 3 || k == 7 { prim.store16! at (ffi_word! v 0); }
+    else if k == 4 || k == 8 { prim.store32! at (ffi_word! v 0); }
+    else if k == 10 { prim.store32! at (prim.to_f32 (float_bits! v)); }
+    else if k == 11 { prim.store64! at (float_bits! v); }
+    else { prim.store64! at (ffi_word! v 0); };
+    unit_word
+};
+
+let ffi_read_bytes! !p !address !n = {
+    let s = new_string! p (untag_fix n);
+    prim.c3! "memcpy" (string_bytes s) (word_of_int! address) (untag_fix n);
+    s
+};
+
+let ffi_write_bytes! !p !address !s = {
+    prim.c3! "memcpy" (word_of_int! address) (string_bytes s) (string_len! s);
+    unit_word
+};
+
+let ffi_read_text! !p !address = c_text! p (word_of_int! address);
+let ffi_calloc! !p !n = int_of_word! p (prim.c2! "calloc" (if untag_fix n == 0 { 1 } else { untag_fix n }) 1);
+let ffi_malloc! !p !n = int_of_word! p (prim.c1! "malloc" (if untag_fix n == 0 { 1 } else { untag_fix n }));
+let ffi_raw_free! !p !address = {
+    prim.c1! "free" (word_of_int! address);
+    unit_word
+};
+
+let ffi_dlopen! !p !path =
+    int_of_word! p (if path == unit_word || string_len! path == 0 { prim.c2! "dlopen" 0 258 } else { prim.c2! "dlopen" (string_bytes path) 258 });
+
+let ffi_dlerror! !p !unit = {
+    let e = prim.c0! "dlerror";
+    if e == 0 { text_of! p "unknown error" } else { c_text! p e }
+};
+
+let ffi_dlsym! !p !handle !name = int_of_word! p (prim.c2! "dlsym" (word_of_int! handle) (string_bytes name));
+
+/// A library that is a payload's bytes: a file with no name, opened through its descriptor.
+/// A library carried as a payload is opened once. Each `dlopen` of a new memfd is a new copy of
+/// the library with its own globals, so a function and the destructor bound to its result would
+/// otherwise not be talking about the same state. A payload's index is the key.
+let ffi_open_bytes! !p !text !index = {
+    let found = ffi_opened! (prim.load64! (p + ctx_opened)) index;
+    if found != 0 { int_of_word! p found } else {
+        let fd = prim.sext32 (prim.c2! "memfd_create" (string_bytes (text_of! p "library")) 0);
+        if fd < 0 { tag_fix 0 } else {
+            prim.c3! "write" fd (string_bytes text) (string_len! text);
+            let path = concat2! p (text_of! p "/proc/self/fd/") (int_to_string! p (tag_fix fd));
+            let h = prim.c2! "dlopen" (string_bytes path) 258;
+            if h != 0 {
+                let cell = prim.c1! "malloc" (3 * word);
+                prim.store64! cell index;
+                prim.store64! (cell + word) h;
+                prim.store64! (cell + 2 * word) (prim.load64! (p + ctx_opened));
+                prim.store64! (p + ctx_opened) cell;
+            };
+            int_of_word! p h
+        }
+    }
+};
+
+let ffi_opened! !cell !index =
+    if cell == 0 { 0 }
+    else if prim.load64! cell == index { prim.load64! (cell + word) }
+    else { ffi_opened! (prim.load64! (cell + 2 * word)) index };
+
+/// A destructor, called with what it is to destroy; what it answers is nobody's concern.
+let ffi_destroy! !p !dtor !ptr = {
+    if word_of_int! dtor != 0 { prim.ptr1! (word_of_int! dtor) (word_of_int! ptr); };
+    unit_word
+};
+
+/// Everything a process still owns, newest first, when it ends. An entry is
+/// `[owner, tag, pointer, destructor, size, parents]`, and the ids are in order of creation.
+/// What a process owned, destroyed when it ends: newest first, because what is made from a thing
+/// is newer than it and must go before it. Nothing here forces, and the fields were forced when
+/// the handle was made (`ffi_adopt!`). A shell sort over a C array, as a process may own many.
+let release_owned! !p !owner = {
+    let m = prim.load64! (p + ctx_foreign);
+    if m != 0 {
+        let ps = node_pairs! p m (popcount (branch_bitmap! m) - 1) nil_word;
+        let n = owned_count! ps owner 0;
+        if n > 0 {
+            let table = prim.c1! "malloc" (2 * word * n);
+            owned_fill! ps owner table 0;
+            owned_sort! table n (n / 2);
+            release_each! p table 0 n;
+            prim.c1! "free" table;
+        };
+    };
+    0
+};
+
+let entry_field! !e !i = prim.load64! (e + (2 + i) * word);
+let pair_id! !pair = prim.load64! (pair + word);
+let pair_entry! !pair = prim.load64! (prim.load64! (pair + 2 * word) + word);
+
+let owned_count! !ps !owner !n = if ps == nil_word { n } else {
+    let hit = entry_field! (pair_entry! (prim.load64! (ps + word))) 0 == owner;
+    owned_count! (prim.load64! (ps + 2 * word)) owner (if hit { n + 1 } else { n })
+};
+
+let owned_fill! !ps !owner !at !i = if ps == nil_word { 0 } else {
+    let pair = prim.load64! (ps + word);
+    if entry_field! (pair_entry! pair) 0 == owner {
+        prim.store64! (at + i * 2 * word) (pair_id! pair);
+        prim.store64! (at + i * 2 * word + word) (pair_entry! pair);
+        owned_fill! (prim.load64! (ps + 2 * word)) owner at (i + 1)
+    } else { owned_fill! (prim.load64! (ps + 2 * word)) owner at i }
+};
+
+let owned_sort! !t !n !gap = if gap <= 0 { 0 } else {
+    owned_pass! t n gap gap;
+    owned_sort! t n (gap / 2)
+};
+let owned_pass! !t !n !gap !i = if i >= n { 0 } else {
+    owned_sink! t gap i (prim.load64! (t + i * 2 * word)) (prim.load64! (t + i * 2 * word + word));
+    owned_pass! t n gap (i + 1)
+};
+let owned_sink! !t !gap !j !id !e =
+    if j >= gap && prim.load64! (t + (j - gap) * 2 * word) < id {
+        prim.store64! (t + j * 2 * word) (prim.load64! (t + (j - gap) * 2 * word));
+        prim.store64! (t + j * 2 * word + word) (prim.load64! (t + (j - gap) * 2 * word + word));
+        owned_sink! t gap (j - gap) id e
+    } else {
+        prim.store64! (t + j * 2 * word) id;
+        prim.store64! (t + j * 2 * word + word) e;
+        0
+    };
+
+let release_each! !p !t !i !n = if i >= n { 0 } else {
+    let e = prim.load64! (t + i * 2 * word + word);
+    ffi_destroy! p (entry_field! e 3) (entry_field! e 2);
+    prim.store64! (p + ctx_foreign) (map_remove! p (prim.load64! (p + ctx_foreign)) (prim.load64! (t + i * 2 * word)));
+    release_each! p t (i + 1) n
+};
+
+// --- large data ----------------------------------------------------------------------------------
+
+/// How many data the program was built with.
+let data_count! !p !unit = tag_fix (prim.load64! (prim.info "payload_table"));
+
+/// One, as a string. The VM hands out a view of the mapped file; here it is copied, once per
+/// ask, which costs what its size costs and is the same bytes.
+let data_at! !p !i = {
+    let n = prim.load64! (prim.info "payload_table");
+    let k = untag_fix i;
+    if not (is_fix i) || k < 0 || k >= n {
+        fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "no datum " (describe! p i) ": this program carries ") (int_to_string! p (tag_fix n)))
+    } else {
+        let t = prim.info "payload_table" + word + k * 3 * word;
+        let s = new_string! p (prim.load64! (t + word));
+        prim.c3! "memcpy" (string_bytes s) (prim.info "payload" + prim.load64! t) (prim.load64! (t + word));
+        s
+    }
+};
+
+let data_named! !p !name !i = {
+    let n = prim.load64! (prim.info "payload_table");
+    if i >= n { tag_fix (0 - 1) }
+    else {
+        let t = prim.info "payload_table" + word + i * 3 * word;
+        let label = prim.load64! (t + 2 * word);
+        if label != 0 && string_eq! label name { tag_fix i } else { data_named! p name (i + 1) }
+    }
+};
+
+let payload_index! !p !name = {
+    let found = data_named! p name 0;
+    if found == tag_fix (0 - 1) { unit_word } else { found }
+};
+
+// --- C calling back -----------------------------------------------------------------------------
+//
+// A C function given a Dream function gets the address of a stub made for the call: load the
+// callback's record, jump to `dream_cb_common` in the machine's text, which saves the argument
+// registers and calls `cb_enter!`. That pushes a frame on the stack of the process that made the
+// call and applies the function, and the frame's code answers C: everything until then has been
+// tail calls, so returning from it returns from `cb_enter!`. A collection would move what C
+// was given, so none runs until C has returned, and neither does any other process, which is
+// why a callback must be pure: it cannot wait for anything. A raise is kept and raised once C
+// has returned, as the VM does, and C is told zero meanwhile.
+
+let cb_record_bytes = 40;
+
+let callback_stub! !spec = {
+    let p = prim.load64! (prim.info "cb_context");
+    let kinds = prim.load64! (spec + 3 * word);
+    let rec_ = prim.c1! "malloc" cb_record_bytes;
+    prim.store64! rec_ p;
+    prim.store64! (rec_ + word) (prim.load64! (spec + 2 * word));
+    prim.store64! (rec_ + 2 * word) kinds;
+    prim.store64! (rec_ + 3 * word) (untag_fix (prim.load64! (spec + 4 * word)));
+    let code = prim.c6! "mmap" 0 4096 7 34 (0 - 1) 0;
+    // movabs r10, record; movabs r11, common; jmp r11
+    prim.store8! code 73;
+    prim.store8! (code + 1) 186;
+    prim.store64! (code + 2) rec_;
+    prim.store8! (code + 10) 73;
+    prim.store8! (code + 11) 187;
+    prim.store64! (code + 12) (prim.info "cb_common");
+    prim.store8! (code + 20) 65;
+    prim.store8! (code + 21) 255;
+    prim.store8! (code + 22) 227;
+    code
+};
+
+/// One argument, from the saved registers: six words, then eight floating.
+let cb_argument! !p !k !regs !state = {
+    let ni = state & 255;
+    let nd = state >> 8;
+    if k == 10 { new_float! p (prim.from_f32 (prim.load64! (regs + (6 + nd) * word))) }
+    else if k == 11 { new_float! p (prim.load64! (regs + (6 + nd) * word)) }
+    else { ffi_answer! p k (prim.load64! (regs + ni * word)) }
+};
+
+let cb_args! !p !kinds !regs !i !n !state = if i >= n { nil_word } else {
+    let k = untag_fix (prim.load64! (kinds + (2 + i) * word));
+    let next = if k == 10 || k == 11 { state + 256 } else { state + 1 };
+    new_cons! p (cb_argument! p k regs state) (cb_args! p kinds regs (i + 1) n next)
+};
+
+let cb_push! !sp !args = if args == nil_word { sp } else {
+    let below = cb_push! sp (prim.load64! (args + 2 * word));
+    let at = below - word;
+    prim.store64! at (prim.load64! (args + word));
+    at
+};
+
+let cb_enter! !rec_ !regs = {
+    let p = prim.load64! rec_;
+    let f = prim.load64! (rec_ + word);
+    let kinds = prim.load64! (rec_ + 2 * word);
+    let n = untag_fix (prim.load64! (kinds + word));
+    prim.store64! (p + ctx_in_callback) (prim.load64! (p + ctx_in_callback) + 1);
+    let sp = prim.load64! (p + ctx_ffi_sp);
+    if prim.load64! (p + ctx_cb_error) != 0 { 0 } else {
+        let frame = sp - 2 * word;
+        prim.store64! frame (prim.info "cb_return");
+        prim.store64! (frame + word) (tag_fix (prim.load64! (rec_ + 3 * word)));
+        let args = if n == 0 { new_cons! p unit_word nil_word } else { cb_args! p kinds regs 0 n 0 };
+        let below = cb_push! frame args;
+        apply! p below f (if n == 0 { 1 } else { n }) 0 0
+    }
+};
+
+let frame_cb_return! !p !sp !v !b !c !d = {
+    let k = untag_fix (prim.load64! (sp + word));
+    prim.store64! (p + ctx_in_callback) (prim.load64! (p + ctx_in_callback) - 1);
+    if k == 0 { 0 }
+    else if k == 10 { prim.to_f32 (float_bits! v) }
+    else if k == 11 { float_bits! v }
+    else { ffi_word! v 0 }
+};
+
+let cb_raised! !p !sp !e !b !c !d = {
+    prim.store64! (p + ctx_in_callback) (prim.load64! (p + ctx_in_callback) - 1);
+    prim.store64! (p + ctx_cb_error) e;
+    0
+};
+
+let note_context! !p = {
+    prim.store64! (prim.info "cb_context") p;
+    0
 };

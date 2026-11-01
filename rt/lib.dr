@@ -1428,3 +1428,544 @@ let tls_info! h = match native.tls_info_parts h {
     () => (),
     [version, cipher, alpn, peer] => %{:version => version, :cipher => cipher, :alpn => alpn, :peer => peer},
 };
+
+// --- what the supercompiler writes -----------------------------------------------------------
+//
+// In a release build a loop's accumulator or membership test may be rewritten to one of
+// these. Each may answer "cannot say", `()`, and the code it was written into then does what
+// the program said in the first place, so a set or a tally here that knows nothing is correct
+// and only as fast as the program was before it was rewritten. The ones that have to answer
+// do so plainly.
+
+let indexed v = match type_of v { :list => array_of_list v, _ => v };
+let append_rev xs ys = concat_lists xs (rev_onto ys []);
+let str_append_rev s parts = concat_list (s :: rev_onto parts []);
+let set_of xs = ();
+let set_add s v = s;
+let set_lookup s v = ();
+let set_refresh s xs = s;
+let tally xs = ();
+let tally_lookup t xs v = ();
+let index_new xs path sorted = ();
+let index_find i v = ();
+let trunk_recall key t = ();
+
+let list_drop !n xs = if n <= 0 { xs } else {
+    match xs { [] => [], [_, ..rest] => list_drop (n - 1) rest }
+};
+
+let memo_fill a f !i !n = if i >= n { a } else { memo_fill (native.array_store a i (f i)) f (i + 1) n };
+let memo_cells n f = memo_fill (native.array_new n ()) f 0 n;
+
+/// A heap, as the sorted list it stands for: `compare` on the elements, first met first.
+let sorted_values xs = {
+    let n = length_from xs 0;
+    seconds (merge_sort (pair_up xs xs) n)
+};
+let heap_of xs = sorted_values xs;
+let heap_empty h = match h { [] => true, _ => false };
+let heap_min h = match h {
+    [x, .._] => x,
+    [] => lib_raise (native.error_new :type_error "head needs a non-empty list"),
+};
+let heap_pop h = match h {
+    [_, ..rest] => rest,
+    [] => lib_raise (native.error_new :type_error "tail needs a non-empty list"),
+};
+let heap_insert h x = match h {
+    [] => [x],
+    [y, ..rest] => if compare_values x y < 0 { x :: h } else { y :: heap_insert rest x },
+};
+let heap_push h xs = match xs {
+    [] => h,
+    [x, ..rest] => heap_push (heap_insert h x) rest,
+};
+
+// --- std.ffi -------------------------------------------------------------------------------------
+//
+// A signature is data, and so is everything said about it, so this is an ordinary program
+// over the runtime's one real operation (`ffi_call!`). A foreign function is a closure of the
+// arguments it wants. The one thing missing is `[:callback, ..]`: C calling back into a program
+// needs an entry from C onto a process's stack, which a native build does not have yet, and a
+// signature that asks for one is an error saying so.
+
+let ffi_fail why = lib_raise (native.error_new :ffi_error why);
+
+let ffi_kind_of name = match name {
+    "void" => [0, 0, 1], "bool" => [1, 1, 1],
+    "i8" => [2, 1, 1], "char" => [2, 1, 1], "i16" => [3, 2, 2], "short" => [3, 2, 2],
+    "i32" => [4, 4, 4], "int" => [4, 4, 4], "i64" => [5, 8, 8], "long" => [5, 8, 8], "longlong" => [5, 8, 8],
+    "ssize" => [5, 8, 8], "intptr" => [5, 8, 8],
+    "u8" => [6, 1, 1], "uchar" => [6, 1, 1], "u16" => [7, 2, 2], "ushort" => [7, 2, 2],
+    "u32" => [8, 4, 4], "uint" => [8, 4, 4], "u64" => [9, 8, 8], "ulong" => [9, 8, 8], "ulonglong" => [9, 8, 8],
+    "size" => [9, 8, 8], "uintptr" => [9, 8, 8],
+    "f32" => [10, 4, 4], "f64" => [11, 8, 8], "double" => [11, 8, 8],
+    "ptr" => [12, 8, 8], "cstr" => [13, 8, 8], "bytes" => [14, 8, 8],
+    _ => (),
+};
+
+let ffi_scalar name = ffi_kind_of name;
+
+/// A type as `[:scalar, kind]`, `[:handle, tag]`, `[:own, tag, dtor]`, `[:borrow, tag]`,
+/// `[:take_cstr, dtor]` or `[:out, inner]`.
+let ffi_parse v lib pos = match type_of v {
+    :atom => {
+        let name = native.atom_name v;
+        if name == "buffer" && pos == :arg { [:handle, "buffer"] } else {
+            match ffi_scalar name {
+                () => ffi_fail (concat_list ["`:", name, "` is not an FFI type"]),
+                k => {
+                    let code = k.[0];
+                    if code == 0 && pos != :ret { ffi_fail "`:void` is only a return type" }
+                    else if code == 14 && pos != :arg { ffi_fail "`:bytes` is only an argument type: C cannot say how long a pointer's bytes are" }
+                    else { [:scalar, code] }
+                },
+            }
+        }
+    },
+    :list => match v {
+        [:handle, tag] => if pos != :arg { ffi_fail "`[:handle, tag]` is an argument type; a result that is a pointer is `[:own, tag, destructor]` or `[:borrow, tag]`" } else { [:handle, tag] },
+        [:own, tag, dtor] => if pos == :arg { ffi_fail "`[:own, tag, destructor]` is a result type; an argument is `[:handle, tag]`" } else { [:own, tag, ffi_destructor lib dtor] },
+        [:borrow, tag] => if pos == :arg { ffi_fail "`[:borrow, tag]` is a result type; an argument is `[:handle, tag]`" } else { [:borrow, tag] },
+        [:cstr, dtor] => if pos == :arg { ffi_fail "`[:cstr, destructor]` is a result type; an argument is `:cstr`" } else { [:take_cstr, ffi_destructor lib dtor] },
+        [:out, inner] => if pos != :arg { ffi_fail "`[:out, t]` is an argument type" } else { [:out, ffi_parse inner lib :out_inner] },
+        [:callback, args, ret] => if pos != :arg { ffi_fail "`[:callback, args, result]` is an argument type" } else { ffi_parse_callback args ret lib },
+        _ => ffi_fail "a compound type is `[:handle, tag]`, `[:own, tag, destructor]`, `[:borrow, tag]`, `[:cstr, destructor]`, `[:out, t]` or `[:callback, args, result]`",
+    },
+    _ => ffi_fail "a type is an atom such as `:i32`, or a list such as `[:own, \"db\", \"db_close\"]`",
+};
+
+let ffi_parse_callback args ret lib = {
+    let kinds = ffi_callback_kinds (as_items args) lib;
+    match ffi_parse ret lib :ret {
+        [:scalar, k] => if k == 13 || k == 14 { ffi_fail "a callback cannot answer a `:cstr`" } else { [:callback, kinds, k] },
+        _ => ffi_fail "a callback answers a number, `:ptr` or `:void`",
+    }
+};
+
+let ffi_callback_kinds items lib = match items {
+    [] => [],
+    [t, ..rest] => match ffi_parse t lib :arg {
+        [:scalar, k] => if k == 14 { ffi_fail "a callback's arguments are numbers, `:ptr` or `:cstr`" } else { k :: ffi_callback_kinds rest lib },
+        _ => ffi_fail "a callback's arguments are numbers, `:ptr` or `:cstr`",
+    },
+};
+
+let ffi_destructor lib name = {
+    let found = native.ffi_dlsym lib name;
+    if found != 0 { found } else {
+        let own = native.ffi_dlsym (native.ffi_dlopen ()) name;
+        if own != 0 { own } else {
+            ffi_fail (concat_list ["cannot find the destructor `", name, "`"])
+        }
+    }
+};
+
+// --- libraries --------------------------------------------------------------------------------
+
+let ffi_open_one v = match type_of v {
+    :unit => [native.ffi_dlopen (), "<this program>"],
+    :string => {
+        let h = native.ffi_dlopen v;
+        if h == 0 { (concat_list ["cannot open ", v, ": ", native.ffi_dlerror ()]) } else { [h, if v == "" { "<this program>" } else { v }] }
+    },
+    :list => match v {
+        [:any, choices] => ffi_open_any choices "",
+        [:search, name, files, dirs] => ffi_search name files dirs,
+        [:payload, which] => ffi_open_payload which,
+        _ => "a library is a path, `()` for this program, `[:any, choices]`, `[:search, ..]` or `[:payload, name]`",
+    },
+    _ => "a library is a path, `()` for this program, `[:any, choices]`, `[:search, ..]` or `[:payload, name]`",
+};
+
+let ffi_open_any choices why = match choices {
+    [] => if why == "" { "`any` was given no libraries to choose from" } else { native.concat2 "none of the libraries could be opened:" why },
+    [c, ..rest] => match ffi_open_one c {
+        [h, where] => [h, where],
+        text => ffi_open_any rest (concat_list [why, "\n", text]),
+    },
+};
+
+let ffi_try_files dirs files = match dirs {
+    [] => ffi_try_plain files,
+    [d, ..more] => match ffi_try_in d files {
+        () => ffi_try_files more files,
+        found => found,
+    },
+};
+
+let ffi_try_in dir files = match files {
+    [] => (),
+    [f, ..rest] => {
+        let path = path_join dir f;
+        let h = native.ffi_dlopen path;
+        if h != 0 { [h, path] } else { ffi_try_in dir rest }
+    },
+};
+
+let ffi_try_plain files = match files {
+    [] => (),
+    [f, ..rest] => {
+        let h = native.ffi_dlopen f;
+        if h != 0 { [h, f] } else { ffi_try_plain rest }
+    },
+};
+
+let ffi_search name files dirs = {
+    let env_name = native.concat2 "DREAM_LIB_" (native.str_ascii_case name true);
+    let named = native.os_env env_name;
+    let from_env = match type_of named {
+        :string => { let h = native.ffi_dlopen named; if h != 0 { [h, named] } else { () } },
+        _ => (),
+    };
+    match from_env {
+        () => match ffi_try_files dirs files {
+            () => concat_list ["cannot find the C library `", name, "`: looked for ", join_items files, " in ", join_items dirs, " and on the loader's path; `$", env_name, "` names it"],
+            found => found,
+        },
+        found => found,
+    }
+};
+
+let ffi_open_payload which = {
+    let index = match type_of which { :string => native.payload_index which, _ => which };
+    match type_of index {
+        :integer => if index >= 0 && index < native.data_count () {
+            let h = native.ffi_open_bytes (native.data_at index) index;
+            if h == 0 { concat_list ["cannot open payload `", show which, "`: ", native.ffi_dlerror ()] }
+            else { [h, concat_list ["payload `", show which, "`"]] }
+        } else { concat_list ["this image carries no payload ", show which] },
+        _ => concat_list ["this image carries no payload called `", show which, "`; build it with `--payload ", show which, "=FILE`"],
+    }
+};
+
+let ffi_library desc = match ffi_open_one desc {
+    [h, where] => [h, where],
+    why => ffi_fail why,
+};
+
+let ffi_locate! lib = match ffi_open_one lib {
+    [_, where] => Result.ok where,
+    why => Result.error why,
+};
+
+// --- handles ------------------------------------------------------------------------------------
+//
+// `[owner, tag, pointer, destructor, size, parents]`, by id, in the runtime's table.
+
+let ffi_adopt! tag ptr dtor size parents = {
+    let id = native.foreign_new_id ();
+    // An array of forced fields, because the runtime reads one when the process that owns it
+    // ends, and nothing can be forced by then.
+    native.foreign_set_table (native.map_put (native.foreign_table ()) id (forced_array [native.current_pid_id (), tag, ptr, dtor, size, parents]));
+    [:foreign, tag, id]
+};
+
+let ffi_entry h = match h {
+    [:foreign, tag, id] => match native.match_key (native.foreign_table ()) id {
+        [e] => if e.[1] == tag && e.[0] == native.current_pid_id () { [id, e] }
+               else { concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"] },
+        _ => concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"],
+    },
+    _ => "expected a handle, `[:foreign, tag, id]`",
+};
+
+let ffi_live h = match ffi_entry h {
+    [id, e] => [id, e],
+    why => ffi_fail why,
+};
+
+/// What goes wrong marshalling an argument is said of the argument.
+let ffi_said prefix why = lib_raise (native.error_new :ffi_error (native.concat2 prefix why));
+
+let ffi_live_as h prefix = match ffi_entry h {
+    [id, e] => [id, e],
+    why => ffi_said prefix why,
+};
+
+let ffi_children id ps = match ps {
+    [] => [],
+    [[k, e], ..rest] => if list_has e.[5] id { k :: ffi_children id rest } else { ffi_children id rest },
+};
+
+let ffi_release_id! id = match native.match_key (native.foreign_table ()) id {
+    [e] => {
+        ffi_release_all! (rev_onto (sort_strings_any (ffi_children id (native.map_pairs (native.foreign_table ())))) []);
+        native.ffi_destroy e.[3] e.[2];
+        native.foreign_set_table (native.map_remove (native.foreign_table ()) id);
+        ()
+    },
+    _ => (),
+};
+
+let sort_strings_any xs = sort_strings xs (length_from xs 0);
+
+let ffi_release_all! ids = match ids {
+    [] => (),
+    [i, ..rest] => { ffi_release_id! i; ffi_release_all! rest },
+};
+
+let ffi_release! h = {
+    let [id, _] = ffi_live_as h "release!: ";
+    ffi_release_id! id
+};
+
+let ffi_alive! h = match ffi_entry h {
+    [_, _] => true,
+    _ => false,
+};
+
+let ffi_owned_pairs ps me = match ps {
+    [] => [],
+    [[id, e], ..rest] => if e.[0] == me { [:foreign, e.[1], id] :: ffi_owned_pairs rest me } else { ffi_owned_pairs rest me },
+};
+/// Oldest first, which is what a table keyed by id reads as on the VM and a map here does not.
+let ffi_owned! u = ffi_by_id (ffi_owned_pairs (native.map_pairs (native.foreign_table ())) (native.current_pid_id ()));
+let ffi_by_id hs = match hs {
+    [] => [],
+    [h, ..rest] => {
+        let older = ffi_by_id (ffi_older rest h.[2] true);
+        let newer = ffi_by_id (ffi_older rest h.[2] false);
+        concat_lists older (h :: newer)
+    },
+};
+let ffi_older hs id below = match hs {
+    [] => [],
+    [h, ..rest] => if (h.[2] < id) == below { h :: ffi_older rest id below } else { ffi_older rest id below },
+};
+
+let ffi_buffer! n = if type_of n != :integer || n < 0 { ffi_fail "buffer! needs a size in bytes" } else {
+    ffi_adopt! "buffer" (native.ffi_calloc n) (native.ffi_dlsym (native.ffi_dlopen ()) "free") n []
+};
+
+let ffi_size! h = {
+    let [_, e] = ffi_live_as h "size!: ";
+    if e.[4] == 0 { () } else { e.[4] }
+};
+
+let ffi_address! h = {
+    let [_, e] = ffi_live_as h "address!: ";
+    e.[2]
+};
+
+let ffi_span h off n who = {
+    let [_, e] = ffi_live h;
+    let size = e.[4];
+    if size == 0 { ffi_fail (concat_list [who, ": a `", e.[1], "` handle has no known size; only a buffer does"]) }
+    else if type_of off != :integer || off < 0 { ffi_fail (native.concat2 who " needs an offset") }
+    else if off > size || n > size - off {
+        ffi_fail (concat_list [who, ": ", show n, " bytes at ", show off, " is outside a buffer of ", show size])
+    }
+    else { e.[2] + off }
+};
+
+let ffi_peekable t = match type_of t {
+    :atom => match ffi_scalar (native.atom_name t) {
+        () => ffi_fail "peek! and poke! read a number or a pointer",
+        k => if k.[0] == 0 || k.[0] == 13 || k.[0] == 14 { ffi_fail "peek! and poke! read a number or a pointer" } else { k },
+    },
+    _ => ffi_fail "peek! and poke! read a number or a pointer",
+};
+
+let ffi_peek! h off t = {
+    let k = ffi_peekable t;
+    native.ffi_peek_at k.[0] (ffi_span h off k.[1] "peek!")
+};
+
+let ffi_poke! h off t v = {
+    let k = ffi_peekable t;
+    native.ffi_store_at k.[0] (ffi_span h off k.[1] "poke!") v
+};
+
+let ffi_read! h off n = if type_of n != :integer || n < 0 { ffi_fail "read! needs a byte count" } else {
+    native.ffi_read_bytes (ffi_span h off n "read!") n
+};
+
+let ffi_read_string! h off = {
+    let [_, e] = ffi_live h;
+    let at = ffi_span h off 1 "read_string!";
+    let rest = native.ffi_read_bytes at (e.[4] - off);
+    let stop = native.str_find_any rest (native.string_of_bytes (forced_array [0])) 0;
+    if stop < 0 { ffi_fail "read_string!: no NUL before the end of the buffer" } else { native.str_slice_any rest 0 stop }
+};
+
+let ffi_write! h off s = if type_of s != :string { ffi_fail "write! needs a string" } else {
+    native.ffi_write_bytes (ffi_span h off (native.size s) "write!") s
+};
+
+let ffi_sizeof t = (ffi_peekable_any t).[1];
+let ffi_alignof t = (ffi_peekable_any t).[2];
+let ffi_peekable_any t = match type_of t {
+    :atom => match ffi_scalar (native.atom_name t) {
+        () => ffi_fail (concat_list ["`:", native.atom_name t, "` is not an FFI type"]),
+        k => k,
+    },
+    _ => ffi_fail "sizeof and alignof take a scalar type",
+};
+
+let ffi_payload_index name = native.payload_index name;
+
+// --- calling ------------------------------------------------------------------------------------
+
+let ffi_needed types = match types {
+    [] => 0,
+    [[:out, _], ..rest] => ffi_needed rest,
+    [_, ..rest] => 1 + ffi_needed rest,
+};
+
+/// The word for one argument: its value and its code, and any parent handle it names.
+let ffi_marshal t v prefix = match t {
+    [:handle, tag] => {
+        let [id, e] = ffi_live_as v prefix;
+        if e.[1] != tag { ffi_said prefix (concat_list ["expected a `", tag, "` handle, not a `", e.[1], "` one"]) }
+        else { [e.[2], 0, [id]] }
+    },
+    [:callback, kinds, ret] => match type_of v {
+        :impure_fn => ffi_said prefix "a callback must be a pure function: C cannot wait while it performs an effect",
+        :pure_fn => [forced_array [v, forced_array kinds, ret], 5, []],
+        _ => ffi_said prefix "a callback is a function",
+    },
+    [:scalar, 13] => match type_of v {
+        :string => [v, 3, []],
+        :unit => [(), 3, []],
+        :list => [(), 3, []],
+        _ => ffi_said prefix "expected a string",
+    },
+    [:scalar, 14] => match type_of v {
+        :string => [v, 3, []],
+        :unit => [(), 3, []],
+        _ => ffi_said prefix "expected a string or a payload view",
+    },
+    [:scalar, 12] => match type_of v {
+        :list => { let [id, e] = ffi_live_as v prefix; [e.[2], 0, [id]] },
+        :integer => [v, 0, []],
+        :unit => [0, 0, []],
+        _ => ffi_said prefix "expected an address, which is carried as an integer",
+    },
+    [:scalar, 10] => if native.is_number_value v { [v, 2, []] } else { ffi_said prefix "expected a number" },
+    [:scalar, 11] => if native.is_number_value v { [v, 1, []] } else { ffi_said prefix "expected a number" },
+    [:scalar, 1] => [if v == true { 1 } else { 0 }, 0, []],
+    [:scalar, _] => match type_of v {
+        :integer => [v, 0, []],
+        :float => [native.to_int v, 0, []],
+        _ => ffi_said prefix "expected a number",
+    },
+    _ => ffi_said prefix "not an argument type",
+};
+
+/// An out parameter's place: a small buffer of C's, read when the call has returned.
+let ffi_out_place! u = native.ffi_calloc 16;
+
+let ffi_invoke! binding args = {
+    let [f, name, types, ret] = binding;
+    let rec fill! ts given values codes parents outs !at = match ts {
+        [] => [rev_onto values [], rev_onto codes [], parents, rev_onto outs []],
+        [[:out, inner], ..more] => {
+            let place = ffi_out_place! ();
+            fill! more given (place :: values) (0 :: codes) parents ([inner, place] :: outs) at
+        },
+        [t, ..more] => match given {
+            [v, ..rest] => {
+                let [word, code, named] = ffi_marshal t v (concat_list ["argument ", show at, " of `", name, "`: "]);
+                fill! more rest (word :: values) (code :: codes) (concat_lists named parents) outs (at + 1)
+            },
+            [] => ffi_fail (concat_list ["`", name, "` needs more arguments"]),
+        },
+    };
+    let [values, codes, parents, outs] = fill! types args [] [] [] [] 1;
+    let answer = native.ffi_call_m f (forced_array [forced_array values, forced_array codes, ffi_raw_kind ret]);
+    let result = ffi_result! ret answer parents;
+    match outs {
+        [] => result,
+        _ => result :: ffi_out_results! outs parents,
+    }
+};
+
+let ffi_raw_kind t = match t {
+    [:scalar, k] => k,
+    [:take_cstr, _] => 12,
+    _ => 12,
+};
+
+let ffi_result! t raw parents = match t {
+    [:own, tag, dtor] => match raw { () => (), _ => ffi_adopt! tag raw dtor 0 parents },
+    [:borrow, tag] => match raw { () => (), _ => ffi_adopt! tag raw 0 0 parents },
+    [:take_cstr, dtor] => match raw {
+        () => (),
+        _ => {
+            // Read before the free, which a suspension would not be.
+            let text = strict! (native.ffi_read_text raw);
+            native.ffi_destroy dtor raw;
+            text
+        },
+    },
+    _ => raw,
+};
+
+let ffi_out_results! outs parents = match outs {
+    [] => [],
+    [[inner, place], ..rest] => {
+        let raw = native.ffi_peek_at (ffi_raw_kind inner) place;
+        let one = ffi_result! inner raw parents;
+        native.ffi_raw_free place;
+        one :: ffi_out_results! rest parents
+    },
+};
+
+/// A function of `n` arguments, collected one at a time: what `apply` makes of any number.
+let ffi_curried! binding !n got =
+    if n == 0 { ffi_invoke! binding (rev_onto got []) }
+    else { fn x -> ffi_curried! binding (n - 1) (x :: got) };
+
+let ffi_bind_in! lib label symbol args ret = {
+    if type_of symbol != :string || symbol == "" { ffi_fail "a foreign function needs a name" }
+    else {
+        let types = ffi_parse_all args lib;
+        let result = ffi_parse ret lib :ret;
+        let f = native.ffi_dlsym lib symbol;
+        if f == 0 { ffi_fail (concat_list ["cannot find `", symbol, "` in ", label]) }
+        else {
+            let binding = [f, symbol, types, result];
+            let visible = ffi_needed types;
+            if visible == 0 { fn u -> ffi_invoke! binding [] }
+            else { ffi_curried! binding visible [] }
+        }
+    }
+};
+
+let ffi_parse_all args lib = match as_items args {
+    () => ffi_fail "the argument types must be a list",
+    items => if length_from items 0 > 16 { ffi_fail "more than 16 arguments" } else { ffi_parse_items items lib },
+};
+
+let ffi_parse_items items lib = match items {
+    [] => [],
+    [t, ..rest] => ffi_parse t lib :arg :: ffi_parse_items rest lib,
+};
+
+let ffi_function! lib symbol args ret = {
+    let [h, where] = ffi_library lib;
+    ffi_bind_in! h where symbol args ret
+};
+let ffi_pure_function! lib symbol args ret = ffi_function! lib symbol args ret;
+
+let ffi_call! f args = match as_items args {
+    () => ffi_fail "call!'s arguments must be a list",
+    [] => f (),
+    items => ffi_apply_all f items,
+};
+let ffi_apply_all f items = match items {
+    [x] => f x,
+    [x, ..rest] => ffi_apply_all (f x) rest,
+};
+
+// The older interface, by number: a number here is the library's own handle.
+let ffi_open! lib = (ffi_library lib).[0];
+let ffi_close! h = ();
+let ffi_bind! h symbol args ret = ffi_bind_in! h "the library" symbol args ret;
+let ffi_load! lib symbol args ret = ffi_function! lib symbol args ret;
+let ffi_alloc! n = native.ffi_malloc n;
+let ffi_free! a = native.ffi_raw_free a;
+let ffi_read_cstr! a = native.ffi_read_text a;
+let ffi_read_u8! a i = native.ffi_peek_at 6 (a + i);
+let ffi_write_u8! a i v = native.ffi_store_at 6 (a + i) v;
