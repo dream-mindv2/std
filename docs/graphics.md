@@ -73,10 +73,11 @@ mind build            # target/debug/hello/: the application, to put anywhere
 browser VM and the page that runs it: a static site, which any host serves if
 it answers `.mjs` as JavaScript, `.wasm` as WebAssembly and an extensionless
 path with `index.html` (as `mind run` and `mind serve --fallback index.html`
-do). Building one needs the browser VM, from `just graphics-browser` in the
-Dream repository; `mind` finds it in the installation, in a checkout's
-`build-browser/`, or where `--runtime DIR`, `[graphics] runtime` or
-`$DREAM_BROWSER` says. The section's keys, each optional, paths relative to the
+do). Building one needs the browser VM, which a toolchain release carries, so
+there is nothing to install; working on the VM itself, `just graphics-browser`
+makes one. `mind` finds it where `--runtime DIR`, `[graphics] runtime` or
+`$DREAM_BROWSER` says, then in the installation, then in a checkout's
+`build-browser/`. The section's keys, each optional, paths relative to the
 manifest:
 
 | Key | |
