@@ -31,14 +31,32 @@ import rt.prim;
 
 let ctx_hp = 0;
 let ctx_limit = 8;
-let ctx_want_gc = 16;
+// The word every function entry compares its stack pointer with. Asking a process to
+// stop for anything, a collection above all, is setting it above every address, so
+// that one compare is the whole of what a function pays for all of them.
+let ctx_guard = 16;
 let ctx_retry = 24;
 let ctx_retry_stack = 32;
 let ctx_stack_top = 40;
 let ctx_chunks = 48;
 let ctx_to = 56;
 let ctx_total = 64;
-let ctx_size = 128;
+let ctx_error = 72;
+let ctx_scratch = 80;
+let ctx_scratch2 = 88;
+let ctx_want_gc = 96;
+let ctx_floor = 104;
+let ctx_current = 112;
+let ctx_current_id = 120;
+let ctx_table = 128;
+let ctx_table_cap = 136;
+let ctx_next_id = 144;
+let ctx_run_head = 152;
+let ctx_run_tail = 160;
+let ctx_live = 168;
+let ctx_unique = 176;
+let ctx_ticking = 184;
+let ctx_size = 256;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -50,12 +68,25 @@ let kind_float = 6;
 let kind_string = 7;
 let kind_array = 8;
 let kind_record = 9;
+let kind_map = 10;
+let kind_leaf = 11;
+let kind_big = 12;
+let kind_error = 13;
+let kind_process = 14;
+
+// What a frame is, in its info's kind: nothing the unwinder need notice, or one of these.
+let frame_catch = 20;
+let frame_thunk = 21;
+let frame_halt = 22;
+let frame_cleanup = 23;
 
 let info_code = 0;
 let info_kind = 8;
 let info_size = 16;
 let info_arity = 24;
 let info_call = 32;
+let info_name = 40;
+let info_impure = 48;
 
 let word = 8;
 /// Everything below this is the executable; the heap and stacks are `mmap`ed far
@@ -63,7 +94,8 @@ let word = 8;
 let static_limit = 4294967296;
 let chunk_header = 16;
 let min_chunk = 8388608;
-let stack_bytes = 1073741824;
+let stack_bytes = 268435456;
+let stack_margin = 1048576;
 
 let tag_fix !n = n * 2 + 1;
 let untag_fix !v = v >> 1;
@@ -101,6 +133,7 @@ let new_chunk! !p !bytes = {
 /// The slow path of a compiled allocation, and every allocation made here.
 let more! !p !bytes = {
     prim.store64! (p + ctx_want_gc) 1;
+    prim.store64! (p + ctx_guard) (0 - 1);
     new_chunk! p bytes;
     alloc! p bytes
 };
@@ -125,9 +158,9 @@ let object_words! !o !info = {
     let kind = prim.load64! (info + info_kind);
     if kind == kind_string {
         2 + (prim.load64! (o + word) + word) / word
-    } else if kind == kind_array || kind == kind_pap {
+    } else if kind == kind_array || kind == kind_pap || kind == kind_map {
         2 + untag_fix (prim.load64! (o + word))
-    } else if kind == kind_record {
+    } else if kind == kind_record || kind == kind_big {
         3 + untag_fix (prim.load64! (o + word))
     } else if kind == kind_hole || kind == kind_ind {
         2
@@ -173,7 +206,7 @@ let scan! !p !at =
         let info = prim.load64! at;
         let kind = prim.load64! (info + info_kind);
         let n = object_words! at info;
-        if kind != kind_float && kind != kind_string && kind != kind_hole {
+        if kind != kind_float && kind != kind_string && kind != kind_hole && kind != kind_big {
             evacuate_range! p (at + word) (at + n * word);
         };
         scan! p (at + n * word)
@@ -199,6 +232,24 @@ let scan_cafs! !p !table !i !n = if i >= n { 0 } else {
     scan_cafs! p table (i + 1) n
 };
 
+/// Every process's stack and what its record holds, the running one's saved just now.
+let scan_processes! !p !id !n = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 {
+        if prim.load64! (pcb + pcb_stack) != 0 {
+            scan_stack! p (prim.load64! (pcb + pcb_sp)) (stack_top! pcb);
+        };
+        evacuate_at! p (pcb + pcb_mail_head);
+        evacuate_at! p (pcb + pcb_mail_tail);
+        evacuate_at! p (pcb + pcb_result);
+        evacuate_at! p (pcb + pcb_monitors);
+        evacuate_at! p (pcb + pcb_joiners);
+        evacuate_at! p (pcb + pcb_kill);
+        evacuate_at! p (pcb + pcb_resume);
+    };
+    scan_processes! p (id + 1) n
+};
+
 let free_chunks! !c = if c == 0 { 0 } else {
     let next = prim.load64! c;
     prim.c2! "munmap" c (prim.load64! (c + word));
@@ -213,7 +264,8 @@ let collect! !p !sp = {
     prim.store64! to 0;
     prim.store64! (to + word) space;
     prim.store64! (p + ctx_to) start;
-    scan_stack! p sp (prim.load64! (p + ctx_stack_top));
+    prim.store64! (current! p + pcb_sp) sp;
+    scan_processes! p 1 (prim.load64! (p + ctx_next_id));
     let cafs = prim.info "cafs";
     scan_cafs! p cafs 0 (prim.load64! cafs);
     scan! p start;
@@ -222,6 +274,7 @@ let collect! !p !sp = {
     prim.store64! (p + ctx_chunks) to;
     prim.store64! (p + ctx_total) space;
     prim.store64! (p + ctx_want_gc) 0;
+    prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
     new_chunk! p (live * 2);
     0
 };
@@ -241,7 +294,18 @@ let code_value! !p !sp !self !b !c !d = return! p sp self;
 
 let code_ind! !p !sp !self !b !c !d = enter! p sp (prim.load64! (self + word));
 
-let code_hole! !p !sp !self !b !c !d = raise_text! p sp "value depends on itself";
+/// A thunk being evaluated is reached again. By the one evaluating it, it depends on
+/// itself; by another process, that one has only to finish.
+let code_hole! !p !sp !self !b !c !d =
+    if prim.load64! (self + word) == prim.load64! (p + ctx_current_id) {
+        fail! p atom_loop "value depends on itself";
+        native_failed! p sp 0 0 0 0
+    } else {
+        let at = sp - 2 * word;
+        prim.store64! at (prim.info "enter_again");
+        prim.store64! (at + word) self;
+        yield_now! p at unit_word 0 0 0
+    };
 
 let frame_update! !p !sp !v !b !c !d = {
     let thunk = prim.load64! (sp + word);
@@ -250,27 +314,35 @@ let frame_update! !p !sp !v !b !c !d = {
     return! p (sp + 2 * word) v
 };
 
-/// The bottom of a process's stack: its answer is the status of the whole run.
-let frame_halt! !p !sp !v !b !c !d = 0;
-
 /// A collection asked for at a function's entry. The registers are saved as a frame
 /// with the code to go back to, so the collector sees them as it sees any frame.
-let collect_at_entry! !p !sp !a !b !c !d = {
-    let extra = prim.load64! (p + ctx_retry_stack);
-    let at = sp - 8 * word;
-    prim.store64! at (prim.info "retry");
-    prim.store64! (at + word) (tag_fix (8 + extra));
-    prim.store64! (at + 2 * word) (prim.load64! (p + ctx_retry));
-    prim.store64! (at + 3 * word) (tag_fix extra);
-    prim.store64! (at + 4 * word) a;
-    prim.store64! (at + 5 * word) b;
-    prim.store64! (at + 6 * word) c;
-    prim.store64! (at + 7 * word) d;
-    collect! p at;
-    prim.jump! (prim.load64! (at + 2 * word)) p (at + 8 * word)
-        (prim.load64! (at + 4 * word)) (prim.load64! (at + 5 * word))
-        (prim.load64! (at + 6 * word)) (prim.load64! (at + 7 * word))
-};
+let collect_at_entry! !p !sp !a !b !c !d =
+    if prim.ult sp (prim.load64! (p + ctx_floor)) && prim.load64! (p + ctx_want_gc) == 0 {
+        // The guard was the real one, so this is the stack running out.
+        prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor) - stack_margin / 2);
+        fail! p atom_stack_overflow "recursion too deep";
+        native_failed! p sp 0 0 0 0
+    } else {
+        let extra = prim.load64! (p + ctx_retry_stack);
+        let at = sp - 8 * word;
+        prim.store64! at (prim.info "retry");
+        prim.store64! (at + word) (tag_fix (8 + extra));
+        prim.store64! (at + 2 * word) (prim.load64! (p + ctx_retry));
+        prim.store64! (at + 3 * word) (tag_fix extra);
+        prim.store64! (at + 4 * word) a;
+        prim.store64! (at + 5 * word) b;
+        prim.store64! (at + 6 * word) c;
+        prim.store64! (at + 7 * word) d;
+        if prim.load64! (p + ctx_want_gc) != 0 { collect! p at; };
+        prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
+        // Asked for by the clock, or by a kill: another's turn, if there is another,
+        // and a kill is seen where the process next resumes.
+        if prim.load64! (p + ctx_run_head) != 0 || prim.load64! (current! p + pcb_kill) != 0 {
+            yield_now! p at unit_word 0 0 0
+        } else {
+            frame_resume_entry! p at unit_word 0 0 0
+        }
+    };
 
 /// Call the closure `f`, whose arguments are on the stack, first on top, with
 /// exactly as many as it takes: up to three go in registers, the rest stay.
@@ -295,9 +367,14 @@ let move_words_up! !from !to !n = if n == 0 { 0 } else {
     move_words_up! from to (n - 1)
 };
 
+let not_a_function! !p !sp !f = {
+    fail_value! p atom_not_a_function (concat2! p (describe! p f) (text_of! p " is not a function"));
+    native_failed! p sp 0 0 0 0
+};
+
 /// Apply `f`, in weak head normal form, to the `n` arguments on the stack.
 let apply! !p !sp !f !n !c !d = {
-    if not (is_object f) { raise_text! p sp "applied something that is not a function" }
+    if not (is_object f) { not_a_function! p (sp + n * word) f }
     else {
         let info = prim.load64! f;
         let kind = prim.load64! (info + info_kind);
@@ -308,7 +385,7 @@ let apply! !p !sp !f !n !c !d = {
             apply! p below (prim.load64! (f + 2 * word)) (n + held) 0 0
         }
         else if kind != kind_closure {
-            raise_text! p sp "applied something that is not a function"
+            not_a_function! p (sp + n * word) f
         }
         else {
             let arity = prim.load64! (info + info_arity);
@@ -339,30 +416,20 @@ let apply! !p !sp !f !n !c !d = {
 
 let frame_apply_rest! !p !sp !v !b !c !d = {
     let n = untag_fix (prim.load64! (sp + word)) - 2;
-    apply! p (sp + 2 * word) v n 0 0
+    // No arguments, which is a process's work: only a function waiting for none runs.
+    if n == 0 && not (is_object v && kind_of! v == kind_closure && prim.load64! (prim.load64! v + info_arity) == 0) {
+        return! p (sp + 2 * word) v
+    } else {
+        apply! p (sp + 2 * word) v n 0 0
+    }
 };
 
 // --- errors --------------------------------------------------------------------
 
+/// What the machine itself runs into, before a value can even be made of it.
 let raise_text! !p !sp s = {
-    prim.c3! "write" 2 "dream: uncaught error: " (prim.str_len "dream: uncaught error: ");
-    prim.c3! "write" 2 s (prim.str_len s);
-    prim.c3! "write" 2 "\n" 1;
-    prim.c1! "exit" 1
-};
-
-let native_failed! !p !sp !a !b !c !d = raise_text! p sp "an operation on values it cannot take";
-
-let not_bool! !p !sp !a !b !c !d = raise_text! p sp "a condition that is not a boolean";
-
-/// An error raised by the program. Nothing catches one yet, and printing a value
-/// takes the library, so a string is shown and anything else is only reported.
-let raise! !p !sp !e !b !c !d = {
-    if is_object e && prim.load64! (prim.load64! e + info_kind) == kind_string {
-        raise_text! p sp (e + 2 * word)
-    } else {
-        raise_text! p sp "a value that is not a string"
-    }
+    fail! p atom_type_error s;
+    native_failed! p sp 0 0 0 0
 };
 
 // --- starting ------------------------------------------------------------------
@@ -371,10 +438,10 @@ let raise! !p !sp !e !b !c !d = {
 let init! () = {
     let p = prim.c2! "calloc" 1 ctx_size;
     new_chunk! p min_chunk;
-    let stack = map_memory! stack_bytes;
-    let top = stack + stack_bytes;
-    prim.store64! (p + ctx_stack_top) top;
-    prim.store64! (top - word) (prim.info "halt");
+    prim.store64! (p + ctx_table_cap) table_grow;
+    prim.store64! (p + ctx_table) (prim.c2! "calloc" table_grow word);
+    prim.store64! (p + ctx_next_id) 1;
+    make_current! p (new_pcb! p);
     p
 };
 
@@ -391,14 +458,12 @@ let new_string! !p !bytes = {
     o
 };
 
-/// An error, as the record `_error_new` makes: a kind, and what it carries.
+/// An error: a kind, and what it carries.
 let error_new! !p !kind !payload = {
-    let o = alloc! p (5 * word);
-    prim.store64! o (prim.info "record");
-    prim.store64! (o + word) (tag_fix 2);
-    prim.store64! (o + 2 * word) (atom_word 12);
-    prim.store64! (o + 3 * word) kind;
-    prim.store64! (o + 4 * word) payload;
+    let o = alloc! p (3 * word);
+    prim.store64! o (prim.info "error");
+    prim.store64! (o + word) kind;
+    prim.store64! (o + 2 * word) payload;
     o
 };
 
@@ -485,16 +550,25 @@ let atom_word !i = i * 256 + 26;
 
 let kind_of! !v = prim.load64! (prim.load64! v + info_kind);
 
-/// `type_of`, for what exists so far.
+/// `type_of`. A record answers the name of its type, which the compiler worked out
+/// for each record's atom (`atom_types`).
 let type_of! !p !v =
     if v & 1 == 1 { atom_word 0 }
     else if v & 7 == 0 {
         let kind = kind_of! v;
         if kind == kind_float { atom_word 1 }
+        else if kind == kind_big { atom_word 0 }
         else if kind == kind_string { atom_word 5 }
         else if kind == kind_cons { atom_word 7 }
         else if kind == kind_array { atom_word 8 }
-        else if kind == kind_closure || kind == kind_pap { atom_word 10 }
+        else if kind == kind_map { atom_word 9 }
+        else if kind == kind_error { atom_word 12 }
+        else if kind == kind_process { atom_process }
+        else if kind == kind_record {
+            atom_word (prim.load64! (prim.info "atom_types" + word * (prim.load64! (v + 2 * word) >> 8)))
+        }
+        else if kind == kind_closure { if prim.load64! (prim.load64! v + info_impure) != 0 { atom_impure_fn } else { atom_pure_fn } }
+        else if kind == kind_pap { type_of! p (prim.load64! (v + 2 * word)) }
         else { atom_word 11 }
     } else {
         let imm = (v >> 3) & 31;
@@ -508,18 +582,9 @@ let type_of! !p !v =
 let atom_name! !p !v = prim.load64! (prim.info "atoms" + word * (v >> 8));
 
 let size! !p !v = if is_string! v { tag_fix (string_len! v) }
-    else if is_object v && kind_of! v == kind_array { prim.load64! (v + word) }
-    else { 0 };
-
-let str_byte! !p !s !i = tag_fix (prim.load8! (string_bytes s + untag_fix i));
-
-let str_slice! !p !s !from !n = {
-    let start = untag_fix from;
-    let count = untag_fix n;
-    let out = new_string! p count;
-    prim.c3! "memcpy" (string_bytes out) (string_bytes s + start) count;
-    out
-};
+    else if is_kind! v kind_array { prim.load64! (v + word) }
+    else if is_kind! v kind_map { prim.load64! (v + 2 * word) }
+    else { type_fail! p "len needs a string, a list, an array or a map" };
 
 let str_le! !p !v !width = {
     let n = untag_fix width;
@@ -533,20 +598,1756 @@ let write_le! !at !v !n = if n == 0 { 0 } else {
     write_le! (at + 1) (v >> 8) (n - 1)
 };
 
-/// `+` on what is not two fixnums, `-` and the rest being refused until floats and
-/// bignums are here.
+// --- failing ------------------------------------------------------------------------
+//
+// A native that fails leaves an error in the context and answers 0; the compiled call
+// sees the 0 and raises it. An atom's number is its place in `machine.first_atoms`.
+
+let atom_error = atom_word 12;
+let atom_no_such_key = atom_word 13;
+let atom_out_of_bounds = atom_word 14;
+let atom_type_error = atom_word 15;
+let atom_divide_by_zero = atom_word 16;
+let atom_not_a_function = atom_word 17;
+let atom_loop = atom_word 18;
+let atom_match_error = atom_word 19;
+let atom_pure_fn = atom_word 20;
+let atom_impure_fn = atom_word 21;
+let atom_process = atom_word 22;
+let atom_stack_overflow = atom_word 23;
+let atom_killed = atom_word 24;
+let atom_ok = atom_word 25;
+let atom_timeout = atom_word 26;
+let atom_none = atom_word 27;
+let atom_down = atom_word 28;
+let atom_result_ok = atom_word 29;
+let atom_result_error = atom_word 30;
+
+/// A value as an error message names it.
+let describe! !p !v =
+    if is_fix v { concat2! p (text_of! p "integer ") (int_to_string! p v) }
+    else if v == unit_word { text_of! p "unit" }
+    else if v == true_word { text_of! p "bool true" }
+    else if v == false_word { text_of! p "bool false" }
+    else if v == nil_word { text_of! p "the empty list" }
+    else if v & 7 == 2 {
+        if (v >> 3) & 31 == 2 { text_of! p "a char" }
+        else { concat2! p (text_of! p ":") (atom_name! p v) }
+    }
+    else if is_object v {
+        let kind = kind_of! v;
+        text_of! p (
+            if kind == kind_string { "a string" } else if kind == kind_float { "a float" }
+            else if kind == kind_cons { "a list" } else if kind == kind_array { "a array" }
+            else if kind == kind_map { "a map" } else if kind == kind_closure { "a function" }
+            else if kind == kind_pap { "a function" } else if kind == kind_record { "a record" }
+            else if kind == kind_big { "a integer" } else if kind == kind_error { "a error" }
+            else { "a value" })
+    }
+    else { text_of! p "a value" };
+
+let concat_parts! !p !a !b !c = concat2! p (concat2! p (text_of! p a) b) (text_of! p c);
+
+let fail_text! !p !kind !t = fail_value! p kind t;
+
+let text_of! !p s = {
+    let n = prim.str_len s;
+    let o = new_string! p n;
+    prim.c3! "memcpy" (string_bytes o) s n;
+    o
+};
+
+let fail! !p !kind s = {
+    prim.store64! (p + ctx_error) (error_new! p kind (text_of! p s));
+    0
+};
+
+let fail_value! !p !kind !v = {
+    prim.store64! (p + ctx_error) (error_new! p kind v);
+    0
+};
+
+let type_fail! !p s = fail! p atom_type_error s;
+
+// --- walking out of a raise ---------------------------------------------------------
+
+/// Every thunk being forced on the way up is left raising the same error, because
+/// what it would have computed is gone, and forcing it again must not pretend.
+let unwind! !p !at !e !b !c !d = {
+    let info = prim.load64! at;
+    let kind = prim.load64! (info + info_kind);
+    let killing = prim.load64! (current! p + pcb_killing) == 1;
+    if kind == frame_cleanup {
+        // While a killed process runs a cleanup, the cleanup may handle its own errors.
+        if killing { prim.store64! (current! p + pcb_killing) 2; };
+        prim.jump! (prim.load64! (info + info_call)) p at e 0 0 0
+    } else if kind == frame_catch && prim.load64! (current! p + pcb_killing) != 1 {
+        prim.jump! (prim.load64! (info + info_call)) p at e 0 0 0
+    } else if kind == frame_halt {
+        // The first process failing ends the run; what it was is the library's to say.
+        if prim.load64! (current! p + pcb_id) == 1 {
+            prim.store64! (at - word) e;
+            apply! p (at - word) (prim.info "lib_uncaught") 1 0 0
+        } else { finish! p e 1 0 0 0 }
+    } else {
+        if kind == frame_thunk {
+            let thunk = prim.load64! (at + word);
+            let raised = alloc! p (2 * word);
+            prim.store64! raised (prim.info "raised");
+            prim.store64! (raised + word) e;
+            prim.store64! (thunk + word) raised;
+            prim.store64! thunk (prim.info "ind");
+        };
+        unwind! p (at + frame_words! at info * word) e 0 0 0
+    }
+};
+
+let code_raised! !p !sp !self !b !c !d = unwind! p sp (prim.load64! (self + word)) 0 0 0;
+
+let frame_catch_return! !p !sp !v !b !c !d =
+    return! p (sp + frame_words! sp (prim.load64! sp) * word) v;
+
+let native_failed! !p !sp !a !b !c !d = unwind! p sp (prim.load64! (p + ctx_error)) 0 0 0;
+
+let not_bool! !p !sp !a !b !c !d = {
+    fail_value! p atom_type_error (concat2! p (text_of! p "`if` needs a bool, got ") (describe! p a));
+    native_failed! p sp 0 0 0 0
+};
+
+/// `raise!`: an error goes up as it is, anything else inside one.
+let raise! !p !sp !self !v !c !d =
+    if is_object v && kind_of! v == kind_error {
+        // The kill itself going on up after a cleanup: nothing may catch it from here.
+        if prim.load64! (v + word) == atom_killed && prim.load64! (current! p + pcb_kill) != 0 {
+            prim.store64! (current! p + pcb_killing) 1;
+        };
+        unwind! p sp v 0 0 0
+    }
+    else { unwind! p sp (error_new! p atom_error v) 0 0 0 };
+
+/// A thunk the runtime makes, for what only the library can finish: `[f, a, b]`.
+let deferred2! !p !f !a !b = {
+    let o = alloc! p (4 * word);
+    prim.store64! o (prim.info "deferred2");
+    prim.store64! (o + word) f;
+    prim.store64! (o + 2 * word) a;
+    prim.store64! (o + 3 * word) b;
+    o
+};
+
+let code_deferred2! !p !sp !self !b !c !d = {
+    let f = prim.load64! (self + word);
+    let x = prim.load64! (self + 2 * word);
+    let y = prim.load64! (self + 3 * word);
+    let at = sp - 4 * word;
+    prim.store64! (at + 2 * word) (prim.info "update");
+    prim.store64! (at + 3 * word) self;
+    prim.store64! self (prim.info "hole");
+    prim.store64! (self + word) (prim.load64! (p + ctx_current_id));
+    prim.store64! at x;
+    prim.store64! (at + word) y;
+    apply! p at f 2 0 0
+};
+
+// --- floats -------------------------------------------------------------------------
+
+let new_float! !p !bits = {
+    let o = alloc! p (2 * word);
+    prim.store64! o (prim.info "float");
+    prim.store64! (o + word) bits;
+    o
+};
+
+let is_kind! !v !kind = is_object v && kind_of! v == kind;
+let is_float! !v = is_kind! v kind_float;
+let is_big! !v = is_kind! v kind_big;
+let is_fix !v = v & 1 == 1;
+let is_int! !v = is_fix v || is_big! v;
+let is_number! !v = is_fix v || is_kind! v kind_float || is_big! v;
+
+let float_bits! !v =
+    if is_fix v { prim.i2f (untag_fix v) }
+    else if is_big! v { big_to_float! v }
+    else { prim.load64! (v + word) };
+
+// --- bignums ------------------------------------------------------------------------
+//
+// Sign and magnitude, a limb being 32 bits held in a whole word, least significant
+// first, so that a product of two limbs and a carry always fits. The layout is
+// `[info, n tagged, sign tagged, limbs..]`. Only a value past a fixnum is ever a
+// bignum, so two integers are equal only if they are the same kind.
+
+let limb_base = 4294967296;
+let limb_mask = 4294967295;
+
+let new_big! !p !n !sign = {
+    let o = alloc! p ((3 + n) * word);
+    prim.store64! o (prim.info "big");
+    prim.store64! (o + word) (tag_fix n);
+    prim.store64! (o + 2 * word) (tag_fix sign);
+    o
+};
+
+let big_n! !b = untag_fix (prim.load64! (b + word));
+let big_sign! !b = untag_fix (prim.load64! (b + 2 * word));
+let limb_at !b !i = b + (3 + i) * word;
+let big_limb! !b !i = if i >= big_n! b { 0 } else { prim.load64! (limb_at b i) };
+
+/// Any integer as a bignum, for the arithmetic: a fixnum becomes a short one, which
+/// is never an answer until `big_fix!` has looked at it.
+let as_big! !p !v = if is_big! v { v } else {
+    let n = untag_fix v;
+    let negative = n < 0;
+    let m = if negative { 0 - n } else { n };
+    let b = new_big! p 2 (if negative { 1 } else { 0 });
+    prim.store64! (limb_at b 0) (m & limb_mask);
+    prim.store64! (limb_at b 1) (prim.ushr m 32);
+    b
+};
+
+let trimmed! !b !n = if n > 0 && prim.load64! (limb_at b (n - 1)) == 0 { trimmed! b (n - 1) } else { n };
+
+/// A finished result: a fixnum if it fits, which must be checked before anyone can
+/// compare it, and otherwise the object with its top zero limbs dropped.
+let big_fix! !b = {
+    let n = trimmed! b (big_n! b);
+    let top = if n == 0 { 0 } else { prim.load64! (limb_at b (n - 1)) };
+    let fits = n == 0 || n == 1 || (n == 2 && prim.ult top 1073741824);
+    if fits {
+        let low = if n == 0 { 0 } else { prim.load64! (limb_at b 0) };
+        let high = if n == 2 { top } else { 0 };
+        let m = low + (high << 32);
+        tag_fix (if big_sign! b == 1 { 0 - m } else { m })
+    } else {
+        prim.store64! (b + word) (tag_fix n);
+        b
+    }
+};
+
+let magnitude_order_at! !a !b !i =
+    if i < 0 { 0 }
+    else {
+        let x = big_limb! a i;
+        let y = big_limb! b i;
+        if prim.ult x y { 0 - 1 } else if prim.ult y x { 1 } else { magnitude_order_at! a b (i - 1) }
+    };
+
+let magnitude_order! !a !b = {
+    let n = big_n! a;
+    let m = big_n! b;
+    magnitude_order_at! a b ((if n > m { n } else { m }) - 1)
+};
+
+let add_limbs! !a !b !out !i !n !carry = if i >= n { carry } else {
+    let t = big_limb! a i + big_limb! b i + carry;
+    prim.store64! (limb_at out i) (t & limb_mask);
+    add_limbs! a b out (i + 1) n (prim.ushr t 32)
+};
+
+let magnitude_add! !p !a !b !sign = {
+    let n = big_n! a;
+    let m = big_n! b;
+    let top = if n > m { n } else { m };
+    let out = new_big! p (top + 1) sign;
+    prim.store64! (limb_at out top) (add_limbs! a b out 0 top 0);
+    out
+};
+
+let sub_limbs! !a !b !out !i !n !borrow = if i >= n { 0 } else {
+    let t = big_limb! a i - big_limb! b i - borrow;
+    prim.store64! (limb_at out i) (t & limb_mask);
+    sub_limbs! a b out (i + 1) n (if t < 0 { 1 } else { 0 })
+};
+
+/// `|a| - |b|`, with `|a| >= |b|`.
+let magnitude_sub! !p !a !b !sign = {
+    let n = big_n! a;
+    let out = new_big! p n sign;
+    sub_limbs! a b out 0 n 0;
+    out
+};
+
+let big_add! !p !a !b !flip = {
+    let sa = big_sign! a;
+    let sb = if flip { 1 - big_sign! b } else { big_sign! b };
+    if sa == sb { big_fix! (magnitude_add! p a b sa) }
+    else if magnitude_order! a b >= 0 { big_fix! (magnitude_sub! p a b sa) }
+    else { big_fix! (magnitude_sub! p b a sb) }
+};
+
+let mul_row! !at !x !b !j !m !carry = if j >= m {
+    let t = prim.load64! at + carry;
+    prim.store64! at (t & limb_mask);
+    prim.store64! (at + word) (prim.load64! (at + word) + prim.ushr t 32);
+    0
+} else {
+    let t = prim.load64! at + x * prim.load64! (limb_at b j) + carry;
+    prim.store64! at (t & limb_mask);
+    mul_row! (at + word) x b (j + 1) m (prim.ushr t 32)
+};
+
+let mul_rows! !a !b !out !i !n !m = if i >= n { 0 } else {
+    mul_row! (limb_at out i) (prim.load64! (limb_at a i)) b 0 m 0;
+    mul_rows! a b out (i + 1) n m
+};
+
+let zero_words! !at !n = if n == 0 { 0 } else {
+    prim.store64! at 0;
+    zero_words! (at + word) (n - 1)
+};
+
+let big_mul! !p !a !b = {
+    let n = big_n! a;
+    let m = big_n! b;
+    let out = new_big! p (n + m + 1) (if big_sign! a == big_sign! b { 0 } else { 1 });
+    zero_words! (limb_at out 0) (n + m + 1);
+    mul_rows! a b out 0 n m;
+    big_fix! out
+};
+
+/// Divide the magnitude by one limb in place, answering the remainder.
+let div_small! !b !i !d !rem = if i < 0 { rem } else {
+    let cur = (rem << 32) + prim.load64! (limb_at b i);
+    prim.store64! (limb_at b i) (prim.udiv cur d);
+    div_small! b (i - 1) d (prim.urem cur d)
+};
+
+/// A copy with `n` limbs of room, the top ones zero.
+let big_copy! !p !a !n = {
+    let out = new_big! p n (big_sign! a);
+    zero_words! (limb_at out 0) n;
+    copy_words! (limb_at a 0) (limb_at out 0) (big_n! a);
+    out
+};
+
+/// Shift-and-subtract long division, one bit at a time. It is linear in the bits times
+/// the limbs, which is slow for huge numbers and exact for all of them.
+let long_div_bits! !p !a !b !q !r !bit =
+    if bit < 0 { 0 } else {
+        shift_in! r (big_n! r) 0 (prim.ushr (prim.load64! (limb_at a (bit / 32))) (bit % 32) & 1);
+        if magnitude_order! r b >= 0 {
+            sub_limbs! r b r 0 (big_n! r) 0;
+            let at = limb_at q (bit / 32);
+            prim.store64! at (prim.load64! at | (1 << (bit % 32)));
+        };
+        long_div_bits! p a b q r (bit - 1)
+    };
+
+let shift_in! !r !n !i !carry = if i >= n { 0 } else {
+    let t = prim.load64! (limb_at r i);
+    prim.store64! (limb_at r i) (((t << 1) | carry) & limb_mask);
+    shift_in! r n (i + 1) (prim.ushr t 31 & 1)
+};
+
+/// `[quotient, remainder]` of two magnitudes, left in the context's scratch words.
+let big_divmod! !p !a !b = {
+    let n = big_n! a;
+    let q = new_big! p n (if big_sign! a == big_sign! b { 0 } else { 1 });
+    zero_words! (limb_at q 0) n;
+    let r = new_big! p (big_n! b + 1) (big_sign! a);
+    zero_words! (limb_at r 0) (big_n! b + 1);
+    long_div_bits! p a b q r (n * 32 - 1);
+    prim.store64! (p + ctx_scratch) (big_fix! q);
+    prim.store64! (p + ctx_scratch2) (big_fix! r);
+    0
+};
+
+/// Writing backwards from `at`, the next free byte; answers where it stopped.
+let big_digits! !b !at = {
+    let n = trimmed! b (big_n! b);
+    prim.store64! (b + word) (tag_fix n);
+    if n == 0 { at } else {
+        // Nine digits a step, the most that always fit under one limb's division.
+        let rem = div_small! b (n - 1) 1000000000 0;
+        let more = trimmed! b n != 0;
+        big_digits! b (digit_group! at rem (if more { 9 } else { 0 }) - 1)
+    }
+};
+
+let digit_group! !at !v !pad =
+    if v == 0 && pad <= 0 { at + 1 }
+    else {
+        prim.store8! at (48 + v % 10);
+        digit_group! (at - 1) (v / 10) (pad - 1)
+    };
+
+let big_to_string! !p !v = {
+    let copy = big_copy! p v (big_n! v);
+    // Ten digits to a limb is an overestimate, and the buffer is thrown away.
+    let room = big_n! v * 10 + 2;
+    let buf = alloc! p ((room + 8) / word * word + word);
+    let last = buf + room - 1;
+    let first = big_digits! copy last + 1;
+    let digits = last + 1 - first;
+    let negative = big_sign! v == 1;
+    let s = new_string! p (digits + (if negative { 1 } else { 0 }));
+    let bytes = string_bytes s;
+    if negative { prim.store8! bytes 45; };
+    prim.c3! "memcpy" (bytes + (if negative { 1 } else { 0 })) first digits;
+    s
+};
+
+let big_to_float_at! !b !i !acc = if i < 0 { acc } else {
+    big_to_float_at! b (i - 1) (prim.fadd (prim.fmul acc (prim.i2f limb_base)) (prim.i2f (prim.load64! (limb_at b i))))
+};
+
+let big_to_float! !b = {
+    let m = big_to_float_at! b (big_n! b - 1) (prim.i2f 0);
+    if big_sign! b == 1 { prim.fsub (prim.i2f 0) m } else { m }
+};
+
+// --- arithmetic that is not two fixnums that fit ------------------------------------
+
+let number_fail! !p s = fail! p atom_type_error s;
+
+let cannot_apply! !p name !a !b = fail_value! p atom_type_error
+    (concat2! p (concat_parts! p "cannot apply `" (text_of! p name) "` to ")
+                (concat2! p (describe! p a) (concat2! p (text_of! p " and ") (describe! p b))));
+
+let int_or_float_op! !p !op !a !b =
+    if is_float! a || is_float! b {
+        let x = float_bits! a;
+        let y = float_bits! b;
+        new_float! p (if op == 0 { prim.fadd x y } else if op == 1 { prim.fsub x y }
+                      else if op == 2 { prim.fmul x y } else if op == 3 { prim.fdiv x y }
+                      else { prim.d2! "fmod" x y })
+    } else if op == 0 { big_add! p (as_big! p a) (as_big! p b) false }
+    else if op == 1 { big_add! p (as_big! p a) (as_big! p b) true }
+    else if op == 2 { big_mul! p (as_big! p a) (as_big! p b) }
+    else if b == tag_fix 0 {
+        if op == 3 { fail! p atom_divide_by_zero "division by zero" } else { fail! p atom_divide_by_zero "remainder by zero" }
+    } else {
+        big_divmod! p (as_big! p a) (as_big! p b);
+        prim.load64! (p + (if op == 3 { ctx_scratch } else { ctx_scratch2 }))
+    };
+
+let is_listish! !v = v == nil_word || is_kind! v kind_cons;
+
 let add_slow! !p !a !b =
-    if is_string! a && is_string! b { concat2! p a b } else { 0 };
+    if is_string! a && is_string! b { concat2! p a b }
+    else if is_number! a && is_number! b { int_or_float_op! p 0 a b }
+    else if is_listish! a && is_listish! b { deferred2! p (prim.info "lib_concat_lists") a b }
+    else { cannot_apply! p "add" a b };
 
-let arith_slow! !p !a !b = 0;
+let sub_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 1 a b } else { cannot_apply! p "sub" a b };
+let mul_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 2 a b } else { cannot_apply! p "mul" a b };
+let div_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 3 a b } else { cannot_apply! p "div" a b };
+let mod_slow! !p !a !b = if is_number! a && is_number! b { int_or_float_op! p 4 a b } else { cannot_apply! p "mod" a b };
 
-/// `==` and `!=` on what is not two words to compare: a 0 or a 1.
-let eq_slow! !p !a !b =
-    if is_string! a && is_string! b { string_eq! a b } else { a == b };
+let neg! !p !v =
+    if is_float! v { new_float! p (prim.fneg (prim.load64! (v + word))) }
+    else if is_int! v { int_or_float_op! p 1 (tag_fix 0) v }
+    else { fail_value! p atom_type_error (concat2! p (text_of! p "cannot negate ") (describe! p v)) };
 
-/// Ordering, on strings: below zero, zero or above, as `memcmp` says.
-let order_slow! !p !a !b = 0;
+// --- comparison ---------------------------------------------------------------------
 
-// A dialect image's roots are named by the compiler (`machine.runtime_roots`), and
-// a program needs an entry to be one at all, though nothing calls this.
-let main! () = 0;
+let true_word = 266;
+let false_word = 10;
+let nil_word = 34;
+let unit_word = 2;
+
+let as_word !bit = if bit == 0 { false_word } else { true_word };
+
+let numeric_order! !a !b =
+    if is_float! a || is_float! b {
+        let x = float_bits! a;
+        let y = float_bits! b;
+        if prim.flt x y { 0 - 1 } else if prim.flt y x { 1 } else if prim.feq x y { 0 } else { 2 }
+    } else if is_fix a && is_fix b {
+        if a < b { 0 - 1 } else if a == b { 0 } else { 1 }
+    } else {
+        // A bignum is past every fixnum, so its sign says.
+        let sa = if is_fix a { 2 } else { big_sign! a };
+        let sb = if is_fix b { 2 } else { big_sign! b };
+        if sa == 2 { if sb == 1 { 1 } else { 0 - 1 } }
+        else if sb == 2 { if sa == 1 { 0 - 1 } else { 1 } }
+        else if sa != sb { if sa == 1 { 0 - 1 } else { 1 } }
+        else {
+            let m = magnitude_order! a b;
+            if sa == 1 { 0 - m } else { m }
+        }
+    };
+
+let string_order! !a !b = {
+    let n = string_len! a;
+    let m = string_len! b;
+    let least = if n < m { n } else { m };
+    let c = prim.sext32 (prim.c3! "memcmp" (string_bytes a) (string_bytes b) least);
+    if c < 0 { 0 - 1 } else if c > 0 { 1 } else if n < m { 0 - 1 } else if n > m { 1 } else { 0 }
+};
+
+/// `==`, or a thunk of the library's walk when both are structures: forcing what is
+/// inside them is not something a native can do.
+let eq_slow! !p !a !b = {
+    if is_number! a && is_number! b { as_word (numeric_order! a b == 0) }
+    else if is_string! a && is_string! b { as_word (string_eq! a b) }
+    else if a == b && not (is_float! a) { true_word }
+    else if is_kind! a kind_process && is_kind! b kind_process { as_word (prim.load64! (a + word) == prim.load64! (b + word)) }
+    else if is_object a && is_object b && kind_of! a == kind_of! b && kind_of! a != kind_closure {
+        deferred2! p (prim.info "lib_equal") a b
+    }
+    else if a == nil_word && is_kind! b kind_cons { false_word }
+    else { false_word }
+};
+
+let ne_slow! !p !a !b = {
+    let r = eq_slow! p a b;
+    if r == true_word { false_word } else if r == false_word { true_word }
+    else { deferred2! p (prim.info "lib_not_equal") a b }
+};
+
+let ordered! !p !op !a !b = {
+    let c =
+        if is_number! a && is_number! b { numeric_order! a b }
+        else if is_string! a && is_string! b { string_order! a b }
+        else if is_char_word a && is_char_word b { if a < b { 0 - 1 } else if a == b { 0 } else { 1 } }
+        else { 3 };
+    if c == 3 {
+        fail_value! p atom_type_error (concat2! p (concat2! p (text_of! p "cannot order ") (describe! p a))
+                                       (concat2! p (text_of! p " against ") (describe! p b)))
+    }
+    // A NaN is on no side of anything.
+    else if c == 2 { false_word }
+    else { as_word (if op == 0 { c < 0 } else if op == 1 { c <= 0 } else if op == 2 { c > 0 } else { c >= 0 }) }
+};
+
+let is_char_word !v = v & 255 == 18;
+
+let lt_slow! !p !a !b = ordered! p 0 a b;
+let le_slow! !p !a !b = ordered! p 1 a b;
+let gt_slow! !p !a !b = ordered! p 2 a b;
+let ge_slow! !p !a !b = ordered! p 3 a b;
+
+/// `compare` on what has an order of its own: -1, 0 or 1 tagged, or 3 tagged when the
+/// library must look inside. Different types order by the number of their type.
+let type_rank! !v =
+    if is_fix v || is_float! v || is_big! v { 1 }
+    else if v == unit_word { 0 }
+    else if v & 7 == 2 {
+        let imm = (v >> 3) & 31;
+        if imm == 1 { 2 } else if imm == 2 { 3 } else if imm == 3 { 5 } else { 6 }
+    }
+    else if is_string! v { 4 }
+    else if is_kind! v kind_cons { 6 }
+    else if is_kind! v kind_array { 7 }
+    else if is_kind! v kind_record { 8 }
+    else if is_kind! v kind_map { 9 }
+    else { 10 };
+
+let flat_compare! !p !a !b = {
+    let ra = type_rank! a;
+    let rb = type_rank! b;
+    if ra != rb { tag_fix (if ra < rb { 0 - 1 } else { 1 }) }
+    else if ra == 1 {
+        let c = numeric_order! a b;
+        tag_fix (if c == 2 { 0 } else { c })
+    }
+    else if ra == 4 { tag_fix (string_order! a b) }
+    else if ra == 5 { tag_fix (string_order! (atom_name! p a) (atom_name! p b)) }
+    else if ra == 2 || ra == 3 || ra == 0 {
+        tag_fix (if a < b { 0 - 1 } else if a == b { 0 } else { 1 })
+    }
+    else { tag_fix 3 }
+};
+
+// --- bit operations -----------------------------------------------------------------
+
+let both_fix !a !b = is_fix a && is_fix b;
+
+let bit_and! !p !a !b = if both_fix a b { a & b } else { number_fail! p "`&` needs two integers" };
+let bit_or! !p !a !b = if both_fix a b { a | b } else { number_fail! p "`|` needs two integers" };
+let bit_xor! !p !a !b = if both_fix a b { tag_fix (untag_fix a ^ untag_fix b) } else { number_fail! p "`^` needs two integers" };
+let bit_not! !p !a = if is_fix a { tag_fix (0 - 1 - untag_fix a) } else { number_fail! p "`~` needs an integer" };
+let shift_left! !p !a !b = if both_fix a b {
+    let n = untag_fix b;
+    if n < 0 { number_fail! p "a negative shift" }
+    else if n >= 62 || (((untag_fix a << n) >> n) != untag_fix a) || (untag_fix a << n) >= (1 << 62) || (untag_fix a << n) < 0 - (1 << 62) {
+        big_shift_left! p a n
+    } else { tag_fix (untag_fix a << n) }
+} else { number_fail! p "`<<` needs two integers" };
+
+/// A shift past a fixnum, by the arithmetic it is short for.
+let big_shift_left! !p !a !n = if n == 0 { a } else {
+    let step = if n > 30 { 30 } else { n };
+    big_shift_left! p (big_mul! p (as_big! p a) (as_big! p (tag_fix (1 << step)))) (n - step)
+};
+
+let shift_right! !p !a !b = if both_fix a b {
+    let n = untag_fix b;
+    if n < 0 { number_fail! p "a negative shift" }
+    else { tag_fix (untag_fix a >> (if n > 63 { 63 } else { n })) }
+} else { number_fail! p "`>>` needs two integers" };
+
+// --- numbers ------------------------------------------------------------------------
+
+let to_float! !p !v = if is_float! v { v } else if is_int! v { new_float! p (float_bits! v) } else { number_fail! p "to_float needs a number" };
+
+let to_int! !p !v =
+    if is_int! v { v }
+    else if is_float! v {
+        let bits = prim.load64! (v + word);
+        if prim.feq bits bits && prim.flt (prim.fabs bits) (prim.i2f (1 << 62)) { tag_fix (prim.f2i bits) }
+        else if prim.feq bits bits && prim.flt (prim.fabs bits) (prim.d1! "exp" (prim.i2f 700)) { float_to_big! p bits }
+        else { fail! p atom_type_error "to_int: this float is not a finite number" }
+    }
+    else { number_fail! p "to_int needs a number" };
+
+/// A float too large for a fixnum, whose digits past 53 bits are all zero anyway.
+let float_to_big! !p !bits = {
+    let negative = prim.flt bits (prim.i2f 0);
+    let m = prim.fabs bits;
+    let rec_ = float_limbs! p m (tag_fix 1) (tag_fix 0);
+    if negative { neg! p rec_ } else { rec_ }
+};
+
+let float_limbs! !p !m !scale !acc =
+    if prim.flt m (prim.i2f 1) { acc }
+    else {
+        let q = prim.d1! "floor" (prim.fdiv m (prim.i2f limb_base));
+        let limb = prim.f2i (prim.fsub m (prim.fmul q (prim.i2f limb_base)));
+        let part = big_mul! p (as_big! p scale) (as_big! p (tag_fix limb));
+        float_limbs! p q (big_mul! p (as_big! p scale) (as_big! p (tag_fix limb_base)))
+            (big_add! p (as_big! p acc) (as_big! p part) false)
+    };
+
+let float_bytes! !p !v = {
+    let s = new_string! p 8;
+    prim.store64! (string_bytes s) (float_bits! v);
+    s
+};
+
+let float_of_bytes! !p !s = new_float! p (prim.load64! (string_bytes s));
+
+/// Python's `repr`: the shortest digits that read back as the same number, positional
+/// from 1e-4 up to 1e16.
+let shortest_prec! !buf !bits !prec =
+    if prec >= 17 { 17 } else {
+        prim.fmt_double! buf 64 "%.*g" prec bits;
+        if prim.feq (prim.strtod! buf) bits { prec } else { shortest_prec! buf bits (prec + 1) }
+    };
+
+let float_text! !p !v = {
+    let bits = prim.load64! (v + word);
+    let buf = alloc! p 128;
+    let prec = shortest_prec! buf bits 1;
+    prim.fmt_double! buf 64 "%.*g" prec bits;
+    let finite = prim.feq bits bits && prim.flt (prim.fabs bits) (prim.d1! "exp" (prim.i2f 710));
+    if finite && not (prim.feq bits (prim.i2f 0)) && prim.c2! "strchr" buf 101 != 0 {
+        let exponent = prim.f2i (prim.d1! "floor" (prim.d1! "log10" (prim.fabs bits)));
+        if exponent >= 0 - 4 && exponent < 16 {
+            let places = prec - 1 - exponent;
+            prim.fmt_double! buf 64 "%.*f" (if places < 0 { 0 } else { places }) bits;
+        };
+    };
+    let n = prim.c1! "strlen" buf;
+    let s = new_string! p n;
+    prim.c3! "memcpy" (string_bytes s) buf n;
+    s
+};
+
+let digits_value! !s !i !n !acc =
+    if i >= n { acc } else {
+        let d = prim.load8! (s + i) - 48;
+        digits_value! s (i + 1) n (neg_free! acc d)
+    };
+
+let neg_free! !acc !d = acc * 10 + d;
+
+let parse_digits_big! !p !s !i !n !acc =
+    if i >= n { acc } else {
+        let d = prim.load8! (s + i) - 48;
+        parse_digits_big! p s (i + 1) n
+            (big_add! p (as_big! p (big_mul! p (as_big! p acc) (as_big! p (tag_fix 10)))) (as_big! p (tag_fix d)) false)
+    };
+
+let all_digits! !s !i !n = if i >= n { true } else {
+    let d = prim.load8! (s + i);
+    d >= 48 && d <= 57 && all_digits! s (i + 1) n
+};
+
+/// `_parse_int`: decimal digits with an optional sign; unit for anything else.
+let parse_int! !p !v = {
+    let s = string_bytes v;
+    let n = string_len! v;
+    let signed = n > 0 && (prim.load8! s == 45 || prim.load8! s == 43);
+    let from = if signed { 1 } else { 0 };
+    if from >= n || not (all_digits! s from n) { unit_word }
+    else {
+        let m = if n - from <= 18 { tag_fix (digits_value! s from n 0) } else { parse_digits_big! p s from n (tag_fix 0) };
+        if signed && prim.load8! s == 45 { neg! p m } else { m }
+    }
+};
+
+let parse_float! !p !v = {
+    let s = string_bytes v;
+    let n = string_len! v;
+    if n == 0 { unit_word } else {
+        let end = alloc! p word;
+        let bits = prim.strtod_end! s end;
+        if prim.load64! end == s + n { new_float! p bits } else { unit_word }
+    }
+};
+
+let pow_int! !p !base !e !acc =
+    if e == 0 { acc }
+    else {
+        let next = if e & 1 == 1 { big_mul! p (as_big! p acc) (as_big! p base) } else { acc };
+        if e == 1 { next } else { pow_int! p (big_mul! p (as_big! p base) (as_big! p base)) (e >> 1) next }
+    };
+
+let pow! !p !a !b =
+    if is_int! a && is_fix b && untag_fix b >= 0 { pow_int! p a (untag_fix b) (tag_fix 1) }
+    else if is_number! a && is_number! b { new_float! p (prim.d2! "pow" (float_bits! a) (float_bits! b)) }
+    else { number_fail! p "pow needs numbers" };
+
+// --- text ---------------------------------------------------------------------------
+
+let big_or_int_text! !p !v = if is_fix v { int_to_string! p v } else { big_to_string! p v };
+
+/// A slice, clamped as the primitive is.
+let clamp !v !low !high = if v < low { low } else if v > high { high } else { v };
+
+let str_slice_any! !p !s !from !n = {
+    let size = string_len! s;
+    let start = clamp (untag_fix from) 0 size;
+    let count = clamp (untag_fix n) 0 (size - start);
+    let out = new_string! p count;
+    prim.c3! "memcpy" (string_bytes out) (string_bytes s + start) count;
+    out
+};
+
+let str_byte_any! !p !s !i = {
+    let at = untag_fix i;
+    if at < 0 || at >= string_len! s { tag_fix (0 - 1) } else { tag_fix (prim.load8! (string_bytes s + at)) }
+};
+
+let find_at! !h !hn !n !nn !at =
+    if at + nn > hn { 0 - 1 }
+    else if prim.sext32 (prim.c3! "memcmp" (h + at) n nn) == 0 { at }
+    else { find_at! h hn n nn (at + 1) };
+
+let str_find_any! !p !hay !needle !from = {
+    let start = clamp (untag_fix from) 0 (string_len! hay);
+    tag_fix (find_at! (string_bytes hay) (string_len! hay) (string_bytes needle) (string_len! needle) start)
+};
+
+let rfind_at! !h !n !nn !at =
+    if at < 0 { 0 - 1 }
+    else if prim.sext32 (prim.c3! "memcmp" (h + at) n nn) == 0 { at }
+    else { rfind_at! h n nn (at - 1) };
+
+let str_rfind! !p !hay !needle !from = {
+    let top = string_len! hay - string_len! needle;
+    let start = if untag_fix from > top { top } else { untag_fix from };
+    tag_fix (rfind_at! (string_bytes hay) (string_bytes needle) (string_len! needle) start)
+};
+
+let in_set! !b !set !i !n = i < n && (prim.load8! (set + i) == b || in_set! b set (i + 1) n);
+
+let span_at! !s !n !set !m !at !wanted =
+    if at >= n { n }
+    else if in_set! (prim.load8! (s + at)) set 0 m == wanted { span_at! s n set m (at + 1) wanted }
+    else { at };
+
+let str_span! !p !s !from !set = tag_fix (span_at! (string_bytes s) (string_len! s) (string_bytes set) (string_len! set) (clamp (untag_fix from) 0 (string_len! s)) true);
+let str_upto! !p !s !from !set = tag_fix (span_at! (string_bytes s) (string_len! s) (string_bytes set) (string_len! set) (clamp (untag_fix from) 0 (string_len! s)) false);
+
+let span_back_at! !s !set !m !at =
+    if at <= 0 { 0 }
+    else if in_set! (prim.load8! (s + at - 1)) set 0 m { span_back_at! s set m (at - 1) }
+    else { at };
+
+let str_span_back! !p !s !until !set = tag_fix (span_back_at! (string_bytes s) (string_bytes set) (string_len! set) (clamp (untag_fix until) 0 (string_len! s)));
+
+/// How many bytes the character at `at` takes, and its value, decoded leniently: what
+/// does not spell a scalar is one replacement character per byte.
+let utf8_len! !s !n !at = {
+    let b = prim.load8! (s + at);
+    let want = if b < 128 { 1 } else if b >= 194 && b < 224 { 2 } else if b >= 224 && b < 240 { 3 } else if b >= 240 && b < 245 { 4 } else { 1 };
+    if want == 1 || at + want > n || not (continuations! s (at + 1) (want - 1)) { 1 }
+    else {
+        // Overlong forms, surrogates and what is past the last scalar spell nothing.
+        let c = utf8_value! s at want;
+        if (want == 3 && (c < 2048 || (c >= 55296 && c <= 57343))) || (want == 4 && (c < 65536 || c > 1114111)) { 1 }
+        else { want }
+    }
+};
+
+let continuations! !s !at !left = left == 0 || (prim.load8! (s + at) & 192 == 128 && continuations! s (at + 1) (left - 1));
+
+let utf8_value! !s !at !len = {
+    let b = prim.load8! (s + at);
+    if len == 1 { if b < 128 { b } else { 65533 } }
+    else if len == 2 { ((b & 31) << 6) + (prim.load8! (s + at + 1) & 63) }
+    else if len == 3 { ((b & 15) << 12) + ((prim.load8! (s + at + 1) & 63) << 6) + (prim.load8! (s + at + 2) & 63) }
+    else { ((b & 7) << 18) + ((prim.load8! (s + at + 1) & 63) << 12) + ((prim.load8! (s + at + 2) & 63) << 6) + (prim.load8! (s + at + 3) & 63) }
+};
+
+let count_chars! !s !n !at !acc = if at >= n { acc } else { count_chars! s n (at + utf8_len! s n at) (acc + 1) };
+
+let str_char_count! !p !v = tag_fix (count_chars! (string_bytes v) (string_len! v) 0 0);
+
+let new_cons! !p !h !t = {
+    let o = alloc! p (3 * word);
+    prim.store64! o (prim.info "cons");
+    prim.store64! (o + word) h;
+    prim.store64! (o + 2 * word) t;
+    o
+};
+
+let char_word !c = c * 256 + 18;
+
+/// Built whole and front to back, keeping the last cell to link the next to.
+let chars_from! !p !s !n !at !last = if at >= n { 0 } else {
+    let len = utf8_len! s n at;
+    let cell = new_cons! p (char_word (utf8_value! s at len)) nil_word;
+    prim.store64! (last + 2 * word) cell;
+    chars_from! p s n (at + len) cell
+};
+
+let str_chars! !p !v = {
+    let s = string_bytes v;
+    let n = string_len! v;
+    if n == 0 { nil_word } else {
+        let len = utf8_len! s n 0;
+        let first = new_cons! p (char_word (utf8_value! s 0 len)) nil_word;
+        chars_from! p s n len first;
+        first
+    }
+};
+
+let case_bytes! !from !to !n !upper = if n == 0 { 0 } else {
+    let b = prim.load8! from;
+    let changed = if upper { if b >= 97 && b <= 122 { b - 32 } else { b } }
+                  else { if b >= 65 && b <= 90 { b + 32 } else { b } };
+    prim.store8! to changed;
+    case_bytes! (from + 1) (to + 1) (n - 1) upper
+};
+
+let str_ascii_case! !p !v !upper = {
+    let n = string_len! v;
+    let out = new_string! p n;
+    case_bytes! (string_bytes v) (string_bytes out) n (upper == true_word);
+    out
+};
+
+let char_code! !p !c = tag_fix (c >> 8);
+let char_of_code! !p !n = {
+    let c = untag_fix n;
+    if c < 0 || c > 1114111 || (c >= 55296 && c <= 57343) { fail! p atom_type_error "that is not a Unicode scalar value" } else { char_word c }
+};
+
+/// Every string of an array of them, joined, copying each once.
+let joined_size! !a !i !n !acc = if i >= n { acc } else {
+    joined_size! a (i + 1) n (acc + string_len! (prim.load64! (a + (2 + i) * word)))
+};
+
+let join_at! !a !i !n !to = if i >= n { 0 } else {
+    let s = prim.load64! (a + (2 + i) * word);
+    let m = string_len! s;
+    prim.c3! "memcpy" to (string_bytes s) m;
+    join_at! a (i + 1) n (to + m)
+};
+
+let join_strings! !p !a = {
+    let n = untag_fix (prim.load64! (a + word));
+    let out = new_string! p (joined_size! a 0 n 0);
+    join_at! a 0 n (string_bytes out);
+    out
+};
+
+let bytes_into! !p !a !i !n !to = if i >= n { 1 } else {
+    let v = prim.load64! (a + (2 + i) * word);
+    if not (is_fix v) { fail! p atom_type_error "str_of_bytes needs a list of integers" }
+    else if untag_fix v < 0 || untag_fix v > 255 {
+        fail_value! p atom_type_error (concat2! p (text_of! p "str_of_bytes needs bytes in 0..255, got ") (int_to_string! p v))
+    }
+    else {
+        prim.store8! (to + i) (untag_fix v);
+        bytes_into! p a (i + 1) n to
+    }
+};
+
+let string_of_bytes! !p !a = {
+    let n = untag_fix (prim.load64! (a + word));
+    let out = new_string! p n;
+    if bytes_into! p a 0 n (string_bytes out) == 0 { 0 } else { out }
+};
+
+// --- arrays and records -------------------------------------------------------------
+
+let new_array! !p !n = {
+    let o = alloc! p ((2 + n) * word);
+    prim.store64! o (prim.info "array");
+    prim.store64! (o + word) (tag_fix n);
+    o
+};
+
+let fill_words! !at !n !v = if n == 0 { 0 } else {
+    prim.store64! at v;
+    fill_words! (at + word) (n - 1) v
+};
+
+let array_new! !p !n !fill = {
+    let m = untag_fix n;
+    if m < 0 { fail! p atom_type_error "array.new: a negative length" }
+    else {
+        let o = new_array! p m;
+        fill_words! (o + 2 * word) m fill;
+        o
+    }
+};
+
+/// A slot of an array still being built, by the library.
+let array_store! !p !a !i !v = {
+    prim.store64! (a + (2 + untag_fix i) * word) v;
+    a
+};
+
+let list_of_words! !p !at !n !tail = if n == 0 { tail } else {
+    list_of_words! p at (n - 1) (new_cons! p (prim.load64! (at + (n - 1) * word)) tail)
+};
+
+let array_to_list! !p !a = list_of_words! p (a + 2 * word) (untag_fix (prim.load64! (a + word))) nil_word;
+
+let new_record! !p !id !n = {
+    let o = alloc! p ((3 + n) * word);
+    prim.store64! o (prim.info "record");
+    prim.store64! (o + word) (tag_fix n);
+    prim.store64! (o + 2 * word) id;
+    o
+};
+
+let is_record! !v = is_kind! v kind_record;
+
+let record_is! !p !id !v = as_word (is_record! v && prim.load64! (v + 2 * word) == id);
+let record_id! !p !v = if is_record! v { prim.load64! (v + 2 * word) } else { unit_word };
+let record_fields! !p !v = {
+    let n = untag_fix (prim.load64! (v + word));
+    let a = new_array! p n;
+    copy_words! (v + 3 * word) (a + 2 * word) n;
+    a
+};
+let record_of! !p !id !variant !a = {
+    let n = untag_fix (prim.load64! (a + word));
+    let r = new_record! p id n;
+    copy_words! (a + 2 * word) (r + 3 * word) n;
+    r
+};
+let record_size! !p !v = prim.load64! (v + word);
+let record_display! !p !id = prim.load64! (prim.info "atom_display" + word * (id >> 8));
+
+/// `_match_at`: unforced, for an array or a record's fields.
+let match_at! !p !v !i = {
+    let at = untag_fix i;
+    if is_kind! v kind_array {
+        if at >= 0 && at < untag_fix (prim.load64! (v + word)) { prim.load64! (v + (2 + at) * word) }
+        else { fail! p atom_out_of_bounds "index out of bounds" }
+    } else if is_record! v {
+        if at >= 0 && at < untag_fix (prim.load64! (v + word)) { prim.load64! (v + (3 + at) * word) }
+        else { fail! p atom_out_of_bounds "index out of bounds" }
+    } else if is_string! v { fail! p atom_type_error "a string is not indexed this way" }
+    else { fail! p atom_type_error "a pattern read a position of something with none" }
+};
+
+let error_kind! !p !e = if is_kind! e kind_error { prim.load64! (e + word) } else { type_fail! p "error_kind needs an error" };
+let error_payload! !p !e = if is_kind! e kind_error { prim.load64! (e + 2 * word) } else { type_fail! p "error_payload needs an error" };
+let is_error! !v = is_kind! v kind_error;
+
+// --- maps ---------------------------------------------------------------------------
+//
+// A hash trie, five bits a level. A branch is `[info, n, count, bitmap, slots..]`, `n`
+// counting what follows it, and everything tagged; a leaf is `[info, hash, key, value,
+// next]`, the hash tagged and so short of its top bit, which is why the level of a key
+// is worked out from those 63 bits everywhere. The hash of a string or an integer is
+// the VM's, so that a map of them iterates in the order programs have been printing;
+// a structure hashes by kind alone, since it moves and has no room for an identity, and
+// is found by a walk of the chain. Nothing here forces, and the key has been.
+
+let fnv_prime = 1099511628211;
+let fnv_start = 1469598103934665603;
+
+let bytes_hash! !s !n !i !h = if i >= n { h } else {
+    bytes_hash! s n (i + 1) ((h ^ prim.load8! (s + i)) * fnv_prime)
+};
+
+let mix !h = {
+    let a = h ^ prim.ushr h 33;
+    let b = a * ((4283543511 << 32) | 3981806797);
+    b ^ prim.ushr b 33
+};
+
+let key_hash! !v = {
+    let h =
+        if is_string! v { bytes_hash! (string_bytes v) (string_len! v) 0 fnv_start }
+        else if is_float! v { mix (prim.load64! (v + word)) }
+        else if is_big! v { mix (prim.load64! (limb_at v 0)) }
+        else if is_object v {
+            if is_record! v && prim.load64! (v + word) == tag_fix 0 { mix (prim.load64! (v + 2 * word)) }
+            else { mix (kind_of! v) }
+        }
+        else { mix v };
+    prim.ushr (h << 1) 1
+};
+
+let key_equal! !a !b = {
+    if a == b { true }
+    else if not (is_object a) || not (is_object b) { false }
+    else if is_string! a && is_string! b { string_eq! a b }
+    else if is_float! a && is_float! b { prim.feq (prim.load64! (a + word)) (prim.load64! (b + word)) }
+    else if is_big! a && is_big! b { numeric_order! a b == 0 }
+    else if is_kind! a kind_process && is_kind! b kind_process { prim.load64! (a + word) == prim.load64! (b + word) }
+    else if is_record! a && is_record! b {
+        prim.load64! (a + word) == tag_fix 0 && prim.load64! (b + word) == tag_fix 0
+            && prim.load64! (a + 2 * word) == prim.load64! (b + 2 * word)
+    }
+    else { false }
+};
+
+let popcount !x = {
+    let a = x - (prim.ushr x 1 & 1431655765);
+    let b = (a & 858993459) + (prim.ushr a 2 & 858993459);
+    let c = (b + prim.ushr b 4) & 252645135;
+    prim.ushr ((c * 16843009) & 4294967295) 24
+};
+
+let branch_count! !b = untag_fix (prim.load64! (b + 2 * word));
+let branch_bitmap! !b = untag_fix (prim.load64! (b + 3 * word));
+let branch_slot !b !i = b + (4 + i) * word;
+
+let new_branch! !p !slots !count !bitmap = {
+    let o = alloc! p ((4 + slots) * word);
+    prim.store64! o (prim.info "map");
+    prim.store64! (o + word) (tag_fix (slots + 2));
+    prim.store64! (o + 2 * word) (tag_fix count);
+    prim.store64! (o + 3 * word) (tag_fix bitmap);
+    o
+};
+
+let map_empty! !p = new_branch! p 0 0 0;
+
+let new_leaf! !p !h !k !v !next = {
+    let o = alloc! p (5 * word);
+    prim.store64! o (prim.info "map_leaf");
+    prim.store64! (o + word) (tag_fix h);
+    prim.store64! (o + 2 * word) k;
+    prim.store64! (o + 3 * word) v;
+    prim.store64! (o + 4 * word) next;
+    o
+};
+
+let is_leaf! !v = is_kind! v kind_leaf;
+let leaf_hash! !l = prim.ushr (prim.load64! (l + word)) 1;
+
+let chain_find! !l !k = if l == nil_word { 0 }
+    else if key_equal! (prim.load64! (l + 2 * word)) k { l }
+    else { chain_find! (prim.load64! (l + 4 * word)) k };
+
+/// The leaf holding `k`, or 0.
+let map_find! !node !h !k !shift = {
+    let bit = 1 << (prim.ushr h shift & 31);
+    let bitmap = branch_bitmap! node;
+    if bitmap & bit == 0 { 0 } else {
+        let child = prim.load64! (branch_slot node (popcount (bitmap & (bit - 1))));
+        if is_leaf! child { chain_find! child k } else { map_find! child h k (shift + 5) }
+    }
+};
+
+let chain_replace! !p !l !k !v = if key_equal! (prim.load64! (l + 2 * word)) k {
+    new_leaf! p (leaf_hash! l) (prim.load64! (l + 2 * word)) v (prim.load64! (l + 4 * word))
+} else {
+    new_leaf! p (leaf_hash! l) (prim.load64! (l + 2 * word)) (prim.load64! (l + 3 * word))
+        (chain_replace! p (prim.load64! (l + 4 * word)) k v)
+};
+
+/// Two leaves of different hashes, under a new branch at `shift`.
+let split_leaves! !p !a !b !count !shift = {
+    let ia = prim.ushr (leaf_hash! a) shift & 31;
+    let ib = prim.ushr (leaf_hash! b) shift & 31;
+    if ia == ib {
+        let inner = split_leaves! p a b count (shift + 5);
+        let o = new_branch! p 1 count (1 << ia);
+        prim.store64! (branch_slot o 0) inner;
+        o
+    } else {
+        let o = new_branch! p 2 count ((1 << ia) | (1 << ib));
+        prim.store64! (branch_slot o (if ia < ib { 0 } else { 1 })) a;
+        prim.store64! (branch_slot o (if ia < ib { 1 } else { 0 })) b;
+        o
+    }
+};
+
+let chain_length! !l = if l == nil_word { 0 } else { 1 + chain_length! (prim.load64! (l + 4 * word)) };
+
+/// `node` with `k` set. Whether it was added is left in the context, since the counts
+/// on the way back up depend on it.
+let map_assoc! !p !node !h !k !v !shift = {
+    let bit = 1 << (prim.ushr h shift & 31);
+    let bitmap = branch_bitmap! node;
+    let at = popcount (bitmap & (bit - 1));
+    let slots = popcount bitmap;
+    if bitmap & bit == 0 {
+        prim.store64! (p + ctx_scratch) 1;
+        let o = new_branch! p (slots + 1) (branch_count! node + 1) (bitmap | bit);
+        copy_words! (branch_slot node 0) (branch_slot o 0) at;
+        prim.store64! (branch_slot o at) (new_leaf! p h k v nil_word);
+        copy_words! (branch_slot node at) (branch_slot o (at + 1)) (slots - at);
+        o
+    } else {
+        let child = prim.load64! (branch_slot node at);
+        let replaced =
+            if is_leaf! child {
+                if leaf_hash! child == h {
+                    if chain_find! child k != 0 {
+                        prim.store64! (p + ctx_scratch) 0;
+                        chain_replace! p child k v
+                    } else {
+                        prim.store64! (p + ctx_scratch) 1;
+                        new_leaf! p h k v child
+                    }
+                } else {
+                    prim.store64! (p + ctx_scratch) 1;
+                    split_leaves! p child (new_leaf! p h k v nil_word) (chain_length! child + 1) (shift + 5)
+                }
+            } else { map_assoc! p child h k v (shift + 5) };
+        let o = new_branch! p slots (branch_count! node + prim.load64! (p + ctx_scratch)) bitmap;
+        copy_words! (branch_slot node 0) (branch_slot o 0) slots;
+        prim.store64! (branch_slot o at) replaced;
+        o
+    }
+};
+
+let map_put! !p !m !k !v = map_assoc! p m (key_hash! k) k v 0;
+
+let map_has! !p !m !k = as_word (is_kind! m kind_map && map_find! m (key_hash! k) k 0 != 0);
+
+let chain_without! !p !l !k = if key_equal! (prim.load64! (l + 2 * word)) k { prim.load64! (l + 4 * word) } else {
+    new_leaf! p (leaf_hash! l) (prim.load64! (l + 2 * word)) (prim.load64! (l + 3 * word)) (chain_without! p (prim.load64! (l + 4 * word)) k)
+};
+
+/// A branch without slot `at`, or with it replaced when `child` is not `nil_word`.
+let branch_changed! !p !node !at !bit !child !count = {
+    let slots = popcount (branch_bitmap! node);
+    if child == nil_word {
+        let o = new_branch! p (slots - 1) count (branch_bitmap! node ^ bit);
+        copy_words! (branch_slot node 0) (branch_slot o 0) at;
+        copy_words! (branch_slot node (at + 1)) (branch_slot o at) (slots - at - 1);
+        o
+    } else {
+        let o = new_branch! p slots count (branch_bitmap! node);
+        copy_words! (branch_slot node 0) (branch_slot o 0) slots;
+        prim.store64! (branch_slot o at) child;
+        o
+    }
+};
+
+let map_without! !p !node !h !k !shift = {
+    let bit = 1 << (prim.ushr h shift & 31);
+    let bitmap = branch_bitmap! node;
+    let at = popcount (bitmap & (bit - 1));
+    let child = prim.load64! (branch_slot node at);
+    if is_leaf! child {
+        branch_changed! p node at bit (chain_without! p child k) (branch_count! node - 1)
+    } else {
+        let inner = map_without! p child h k (shift + 5);
+        branch_changed! p node at bit (if popcount (branch_bitmap! inner) == 0 { nil_word } else { inner }) (branch_count! node - 1)
+    }
+};
+
+let map_remove! !p !m !k = {
+    let h = key_hash! k;
+    if map_find! m h k 0 == 0 { m } else { map_without! p m h k 0 }
+};
+
+let pair_of! !p !k !v = new_cons! p k (new_cons! p v nil_word);
+
+let chain_pairs! !p !l !tail = if l == nil_word { tail } else {
+    new_cons! p (pair_of! p (prim.load64! (l + 2 * word)) (prim.load64! (l + 3 * word)))
+        (chain_pairs! p (prim.load64! (l + 4 * word)) tail)
+};
+
+let node_pairs! !p !node !i !tail = if i < 0 { tail } else {
+    let child = prim.load64! (branch_slot node i);
+    let with_child = if is_leaf! child { chain_pairs! p child tail }
+                     else { node_pairs! p child (popcount (branch_bitmap! child) - 1) tail };
+    node_pairs! p node (i - 1) with_child
+};
+
+let map_pairs! !p !m = if is_kind! m kind_map { node_pairs! p m (popcount (branch_bitmap! m) - 1) nil_word } else { type_fail! p "map_pairs needs a map" };
+
+let map_size! !p !m = tag_fix (branch_count! m);
+
+/// `_match_key`: `[value]` or `[]`, the value unforced.
+let match_key! !p !m !k = {
+    let l = if is_kind! m kind_map { map_find! m (key_hash! k) k 0 } else { 0 };
+    if l == 0 { nil_word } else { new_cons! p (prim.load64! (l + 3 * word)) nil_word }
+};
+
+// --- c.[k] and c.[k => v] -----------------------------------------------------------
+
+/// The element, unforced, or 0 when there is none. A list is the library's, since
+/// walking one forces it, and is told apart before this.
+let peek! !p !c !k =
+    if is_kind! c kind_map { let l = map_find! c (key_hash! k) k 0; if l == 0 { 0 } else { prim.load64! (l + 3 * word) } }
+    else if is_fix k && (is_kind! c kind_array || is_record! c) {
+        let i = untag_fix k;
+        let off = if is_record! c { 3 } else { 2 };
+        if i >= 0 && i < untag_fix (prim.load64! (c + word)) { prim.load64! (c + (off + i) * word) } else { 0 }
+    }
+    else { 0 };
+
+/// Why `peek!` found nothing, as the raise that follows when no `else` was written.
+let index_absent! !p !c !k =
+    if is_kind! c kind_map { fail_value! p atom_no_such_key (concat2! p (text_of! p "the map has no key ") (describe! p k)) }
+    else if is_record! c {
+        if is_fix k {
+            fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "field " (int_to_string! p k) " is outside ") (describe! p c))
+        } else { fail_value! p atom_type_error (concat2! p (text_of! p "a field of a record is read by position, not ") (describe! p k)) }
+    }
+    else if is_kind! c kind_array {
+        if is_fix k {
+            fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "index " (int_to_string! p k) " is outside an array of ")
+                                                      (int_to_string! p (prim.load64! (c + word))))
+        } else { fail_value! p atom_type_error (concat2! p (text_of! p "an array is indexed by an integer, not ") (describe! p k)) }
+    }
+    else { fail_value! p atom_type_error (concat2! p (text_of! p "`.[ ]` reads a map, an array, a list or a trunk, not ") (describe! p c)) };
+
+/// A list's walk ran out, the library having counted how far.
+let past_end_error! !p !k !walked =
+    error_new! p atom_out_of_bounds (concat2! p (concat_parts! p "index " (int_to_string! p k) " is past the end of a list of ")
+                                             (int_to_string! p walked));
+
+let index_set! !p !c !k !v =
+    if is_kind! c kind_map { map_put! p c k v }
+    else if is_fix k && (is_kind! c kind_array || is_record! c) {
+        let n = untag_fix (prim.load64! (c + word));
+        let i = untag_fix k;
+        if i < 0 || i >= n { fail! p atom_out_of_bounds "index out of bounds" }
+        else {
+            let off = if is_record! c { 3 } else { 2 };
+            let o = alloc! p ((off + n) * word);
+            copy_words! c o (off + n);
+            prim.store64! (o + (off + i) * word) v;
+            o
+        }
+    }
+    else { fail! p atom_type_error "this value cannot be updated" };
+
+// --- what the library needs of the runtime --------------------------------------------
+
+let exit! !p !code = prim.c1! "exit" (untag_fix code);
+
+let write_err! !p !s = {
+    prim.c3! "write" 2 (string_bytes s) (string_len! s);
+    unit_word
+};
+
+let closure_name! !p !f = prim.load64! (prim.load64! f + info_name);
+let is_process! !v = is_kind! v kind_process;
+
+let is_record_value! !p !v = as_word (is_record! v);
+
+/// For the library, which raises by calling this: the 0 is what raises.
+let raise_value! !p !e = {
+    prim.store64! (p + ctx_error) e;
+    0
+};
+
+let process_text! !p !v = concat3! p (text_of! p "<process ") (int_to_string! p (prim.load64! (v + word))) (text_of! p ">");
+
+let concat_any_text! !p !v = v;
+
+/// The same with the value forced, as the caller's call has made it.
+let array_force_store! !p !a !i !v = array_store! p a i v;
+
+let raise_or_wrap! !p !v = {
+    prim.store64! (p + ctx_error) (if is_error! v { v } else { error_new! p atom_error v });
+    0
+};
+
+/// What a `switch_atom` keys on: a record is told by its id.
+let atom_key! !p !v = if is_record! v { prim.load64! (v + 2 * word) } else { v };
+
+/// What a `switch_head` looks at, unforced: a cell's head or an array's first item,
+/// and for anything else a word no key can equal.
+let head_of! !p !v =
+    if is_kind! v kind_cons { prim.load64! (v + word) }
+    else if is_kind! v kind_array && prim.load64! (v + word) != tag_fix 0 { prim.load64! (v + 2 * word) }
+    else { unit_word };
+
+/// A cell's parts, unforced, for where the program may ask of something that is not one.
+let list_head! !p !v = if is_kind! v kind_cons { prim.load64! (v + word) } else { fail! p atom_type_error "head needs a non-empty list" };
+let list_tail! !p !v = if is_kind! v kind_cons { prim.load64! (v + 2 * word) } else { fail! p atom_type_error "tail needs a non-empty list" };
+
+// --- processes ------------------------------------------------------------------------
+//
+// Green, on one OS thread, sharing one heap. Sharing is invisible, since values do not
+// change, and a message that is forced before it is sent carries no suspension. A
+// process is a control block of raw words and a stack of its own, reserved and touched
+// as needed. Everything here runs in tail position on the machine stack, so a switch is
+// a jump to the next process's top frame. What may block is a machine function: when
+// it cannot go on it pushes a frame that will call it again, and that frame is what the
+// process resumes in; nothing has to be undone and nothing is half done.
+
+let pcb_id = 0;
+let pcb_sp = 8;
+let pcb_state = 16;
+let pcb_stack = 24;
+let pcb_mail_head = 40;
+let pcb_mail_tail = 48;
+let pcb_mail_count = 56;
+let pcb_result = 64;
+let pcb_failed = 72;
+let pcb_monitors = 80;
+let pcb_wake_at = 88;
+let pcb_next = 96;
+let pcb_joiners = 104;
+let pcb_kill = 112;
+let pcb_resume = 120;
+let pcb_joined = 128;
+let pcb_killing = 136;
+let pcb_size = 160;
+
+let state_ready = 0;
+let state_running = 1;
+let state_waiting = 2;
+let state_done = 3;
+
+let table_grow = 1024;
+
+let table_at! !p !id = prim.load64! (prim.load64! (p + ctx_table) + id * word);
+
+let pcb_of_pid! !p !pid = table_at! p (untag_fix (prim.load64! (pid + word)));
+
+let new_pid! !p !id = {
+    let o = alloc! p (2 * word);
+    prim.store64! o (prim.info "process");
+    prim.store64! (o + word) (tag_fix id);
+    o
+};
+
+let run_push! !p !pcb = {
+    prim.store64! (pcb + pcb_state) state_ready;
+    prim.store64! (pcb + pcb_next) 0;
+    let tail = prim.load64! (p + ctx_run_tail);
+    if tail == 0 { prim.store64! (p + ctx_run_head) pcb; } else { prim.store64! (tail + pcb_next) pcb; };
+    prim.store64! (p + ctx_run_tail) pcb;
+    0
+};
+
+let run_pop! !p = {
+    let pcb = prim.load64! (p + ctx_run_head);
+    if pcb != 0 {
+        let next = prim.load64! (pcb + pcb_next);
+        prim.store64! (p + ctx_run_head) next;
+        if next == 0 { prim.store64! (p + ctx_run_tail) 0; };
+    };
+    pcb
+};
+
+/// Runnable again, if it was parked: a wake of one that is running or queued is no
+/// news, since a blocked call looks again when it gets to run.
+let wake! !p !pcb = if prim.load64! (pcb + pcb_state) == state_waiting {
+    prim.store64! (pcb + pcb_wake_at) (0 - 1);
+    run_push! p pcb
+} else { 0 };
+
+let grow_table! !p !id = if id >= prim.load64! (p + ctx_table_cap) {
+    let cap = prim.load64! (p + ctx_table_cap) * 2;
+    prim.store64! (p + ctx_table) (prim.c2! "realloc" (prim.load64! (p + ctx_table)) (cap * word));
+    prim.store64! (p + ctx_table_cap) cap;
+    0
+} else { 0 };
+
+let new_pcb! !p = {
+    let id = prim.load64! (p + ctx_next_id);
+    prim.store64! (p + ctx_next_id) (id + 1);
+    grow_table! p id;
+    let pcb = prim.c2! "calloc" 1 pcb_size;
+    prim.store64! (prim.load64! (p + ctx_table) + id * word) pcb;
+    prim.store64! (pcb + pcb_id) id;
+    prim.store64! (pcb + pcb_monitors) nil_word;
+    prim.store64! (pcb + pcb_joiners) nil_word;
+    prim.store64! (pcb + pcb_mail_head) nil_word;
+    prim.store64! (pcb + pcb_mail_tail) nil_word;
+    prim.store64! (pcb + pcb_result) unit_word;
+    prim.store64! (pcb + pcb_resume) unit_word;
+    prim.store64! (pcb + pcb_wake_at) (0 - 1);
+    prim.store64! (pcb + pcb_kill) 0;
+    let stack = map_memory! stack_bytes;
+    prim.store64! (pcb + pcb_stack) stack;
+    let top = stack + stack_bytes;
+    prim.store64! (top - word) (prim.info "halt");
+    prim.store64! (pcb + pcb_sp) (top - word);
+    prim.store64! (p + ctx_live) (prim.load64! (p + ctx_live) + 1);
+    pcb
+};
+
+let stack_top! !pcb = prim.load64! (pcb + pcb_stack) + stack_bytes;
+
+/// The process in hand: what the context's fast fields are of.
+let make_current! !p !pcb = {
+    let floor = prim.load64! (pcb + pcb_stack) + stack_margin;
+    prim.store64! (p + ctx_current) pcb;
+    prim.store64! (p + ctx_current_id) (tag_fix (prim.load64! (pcb + pcb_id)));
+    prim.store64! (p + ctx_stack_top) (stack_top! pcb);
+    prim.store64! (p + ctx_floor) floor;
+    prim.store64! (p + ctx_guard) floor;
+    prim.store64! (pcb + pcb_state) state_running;
+    0
+};
+
+let current! !p = prim.load64! (p + ctx_current);
+
+// --- time -------------------------------------------------------------------------------
+
+let now_ns! !p = {
+    let buf = alloc! p (2 * word);
+    prim.c2! "clock_gettime" 1 buf;
+    prim.load64! buf * 1000000000 + prim.load64! (buf + word)
+};
+
+let earliest_at! !p !id !n !best = if id >= n { best } else {
+    let pcb = table_at! p id;
+    let at = if pcb == 0 { 0 - 1 } else { prim.load64! (pcb + pcb_wake_at) };
+    earliest_at! p (id + 1) n
+        (if at >= 0 && prim.load64! (pcb + pcb_state) == state_waiting && (best < 0 || at < best) { at } else { best })
+};
+
+let wake_expired! !p !id !n !now = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting {
+        let at = prim.load64! (pcb + pcb_wake_at);
+        if at >= 0 && at <= now { wake! p pcb; };
+    };
+    wake_expired! p (id + 1) n now
+};
+
+// --- the scheduler -----------------------------------------------------------------------
+
+/// Run whoever is next. A process with a kill waiting does not resume: it starts
+/// unwinding, and only its cleanups run.
+let dispatch! !p !pcb !b !c !d !e = {
+    make_current! p pcb;
+    let sp = prim.load64! (pcb + pcb_sp);
+    let reason = prim.load64! (pcb + pcb_kill);
+    if reason != 0 && prim.load64! (pcb + pcb_killing) == 0 {
+        prim.store64! (pcb + pcb_killing) 1;
+        unwind! p sp (error_new! p atom_killed reason) 0 0 0
+    } else {
+        return! p sp (prim.load64! (pcb + pcb_resume))
+    }
+};
+
+/// Nothing is runnable. Timers may yet make something so; if none can, the run is over.
+let idle! !p !a !b !c !d !e = {
+    let n = prim.load64! (p + ctx_next_id);
+    let at = earliest_at! p 1 n (0 - 1);
+    if at >= 0 {
+        let now = now_ns! p;
+        if at > now {
+            let ts = alloc! p (2 * word);
+            let gap = at - now;
+            prim.store64! ts (gap / 1000000000);
+            prim.store64! (ts + word) (gap % 1000000000);
+            prim.c2! "nanosleep" ts 0;
+        };
+        wake_expired! p 1 n (now_ns! p);
+        schedule! p 0 0 0 0 0
+    }
+    else if prim.load64! (p + ctx_live) == 0 { all_done! p 0 0 0 0 0 }
+    else { deadlock! p 0 0 0 0 0 }
+};
+
+let schedule! !p !a !b !c !d !e = {
+    let n = prim.load64! (p + ctx_next_id);
+    let at = earliest_at! p 1 n (0 - 1);
+    if at >= 0 { wake_expired! p 1 n (now_ns! p); };
+    let next = run_pop! p;
+    if next == 0 { idle! p 0 0 0 0 0 } else { dispatch! p next 0 0 0 0 }
+};
+
+let deadlock! !p !a !b !c !d !e = {
+    let s = "dream: deadlock -- every process is waiting for a message that cannot arrive\n";
+    prim.c3! "write" 2 s (prim.str_len s);
+    prim.c1! "exit" 1
+};
+
+/// Every process has finished. What failed with nobody to tell is reported by the
+/// library, on the first process's stack, which has nothing else to do now.
+let all_done! !p !a !b !c !d !e = {
+    let pcb = table_at! p 1;
+    let stack = map_memory! stack_bytes;
+    prim.store64! (pcb + pcb_stack) stack;
+    make_current! p pcb;
+    let top = stack + stack_bytes;
+    prim.store64! (top - word) (prim.info "halt");
+    prim.store64! (top - 2 * word) unit_word;
+    apply! p (top - 2 * word) (prim.info "lib_finish") 1 0 0
+};
+
+let unjoined_from! !p !id !n !acc = if id >= n { acc } else {
+    let pcb = table_at! p id;
+    let failed = prim.load64! (pcb + pcb_failed) != 0 && prim.load64! (pcb + pcb_joined) == 0;
+    unjoined_from! p (id + 1) n (if failed { new_cons! p (prim.load64! (pcb + pcb_result)) acc } else { acc })
+};
+
+/// The errors of processes that failed and were never joined.
+let unjoined_failures! !p !unit = unjoined_from! p 2 (prim.load64! (p + ctx_next_id)) nil_word;
+
+/// `[:down, pid, Result]`, to each monitor.
+let new_result! !p !ok !v = {
+    let r = new_record! p (if ok { atom_result_ok } else { atom_result_error }) 1;
+    prim.store64! (r + 3 * word) v;
+    r
+};
+
+let deliver! !p !pcb !msg = {
+    let cell = new_cons! p msg nil_word;
+    if prim.load64! (pcb + pcb_mail_count) == 0 { prim.store64! (pcb + pcb_mail_head) cell; }
+    else { prim.store64! (prim.load64! (pcb + pcb_mail_tail) + 2 * word) cell; };
+    prim.store64! (pcb + pcb_mail_tail) cell;
+    prim.store64! (pcb + pcb_mail_count) (prim.load64! (pcb + pcb_mail_count) + 1);
+    wake! p pcb
+};
+
+let down_of! !p !pcb = new_cons! p atom_down (new_cons! p (new_pid! p (prim.load64! (pcb + pcb_id)))
+    (new_cons! p (new_result! p (prim.load64! (pcb + pcb_failed) == 0) (prim.load64! (pcb + pcb_result))) nil_word));
+
+let tell_monitors! !p !pcb !list_ = if list_ == nil_word { 0 } else {
+    let m = table_at! p (untag_fix (prim.load64! (list_ + word)));
+    deliver! p m (down_of! p pcb);
+    tell_monitors! p pcb (prim.load64! (list_ + 2 * word))
+};
+
+let wake_list! !p !list_ = if list_ == nil_word { 0 } else {
+    wake! p (table_at! p (untag_fix (prim.load64! (list_ + word))));
+    wake_list! p (prim.load64! (list_ + 2 * word))
+};
+
+/// A process has its answer, or has failed. Its stack goes now, and its record stays,
+/// since a process may join it later.
+let finish! !p !v !failed !d !e !f = {
+    let pcb = current! p;
+    let is_root = prim.load64! (pcb + pcb_id) == 1;
+    prim.store64! (pcb + pcb_result) v;
+    prim.store64! (pcb + pcb_failed) failed;
+    prim.store64! (pcb + pcb_state) state_done;
+    prim.store64! (p + ctx_live) (prim.load64! (p + ctx_live) - 1);
+    tell_monitors! p pcb (prim.load64! (pcb + pcb_monitors));
+    wake_list! p (prim.load64! (pcb + pcb_joiners));
+    prim.store64! (pcb + pcb_monitors) nil_word;
+    prim.store64! (pcb + pcb_joiners) nil_word;
+    prim.c2! "munmap" (prim.load64! (pcb + pcb_stack)) stack_bytes;
+    prim.store64! (pcb + pcb_stack) 0;
+    schedule! p 0 0 0 0 0
+};
+
+/// The bottom of every process's stack.
+let code_halt! !p !sp !v !b !c !d = finish! p v 0 0 0 0;
+
+/// Save this process with a frame that will call `code` again, and run another. The
+/// frame is its whole state.
+let park! !p !sp !code !a !b !c = {
+    let at = sp - 5 * word;
+    prim.store64! at (prim.info "retry_call");
+    prim.store64! (at + word) code;
+    prim.store64! (at + 2 * word) a;
+    prim.store64! (at + 3 * word) b;
+    prim.store64! (at + 4 * word) c;
+    let pcb = current! p;
+    prim.store64! (pcb + pcb_sp) at;
+    prim.store64! (pcb + pcb_resume) unit_word;
+    prim.store64! (pcb + pcb_state) state_waiting;
+    if prim.load64! (pcb + pcb_kill) != 0 { wake! p pcb; };
+    schedule! p 0 0 0 0 0
+};
+
+let frame_retry_call! !p !sp !v !b !c !d =
+    prim.jump! (prim.load64! (sp + word)) p (sp + 5 * word) 0 (prim.load64! (sp + 2 * word))
+        (prim.load64! (sp + 3 * word)) (prim.load64! (sp + 4 * word));
+
+/// Give way, keeping the frame on top as it is.
+let yield_now! !p !sp !v !b !c !d = {
+    let pcb = current! p;
+    prim.store64! (pcb + pcb_sp) sp;
+    prim.store64! (pcb + pcb_resume) v;
+    run_push! p pcb;
+    schedule! p 0 0 0 0 0
+};
+
+/// Where a function's entry goes when the guard says stop: see `collect_at_entry!`.
+let frame_resume_entry! !p !sp !v !b !c !d = {
+    let code = prim.load64! (sp + 2 * word);
+    prim.jump! code p (sp + 8 * word) (prim.load64! (sp + 4 * word)) (prim.load64! (sp + 5 * word))
+        (prim.load64! (sp + 6 * word)) (prim.load64! (sp + 7 * word))
+};
+
+/// A thunk that some other process is evaluating, waited for by coming back to it.
+let frame_enter_again! !p !sp !v !b !c !d = enter! p (sp + 2 * word) (prim.load64! (sp + word));
+
+// --- what programs call -------------------------------------------------------------------
+
+let spawn! !p !work = {
+    let pcb = new_pcb! p;
+    let sp = prim.load64! (pcb + pcb_sp) - 2 * word;
+    prim.store64! sp (prim.info "start");
+    prim.store64! (sp + word) work;
+    prim.store64! (pcb + pcb_sp) sp;
+    run_push! p pcb;
+    start_ticking! p;
+    new_pid! p (prim.load64! (pcb + pcb_id))
+};
+
+/// A new process starts here: its work is evaluated, and applied if that is a function
+/// waiting for nothing, which is what `$( .. )` makes.
+let frame_start! !p !sp !v !b !c !d = {
+    let work = prim.load64! (sp + word);
+    let at = sp + 2 * word - 2 * word;
+    prim.store64! at (prim.info "apply_rest");
+    prim.store64! (at + word) (tag_fix 2);
+    enter! p at work
+};
+
+let self! !p !unit = new_pid! p (prim.load64! (current! p + pcb_id));
+
+let join_m! !p !sp !self_ !pid !c !d = {
+    if not (is_kind! pid kind_process) {
+        fail! p atom_type_error "join! needs a process";
+        native_failed! p sp 0 0 0 0
+    } else {
+        let target = pcb_of_pid! p pid;
+        if prim.load64! (target + pcb_state) == state_done {
+            prim.store64! (target + pcb_joined) 1;
+            if prim.load64! (target + pcb_failed) != 0 { unwind! p sp (prim.load64! (target + pcb_result)) 0 0 0 }
+            else { enter! p sp (prim.load64! (target + pcb_result)) }
+        } else {
+            prim.store64! (target + pcb_joiners) (new_cons! p (prim.load64! (current! p + pcb_id) * 2 + 1) (prim.load64! (target + pcb_joiners)));
+            park! p sp (prim.load64! (prim.info "m_join")) pid unit_word unit_word
+        }
+    }
+};
+
+let mail_pop! !p !pcb = {
+    let cell = prim.load64! (pcb + pcb_mail_head);
+    prim.store64! (pcb + pcb_mail_head) (prim.load64! (cell + 2 * word));
+    prim.store64! (pcb + pcb_mail_count) (prim.load64! (pcb + pcb_mail_count) - 1);
+    prim.load64! (cell + word)
+};
+
+let recv_m! !p !sp !self_ !a !c !d = {
+    let pcb = current! p;
+    if prim.load64! (pcb + pcb_mail_count) != 0 { return! p sp (mail_pop! p pcb) }
+    else { park! p sp (prim.load64! (prim.info "m_recv")) unit_word unit_word unit_word }
+};
+
+/// `send!`, the library having forced the message.
+let send_forced! !p !pid !msg = {
+    if not (is_kind! pid kind_process) { fail! p atom_type_error "send! needs a process" }
+    else {
+        let target = pcb_of_pid! p pid;
+        if prim.load64! (target + pcb_state) != state_done { deliver! p target msg; };
+        unit_word
+    }
+};
+
+let cell_at! !c !i = if i == 0 { c } else { cell_at! (prim.load64! (c + 2 * word)) (i - 1) };
+
+let mailbox_size! !p !unit = tag_fix (prim.load64! (current! p + pcb_mail_count));
+
+let mailbox_peek! !p !i = {
+    let pcb = current! p;
+    let at = untag_fix i;
+    if at < 0 || at >= prim.load64! (pcb + pcb_mail_count) { atom_none }
+    else { new_result! p true (prim.load64! (cell_at! (prim.load64! (pcb + pcb_mail_head)) at + word)) }
+};
+
+let mailbox_take! !p !i = {
+    let pcb = current! p;
+    let at = untag_fix i;
+    let count = prim.load64! (pcb + pcb_mail_count);
+    if at < 0 || at >= count { fail! p atom_out_of_bounds "mailbox_take!: no message at that position" }
+    else {
+        if at == 0 { prim.store64! (pcb + pcb_mail_head) (prim.load64! (prim.load64! (pcb + pcb_mail_head) + 2 * word)); }
+        else {
+            let before = cell_at! (prim.load64! (pcb + pcb_mail_head)) (at - 1);
+            let gone = prim.load64! (before + 2 * word);
+            prim.store64! (before + 2 * word) (prim.load64! (gone + 2 * word));
+            if at == count - 1 { prim.store64! (pcb + pcb_mail_tail) before; };
+        };
+        prim.store64! (pcb + pcb_mail_count) (count - 1);
+        atom_ok
+    }
+};
+
+let await_message_m! !p !sp !self_ !n !deadline !d = {
+    let pcb = current! p;
+    let at = untag_fix deadline;
+    if prim.load64! (pcb + pcb_mail_count) > untag_fix n { return! p sp atom_ok }
+    else if at >= 0 && now_ns! p >= at { return! p sp atom_timeout }
+    else {
+        prim.store64! (pcb + pcb_wake_at) at;
+        park! p sp (prim.load64! (prim.info "m_await")) n deadline unit_word
+    }
+};
+
+let sleep_until_m! !p !sp !self_ !deadline !c !d = {
+    let pcb = current! p;
+    let at = untag_fix deadline;
+    if now_ns! p >= at { return! p sp atom_ok }
+    else {
+        prim.store64! (pcb + pcb_wake_at) at;
+        park! p sp (prim.load64! (prim.info "m_sleep")) deadline unit_word unit_word
+    }
+};
+
+let deadline_in! !p !ms = tag_fix (now_ns! p + untag_fix ms * 1000000);
+let now_ns_value! !p !unit = tag_fix (now_ns! p);
+let wall_ms! !p !unit = {
+    let buf = alloc! p (2 * word);
+    prim.c2! "clock_gettime" 0 buf;
+    tag_fix (prim.load64! buf * 1000 + prim.load64! (buf + word) / 1000000)
+};
+
+let monitor! !p !pid = {
+    let target = pcb_of_pid! p pid;
+    if prim.load64! (target + pcb_state) == state_done { deliver! p (current! p) (down_of! p target); }
+    else { prim.store64! (target + pcb_monitors) (new_cons! p (tag_fix (prim.load64! (current! p + pcb_id))) (prim.load64! (target + pcb_monitors))); };
+    atom_ok
+};
+
+let without_id! !p !l !id = if l == nil_word { nil_word }
+    else if prim.load64! (l + word) == id { prim.load64! (l + 2 * word) }
+    else { new_cons! p (prim.load64! (l + word)) (without_id! p (prim.load64! (l + 2 * word)) id) };
+
+let demonitor! !p !pid = {
+    let target = pcb_of_pid! p pid;
+    prim.store64! (target + pcb_monitors) (without_id! p (prim.load64! (target + pcb_monitors)) (tag_fix (prim.load64! (current! p + pcb_id))));
+    atom_ok
+};
+
+/// `kill!`, the library having forced the reason. Parked, the target has to run once
+/// more to be stopped. Killing yourself takes effect at the next function entry.
+let kill_forced! !p !pid !reason = {
+    let target = pcb_of_pid! p pid;
+    if prim.load64! (target + pcb_state) != state_done && prim.load64! (target + pcb_kill) == 0 {
+        prim.store64! (target + pcb_kill) reason;
+        wake! p target;
+        if target == current! p { prim.store64! (p + ctx_guard) (0 - 1); };
+    };
+    atom_ok
+};
+
+let unique_value! !p !unit = {
+    let n = prim.load64! (p + ctx_unique) + 1;
+    prim.store64! (p + ctx_unique) n;
+    tag_fix n
+};
+
+let start_ticking! !p = if prim.load64! (p + ctx_ticking) == 0 {
+    prim.store64! (p + ctx_ticking) 1;
+    prim.store64! (prim.info "tick_target") (p + ctx_guard);
+    prim.tick_thread! ()
+} else { 0 };
+
+let process_id! !p !v = prim.load64! (v + word);

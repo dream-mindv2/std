@@ -4,9 +4,12 @@
 // are simply what they are everywhere else, and no builtin needs a protocol for
 // being suspended partway through.
 //
-// `rt.native` names functions of rt/main.dr, which take forced arguments.
+// `rt.native` names functions of rt/main.dr, which take forced arguments. Nothing here
+// may use a builtin of the kind it defines: this is what they are.
 
 import rt.native;
+
+// --- rendering --------------------------------------------------------------------
 
 let quoted v = match type_of v {
     :string => native.concat3 "\"" v "\"",
@@ -14,22 +17,58 @@ let quoted v = match type_of v {
     _ => show v,
 };
 
-let show_items xs = match xs {
-    [] => "",
-    [x] => quoted x,
-    [x, ..rest] => native.concat3 (quoted x) ", " (show_items rest),
+let join_items xs = concat_list (separated xs);
+
+let separated xs = match xs {
+    [] => [],
+    [x] => [quoted x],
+    [x, ..rest] => quoted x :: ", " :: separated rest,
 };
 
-let show v = match type_of v {
-    :string => v,
-    :integer => native.int_to_string v,
-    :atom => native.concat2 ":" (native.atom_name v),
-    :char => native.char_text v,
-    :bool => if v { "true" } else { "false" },
-    :unit => "()",
-    :list => native.concat3 "[" (show_items v) "]",
-    _ => "<a value>",
+/// A list, whose tail may turn out not to be a list at all.
+let show_list xs = native.concat3 "[" (join_items xs) "]";
+
+let pair_text p = native.concat3 (quoted p.[0]) " => " (quoted p.[1]);
+
+let separated_pairs ps = match ps {
+    [] => [],
+    [x] => [pair_text x],
+    [x, ..rest] => pair_text x :: ", " :: separated_pairs rest,
 };
+
+let show v = {
+    let t = type_of v;
+    match t {
+        :string => v,
+        :integer => native.big_or_int_text v,
+        :float => native.float_text v,
+        :atom => native.concat2 ":" (native.atom_name v),
+        :char => native.char_text v,
+        :bool => if v { "true" } else { "false" },
+        :unit => "()",
+        :list => show_list v,
+        :array => native.concat3 "#[" (join_items (native.array_to_list v)) "]",
+        :map => native.concat3 "%{" (concat_list (separated_pairs (native.map_pairs v))) "}",
+        :error => native.concat3 "<error " (native.concat3 (quoted (native.error_kind v)) " " (show (native.error_payload v))) ">",
+        :pure_fn => show_function v,
+        :impure_fn => show_function v,
+        :process => native.process_text v,
+        _ => show_record v,
+    }
+};
+
+let show_function f = native.concat3 "<fn " (native.closure_name f) ">";
+
+let show_record r = {
+    let name = native.record_display (native.record_id r);
+    match native.record_size r {
+        // A variant with no fields is written as a value; a record with none is a call.
+        0 => if native.str_find_any name "." 0 >= 0 { name } else { native.concat2 name "()" },
+        _ => concat_list [name, "(", join_items (native.array_to_list (native.record_fields r)), ")"],
+    }
+};
+
+// --- lengths and forcing -------------------------------------------------------------
 
 let length_from xs !n = match xs {
     [] => n,
@@ -41,28 +80,245 @@ let length v = match type_of v {
     _ => native.size v,
 };
 
-/// All the way down. Only lists hold anything lazy yet.
-let deep! v = match type_of v {
-    :list => {
-        let rec go! xs = match xs {
-            [] => (),
-            [x, ..rest] => { deep! x; go! rest },
-        };
-        go! v;
-        v
+/// All the way down.
+let deep! v = {
+    settle v;
+    v
+};
+
+let settle_list xs = match xs {
+    [] => true,
+    [x, ..rest] => { let done = settle x; done && settle_list rest },
+};
+
+let settle v = match type_of v {
+    :list => settle_list v,
+    :array => settle_list (native.array_to_list v),
+    :map => settle_list (native.map_pairs v),
+    :error => settle (native.error_payload v),
+    :integer => true, :float => true, :string => true, :atom => true, :char => true,
+    :bool => true, :unit => true, :pure_fn => true, :impure_fn => true, :process => true,
+    _ => settle_list (native.array_to_list (native.record_fields v)),
+};
+
+let forced v = { let t = type_of v; true };
+
+// --- strings and arrays from lists ----------------------------------------------------
+
+let array_fill a xs !i = match xs {
+    [] => a,
+    [x, ..rest] => array_fill (native.array_store a i x) rest (i + 1),
+};
+
+let array_of_list xs = array_fill (native.array_new (length_from xs 0) ()) xs 0;
+
+/// Each element evaluated where it lies.
+let array_forced a !i !n =
+    if i >= n { a }
+    else { array_forced (native.array_force_store a i (native.match_at a i)) (i + 1) n };
+
+let forced_array xs = {
+    let a = array_of_list xs;
+    array_forced a 0 (native.size a)
+};
+
+let concat_list xs = native.join_strings (forced_array xs);
+
+let text_array a !i !n =
+    if i >= n { a }
+    else { array_forced_text a i n };
+
+let array_forced_text a !i !n =
+    text_array (native.array_force_store a i (show (native.match_at a i))) (i + 1) n;
+
+let str_interp xs = {
+    let a = array_of_list xs;
+    native.join_strings (text_array a 0 (native.size a))
+};
+
+let str_of_chars cs = {
+    let a = array_of_list cs;
+    native.join_strings (char_texts a 0 (native.size a))
+};
+
+let char_texts a !i !n =
+    if i >= n { a }
+    else { char_texts (native.array_force_store a i (native.char_text (native.match_at a i))) (i + 1) n };
+
+let str_of_bytes bs = native.string_of_bytes (forced_array bs);
+
+// --- structure ------------------------------------------------------------------------
+
+let concat_lists xs ys = match xs {
+    [] => ys,
+    [x, ..rest] => x :: concat_lists rest ys,
+};
+
+let lists_equal xs ys = match [xs, ys] {
+    [[], []] => true,
+    [[x, ..xr], [y, ..yr]] => x == y && lists_equal xr yr,
+    _ => false,
+};
+
+let equal a b = match [type_of a, type_of b] {
+    [:list, :list] => lists_equal a b,
+    [:array, :array] => lists_equal (native.array_to_list a) (native.array_to_list b),
+    [:map, :map] => native.size a == native.size b && map_within (native.map_pairs a) b,
+    [:error, :error] => native.error_kind a == native.error_kind b && native.error_payload a == native.error_payload b,
+    [:integer, :integer] => false,
+    [:string, :string] => false,
+    [:float, :float] => false,
+    [:pure_fn, :pure_fn] => false,
+    [:impure_fn, :impure_fn] => false,
+    _ => native.is_record_value a && native.is_record_value b && native.record_id a == native.record_id b
+         && lists_equal (native.array_to_list (native.record_fields a)) (native.array_to_list (native.record_fields b)),
+};
+
+let map_within ps m = match ps {
+    [] => true,
+    [[k, v], ..rest] => match native.match_key m k {
+        [w] => v == w && map_within rest m,
+        _ => false,
     },
-    _ => v,
 };
 
-let concat_list xs = match xs {
-    [] => "",
-    [x, ..rest] => native.concat2 x (concat_list rest),
+let not_equal a b = not (equal a b);
+
+let compare_lists xs ys = match [xs, ys] {
+    [[], []] => 0,
+    [[], _] => -1,
+    [_, []] => 1,
+    [[x, ..xr], [y, ..yr]] => {
+        let c = compare_values x y;
+        if c != 0 { c } else { compare_lists xr yr }
+    },
 };
 
-let main! () = {
-    show ();
-    length [];
-    deep! ();
-    concat_list [];
-    0
+let compare_values a b = match native.flat_compare a b {
+    3 => match type_of a {
+        :list => compare_lists a b,
+        :array => compare_lists (native.array_to_list a) (native.array_to_list b),
+        :map => compare_lists (native.map_pairs a) (native.map_pairs b),
+        _ => if native.is_record_value a && native.is_record_value b {
+                 match compare_values (native.atom_name (native.record_id a)) (native.atom_name (native.record_id b)) {
+                     0 => compare_lists (native.array_to_list (native.record_fields a)) (native.array_to_list (native.record_fields b)),
+                     c => c,
+                 }
+             } else { 0 },
+    },
+    c => c,
 };
+
+// --- positions in a list ---------------------------------------------------------------
+
+let list_at xs i !walked fallback = match xs {
+    [] => fallback walked,
+    [x, ..rest] => if i == walked { x } else { list_at rest i (walked + 1) fallback },
+};
+
+let index_of_list xs i = {
+    let off_the_end = fn walked -> lib_raise (native.past_end_error i walked);
+    if type_of i != :integer || i < 0 { off_the_end 0 }
+    else { list_at xs i 0 off_the_end }
+};
+
+let index_of_list_else xs i fallback =
+    if type_of i != :integer || i < 0 { fallback }
+    else { list_at xs i 0 (fn _ -> fallback) };
+
+/// The cells in front of the position are walked now, as a `set` does, so that one
+/// past the end raises where it was written and not when the list is next read.
+let list_set_from xs i v !walked before = match xs {
+    [] => lib_raise (native.past_end_error i walked),
+    [x, ..rest] => if i == walked { rev_onto before (v :: rest) } else { list_set_from rest i v (walked + 1) (x :: before) },
+};
+
+let list_set xs i v = list_set_from xs i v 0 [];
+
+let lib_raise e = native.raise_value e;
+
+// --- sorting, by keys --------------------------------------------------------------------
+
+let merge_pairs xs ys = match [xs, ys] {
+    [[], _] => ys,
+    [_, []] => xs,
+    [[x, ..xr], [y, ..yr]] =>
+        if compare_values y.[0] x.[0] < 0 { y :: merge_pairs xs yr } else { x :: merge_pairs xr ys },
+};
+
+let split_at xs !n acc = if n == 0 { [native.array_to_list (array_of_list (rev_onto acc [])), xs] } else {
+    match xs { [x, ..rest] => split_at rest (n - 1) (x :: acc), [] => [rev_onto acc [], []] }
+};
+
+let rev_onto xs ys = match xs {
+    [] => ys,
+    [x, ..rest] => rev_onto rest (x :: ys),
+};
+
+let merge_sort xs !n =
+    if n < 2 { xs }
+    else {
+        let half = n / 2;
+        let [left, right] = split_at xs half [];
+        merge_pairs (merge_sort left half) (merge_sort right (n - half))
+    };
+
+let pair_up ks vs = match [ks, vs] {
+    [[k, ..kr], [v, ..vr]] => [k, v] :: pair_up kr vr,
+    _ => [],
+};
+
+let seconds ps = match ps {
+    [] => [],
+    [p, ..rest] => p.[1] :: seconds rest,
+};
+
+let sort_keyed keys items = {
+    let vs = native.array_to_list items;
+    seconds (merge_sort (pair_up keys vs) (length_from vs 0))
+};
+
+let type_assert ok why v = if ok { v } else { lib_raise (native.error_new :type_error why) };
+
+let match_fail v path line col = lib_raise (native.error_new :match_error [v, path, line, col]);
+
+let error_trace! e = [];
+
+let raise_any! v = native.raise_or_wrap v;
+
+let cons_of x xs = x :: xs;
+
+let send_value! pid message = {
+    settle message;
+    native.send_forced pid message
+};
+
+let kill_value! pid reason = {
+    settle reason;
+    native.kill_forced pid reason
+};
+
+/// The run is over: what failed unjoined is said, and is the exit status.
+let finish! u = {
+    let failures = native.unjoined_failures ();
+    report_failures! failures;
+    native.exit (match failures { [] => 0, _ => 1 })
+};
+
+let report_failures! es = match es {
+    [] => (),
+    [e, ..rest] => {
+        native.write_err (native.concat3 "dream: uncaught error in a process: " (show e) "\n");
+        report_failures! rest
+    },
+};
+
+/// An error nothing caught ends the program, saying what it was.
+let uncaught! e = {
+    native.write_err (native.concat3 "dream: uncaught error: " (show e) "\n");
+    native.exit 1
+};
+
+// The compiler's own reasons to keep each root: it names them, and a program must
+// have an entry to compile at all.
+let main! () = 0;
