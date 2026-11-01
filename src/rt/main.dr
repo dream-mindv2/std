@@ -1,0 +1,552 @@
+// The runtime of a native program, below the language: memory, collection and how
+// a value is entered and applied. It is written in the dialect of
+// dreams/src/aot/dialect.dr, so a value here is one raw machine word, nothing is
+// lazy, and nothing allocates except by asking `alloc!`. dreams/docs/aot.md is the
+// design, and none of it is shared with the VM's.
+//
+// A word is a Dream value by its low bits: `..1` a fixnum, `..010` an immediate,
+// `..000` the address of an object. An object starts with the address of its
+// info, static data the compiler writes:
+//
+//     0  code   what entering the object runs
+//     8  kind   the numbers below
+//    16  size   words of payload, or 0 where the object says for itself
+//    24  arity  for a closure
+//    32  call   a closure's function: `code` is what entering it does, which for any
+//               value is only to answer itself, and applying one is another matter
+//
+// A frame on a process's stack starts with an info too, whose size is the whole
+// frame in words, or 0 when its second word holds that, tagged. Every other word
+// of a frame or a payload is a value, so the collector need know nothing about
+// what any of them is for. The exceptions are the kinds with raw payloads, and an
+// address in static data, which the collector leaves alone: a code address among
+// a frame's words is one of those.
+//
+// Machine functions all take `(p, sp, a, b, c, d)`, in registers, so that a
+// `musttail` never has to grow a stack-argument area.
+
+import rt.prim;
+
+// --- the context --------------------------------------------------------------
+
+let ctx_hp = 0;
+let ctx_limit = 8;
+let ctx_want_gc = 16;
+let ctx_retry = 24;
+let ctx_retry_stack = 32;
+let ctx_stack_top = 40;
+let ctx_chunks = 48;
+let ctx_to = 56;
+let ctx_total = 64;
+let ctx_size = 128;
+
+let kind_thunk = 0;
+let kind_ind = 1;
+let kind_hole = 2;
+let kind_closure = 3;
+let kind_pap = 4;
+let kind_cons = 5;
+let kind_float = 6;
+let kind_string = 7;
+let kind_array = 8;
+let kind_record = 9;
+
+let info_code = 0;
+let info_kind = 8;
+let info_size = 16;
+let info_arity = 24;
+let info_call = 32;
+
+let word = 8;
+/// Everything below this is the executable; the heap and stacks are `mmap`ed far
+/// above it. What is static is not the collector's.
+let static_limit = 4294967296;
+let chunk_header = 16;
+let min_chunk = 8388608;
+let stack_bytes = 1073741824;
+
+let tag_fix !n = n * 2 + 1;
+let untag_fix !v = v >> 1;
+
+let is_object !v = v & 7 == 0 && v != 0;
+
+let map_memory! !bytes = {
+    let at = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
+    if at == 0 - 1 { fatal! "dream: out of memory\n" } else { at }
+};
+
+let fatal! s = {
+    prim.c3! "write" 2 s (prim.str_len s);
+    prim.c1! "exit" 70
+};
+
+// --- allocation ----------------------------------------------------------------
+
+/// A chunk of at least `bytes`, made the place allocation continues. Nothing moves
+/// here, which is what lets a compiled function hold values in registers across an
+/// allocation: running out only asks for a collection at the next function entry.
+let new_chunk! !p !bytes = {
+    let want = bytes + chunk_header;
+    let size = if want < min_chunk { min_chunk } else { want };
+    let chunk = map_memory! size;
+    prim.store64! chunk (prim.load64! (p + ctx_chunks));
+    prim.store64! (chunk + word) size;
+    prim.store64! (p + ctx_chunks) chunk;
+    prim.store64! (p + ctx_total) (prim.load64! (p + ctx_total) + size);
+    prim.store64! (p + ctx_hp) (chunk + chunk_header);
+    prim.store64! (p + ctx_limit) (chunk + size);
+    chunk
+};
+
+/// The slow path of a compiled allocation, and every allocation made here.
+let more! !p !bytes = {
+    prim.store64! (p + ctx_want_gc) 1;
+    new_chunk! p bytes;
+    alloc! p bytes
+};
+
+let alloc! !p !bytes = {
+    let at = prim.load64! (p + ctx_hp);
+    let next = at + bytes;
+    if prim.ugt next (prim.load64! (p + ctx_limit)) { more! p bytes }
+    else {
+        prim.store64! (p + ctx_hp) next;
+        at
+    }
+};
+
+// --- the collector ----------------------------------------------------------------
+//
+// A semispace copy. To-space is one mapping as large as everything allocated, so
+// it cannot overflow and the scan is one walk. A word whose low bit is set in an
+// object's first position is a forwarding address, because an info is aligned.
+
+let object_words! !o !info = {
+    let kind = prim.load64! (info + info_kind);
+    if kind == kind_string {
+        2 + (prim.load64! (o + word) + word) / word
+    } else if kind == kind_array || kind == kind_pap {
+        2 + untag_fix (prim.load64! (o + word))
+    } else if kind == kind_record {
+        3 + untag_fix (prim.load64! (o + word))
+    } else if kind == kind_hole || kind == kind_ind {
+        2
+    } else {
+        1 + prim.load64! (info + info_size)
+    }
+};
+
+let copy_words! !from !to !n = if n == 0 { 0 } else {
+    prim.store64! to (prim.load64! from);
+    copy_words! (from + word) (to + word) (n - 1)
+};
+
+let evacuate! !p !v =
+    if not (is_object v) || prim.ult v static_limit { v }
+    else {
+        let info = prim.load64! v;
+        if info & 1 == 1 { info - 1 }
+        // Copying through an indirection is how the collector removes it. Nothing
+        // has to be written in it: whoever else reads it arrives at the same target,
+        // by then forwarded, or an immediate.
+        else if prim.load64! (info + info_kind) == kind_ind { evacuate! p (prim.load64! (v + word)) }
+        else {
+            let n = object_words! v info;
+            let to = prim.load64! (p + ctx_to);
+            copy_words! v to n;
+            prim.store64! (p + ctx_to) (to + n * word);
+            prim.store64! v (to + 1);
+            to
+        }
+    };
+
+let evacuate_at! !p !at = prim.store64! at (evacuate! p (prim.load64! at));
+
+let evacuate_range! !p !at !stop = if prim.uge at stop { 0 } else {
+    evacuate_at! p at;
+    evacuate_range! p (at + word) stop
+};
+
+let scan! !p !at =
+    if prim.uge at (prim.load64! (p + ctx_to)) { 0 }
+    else {
+        let info = prim.load64! at;
+        let kind = prim.load64! (info + info_kind);
+        let n = object_words! at info;
+        if kind != kind_float && kind != kind_string && kind != kind_hole {
+            evacuate_range! p (at + word) (at + n * word);
+        };
+        scan! p (at + n * word)
+    };
+
+let frame_words! !at !info = {
+    let size = prim.load64! (info + info_size);
+    if size == 0 { untag_fix (prim.load64! (at + word)) } else { size }
+};
+
+let scan_stack! !p !at !top = if prim.uge at top { 0 } else {
+    let n = frame_words! at (prim.load64! at);
+    evacuate_range! p (at + word) (at + n * word);
+    scan_stack! p (at + n * word) top
+};
+
+let scan_cafs! !p !table !i !n = if i >= n { 0 } else {
+    // A value computed once and kept in static data points into the heap.
+    let caf = prim.load64! (table + word * (i + 1));
+    if prim.load64! (prim.load64! caf + info_kind) == kind_ind {
+        evacuate_at! p (caf + word);
+    };
+    scan_cafs! p table (i + 1) n
+};
+
+let free_chunks! !c = if c == 0 { 0 } else {
+    let next = prim.load64! c;
+    prim.c2! "munmap" c (prim.load64! (c + word));
+    free_chunks! next
+};
+
+let collect! !p !sp = {
+    let old = prim.load64! (p + ctx_chunks);
+    let space = prim.load64! (p + ctx_total) + min_chunk;
+    let to = map_memory! space;
+    let start = to + chunk_header;
+    prim.store64! to 0;
+    prim.store64! (to + word) space;
+    prim.store64! (p + ctx_to) start;
+    scan_stack! p sp (prim.load64! (p + ctx_stack_top));
+    let cafs = prim.info "cafs";
+    scan_cafs! p cafs 0 (prim.load64! cafs);
+    scan! p start;
+    free_chunks! old;
+    let live = prim.load64! (p + ctx_to) - start;
+    prim.store64! (p + ctx_chunks) to;
+    prim.store64! (p + ctx_total) space;
+    prim.store64! (p + ctx_want_gc) 0;
+    new_chunk! p (live * 2);
+    0
+};
+
+// --- returning, entering, applying ---------------------------------------------
+
+/// Answer `v`, which is in weak head normal form, to the frame on top of the stack.
+let return! !p !sp !v = prim.jump! (prim.load64! (prim.load64! sp)) p sp v 0 0 0;
+
+/// Evaluate `v` and answer it to the frame on top of the stack.
+let enter! !p !sp !v =
+    if v & 7 != 0 { return! p sp v }
+    else { prim.jump! (prim.load64! (prim.load64! v)) p sp v 0 0 0 };
+
+/// A value's code: it is already what it evaluates to.
+let code_value! !p !sp !self !b !c !d = return! p sp self;
+
+let code_ind! !p !sp !self !b !c !d = enter! p sp (prim.load64! (self + word));
+
+let code_hole! !p !sp !self !b !c !d = raise_text! p sp "value depends on itself";
+
+let frame_update! !p !sp !v !b !c !d = {
+    let thunk = prim.load64! (sp + word);
+    prim.store64! (thunk + word) v;
+    prim.store64! thunk (prim.info "ind");
+    return! p (sp + 2 * word) v
+};
+
+/// The bottom of a process's stack: its answer is the status of the whole run.
+let frame_halt! !p !sp !v !b !c !d = 0;
+
+/// A collection asked for at a function's entry. The registers are saved as a frame
+/// with the code to go back to, so the collector sees them as it sees any frame.
+let collect_at_entry! !p !sp !a !b !c !d = {
+    let extra = prim.load64! (p + ctx_retry_stack);
+    let at = sp - 8 * word;
+    prim.store64! at (prim.info "retry");
+    prim.store64! (at + word) (tag_fix (8 + extra));
+    prim.store64! (at + 2 * word) (prim.load64! (p + ctx_retry));
+    prim.store64! (at + 3 * word) (tag_fix extra);
+    prim.store64! (at + 4 * word) a;
+    prim.store64! (at + 5 * word) b;
+    prim.store64! (at + 6 * word) c;
+    prim.store64! (at + 7 * word) d;
+    collect! p at;
+    prim.jump! (prim.load64! (at + 2 * word)) p (at + 8 * word)
+        (prim.load64! (at + 4 * word)) (prim.load64! (at + 5 * word))
+        (prim.load64! (at + 6 * word)) (prim.load64! (at + 7 * word))
+};
+
+/// Call the closure `f`, whose arguments are on the stack, first on top, with
+/// exactly as many as it takes: up to three go in registers, the rest stay.
+let call_exact! !p !sp !f !arity = {
+    let code = prim.load64! (prim.load64! f + info_call);
+    if arity == 0 { prim.jump! code p sp f 0 0 0 }
+    else if arity == 1 { prim.jump! code p (sp + word) f (prim.load64! sp) 0 0 }
+    else if arity == 2 { prim.jump! code p (sp + 2 * word) f (prim.load64! sp) (prim.load64! (sp + word)) 0 }
+    else {
+        prim.jump! code p (sp + 3 * word) f (prim.load64! sp) (prim.load64! (sp + word))
+            (prim.load64! (sp + 2 * word))
+    }
+};
+
+let move_words_down! !from !to !n = if n == 0 { 0 } else {
+    prim.store64! to (prim.load64! from);
+    move_words_down! (from + word) (to + word) (n - 1)
+};
+
+let move_words_up! !from !to !n = if n == 0 { 0 } else {
+    prim.store64! (to + (n - 1) * word) (prim.load64! (from + (n - 1) * word));
+    move_words_up! from to (n - 1)
+};
+
+/// Apply `f`, in weak head normal form, to the `n` arguments on the stack.
+let apply! !p !sp !f !n !c !d = {
+    if not (is_object f) { raise_text! p sp "applied something that is not a function" }
+    else {
+        let info = prim.load64! f;
+        let kind = prim.load64! (info + info_kind);
+        if kind == kind_pap {
+            let held = untag_fix (prim.load64! (f + word)) - 1;
+            let below = sp - held * word;
+            copy_words! (f + 3 * word) below held;
+            apply! p below (prim.load64! (f + 2 * word)) (n + held) 0 0
+        }
+        else if kind != kind_closure {
+            raise_text! p sp "applied something that is not a function"
+        }
+        else {
+            let arity = prim.load64! (info + info_arity);
+            if n == arity { call_exact! p sp f arity }
+            else if prim.ult n arity {
+                // Too few: the closure and these arguments, kept for the rest.
+                let o = alloc! p ((3 + n) * word);
+                prim.store64! o (prim.info "pap");
+                prim.store64! (o + word) (tag_fix (n + 1));
+                prim.store64! (o + 2 * word) f;
+                copy_words! sp (o + 3 * word) n;
+                return! p (sp + n * word) o
+            }
+            else {
+                // Too many: what is left applies to what comes back, so a frame goes
+                // in between the two runs of arguments.
+                let extra = n - arity;
+                let below = sp - 2 * word;
+                move_words_down! sp below arity;
+                let frame = below + arity * word;
+                prim.store64! frame (prim.info "apply_rest");
+                prim.store64! (frame + word) (tag_fix (extra + 2));
+                call_exact! p below f arity
+            }
+        }
+    }
+};
+
+let frame_apply_rest! !p !sp !v !b !c !d = {
+    let n = untag_fix (prim.load64! (sp + word)) - 2;
+    apply! p (sp + 2 * word) v n 0 0
+};
+
+// --- errors --------------------------------------------------------------------
+
+let raise_text! !p !sp s = {
+    prim.c3! "write" 2 "dream: uncaught error: " (prim.str_len "dream: uncaught error: ");
+    prim.c3! "write" 2 s (prim.str_len s);
+    prim.c3! "write" 2 "\n" 1;
+    prim.c1! "exit" 1
+};
+
+let native_failed! !p !sp !a !b !c !d = raise_text! p sp "an operation on values it cannot take";
+
+let not_bool! !p !sp !a !b !c !d = raise_text! p sp "a condition that is not a boolean";
+
+/// An error raised by the program. Nothing catches one yet, and printing a value
+/// takes the library, so a string is shown and anything else is only reported.
+let raise! !p !sp !e !b !c !d = {
+    if is_object e && prim.load64! (prim.load64! e + info_kind) == kind_string {
+        raise_text! p sp (e + 2 * word)
+    } else {
+        raise_text! p sp "a value that is not a string"
+    }
+};
+
+// --- starting ------------------------------------------------------------------
+
+/// A process's context and its empty stack, whose top holds the frame that ends it.
+let init! () = {
+    let p = prim.c2! "calloc" 1 ctx_size;
+    new_chunk! p min_chunk;
+    let stack = map_memory! stack_bytes;
+    let top = stack + stack_bytes;
+    prim.store64! (p + ctx_stack_top) top;
+    prim.store64! (top - word) (prim.info "halt");
+    p
+};
+
+// --- what library code and the builtins call --------------------------------------
+//
+// A native takes the context first and its arguments forced. It may allocate but
+// never collects, and it answers a value, or 0 to raise what it left in the context.
+
+let new_string! !p !bytes = {
+    let o = alloc! p ((2 + (bytes + word) / word) * word);
+    prim.store64! o (prim.info "string");
+    prim.store64! (o + word) bytes;
+    prim.store8! (o + 2 * word + bytes) 0;
+    o
+};
+
+/// An error, as the record `_error_new` makes: a kind, and what it carries.
+let error_new! !p !kind !payload = {
+    let o = alloc! p (5 * word);
+    prim.store64! o (prim.info "record");
+    prim.store64! (o + word) (tag_fix 2);
+    prim.store64! (o + 2 * word) (atom_word 12);
+    prim.store64! (o + 3 * word) kind;
+    prim.store64! (o + 4 * word) payload;
+    o
+};
+
+let string_bytes !s = s + 2 * word;
+let string_len! !s = prim.load64! (s + word);
+
+let digit_count !n = if n < 10 { 1 } else { 1 + digit_count (n / 10) };
+
+let write_digits! !at !n = {
+    prim.store8! at (48 + n % 10);
+    if n < 10 { 0 } else { write_digits! (at - 1) (n / 10) }
+};
+
+let int_to_string! !p !v = {
+    let n = untag_fix v;
+    let negative = n < 0;
+    let size = 0 - n;
+    let magnitude = if negative { size } else { n };
+    let digits = digit_count magnitude;
+    let total = if negative { digits + 1 } else { digits };
+    let s = new_string! p total;
+    let bytes = string_bytes s;
+    if negative { prim.store8! bytes 45; };
+    write_digits! (bytes + total - 1) magnitude;
+    s
+};
+
+let concat2! !p !a !b = {
+    let n = string_len! a;
+    let m = string_len! b;
+    let s = new_string! p (n + m);
+    prim.c3! "memcpy" (string_bytes s) (string_bytes a) n;
+    prim.c3! "memcpy" (string_bytes s + n) (string_bytes b) m;
+    s
+};
+
+/// A character as UTF-8, the only thing a string holds.
+let char_text! !p !v = {
+    let c = v >> 8;
+    if c < 128 {
+        let s = new_string! p 1;
+        prim.store8! (string_bytes s) c;
+        s
+    } else if c < 2048 {
+        let s = new_string! p 2;
+        prim.store8! (string_bytes s) (192 + (c >> 6));
+        prim.store8! (string_bytes s + 1) (128 + (c & 63));
+        s
+    } else if c < 65536 {
+        let s = new_string! p 3;
+        prim.store8! (string_bytes s) (224 + (c >> 12));
+        prim.store8! (string_bytes s + 1) (128 + ((c >> 6) & 63));
+        prim.store8! (string_bytes s + 2) (128 + (c & 63));
+        s
+    } else {
+        let s = new_string! p 4;
+        prim.store8! (string_bytes s) (240 + (c >> 18));
+        prim.store8! (string_bytes s + 1) (128 + ((c >> 12) & 63));
+        prim.store8! (string_bytes s + 2) (128 + ((c >> 6) & 63));
+        prim.store8! (string_bytes s + 3) (128 + (c & 63));
+        s
+    }
+};
+
+let concat3! !p !a !b !c = concat2! p (concat2! p a b) c;
+
+let string_eq! !a !b = string_len! a == string_len! b
+    && prim.sext32 (prim.c3! "memcmp" (string_bytes a) (string_bytes b) (string_len! a)) == 0;
+
+/// `std.io`'s `write!`: how many bytes went, as `io.write!` answers it.
+let io_write! !p !h !s = {
+    let n = prim.c3! "write" (untag_fix h) (string_bytes s) (string_len! s);
+    tag_fix n
+};
+
+let io_stdout! !p !unit = tag_fix 1;
+let io_stderr! !p !unit = tag_fix 2;
+
+let is_string! !v = is_object v && prim.load64! (prim.load64! v + info_kind) == kind_string;
+
+// The atoms the compiler numbers first, always in this order (`machine.first_atoms`),
+// so that this can say them without a table.
+let atom_word !i = i * 256 + 26;
+
+let kind_of! !v = prim.load64! (prim.load64! v + info_kind);
+
+/// `type_of`, for what exists so far.
+let type_of! !p !v =
+    if v & 1 == 1 { atom_word 0 }
+    else if v & 7 == 0 {
+        let kind = kind_of! v;
+        if kind == kind_float { atom_word 1 }
+        else if kind == kind_string { atom_word 5 }
+        else if kind == kind_cons { atom_word 7 }
+        else if kind == kind_array { atom_word 8 }
+        else if kind == kind_closure || kind == kind_pap { atom_word 10 }
+        else { atom_word 11 }
+    } else {
+        let imm = (v >> 3) & 31;
+        if imm == 0 { atom_word 4 }
+        else if imm == 1 { atom_word 3 }
+        else if imm == 2 { atom_word 2 }
+        else if imm == 3 { atom_word 6 }
+        else { atom_word 7 }
+    };
+
+let atom_name! !p !v = prim.load64! (prim.info "atoms" + word * (v >> 8));
+
+let size! !p !v = if is_string! v { tag_fix (string_len! v) }
+    else if is_object v && kind_of! v == kind_array { prim.load64! (v + word) }
+    else { 0 };
+
+let str_byte! !p !s !i = tag_fix (prim.load8! (string_bytes s + untag_fix i));
+
+let str_slice! !p !s !from !n = {
+    let start = untag_fix from;
+    let count = untag_fix n;
+    let out = new_string! p count;
+    prim.c3! "memcpy" (string_bytes out) (string_bytes s + start) count;
+    out
+};
+
+let str_le! !p !v !width = {
+    let n = untag_fix width;
+    let out = new_string! p n;
+    let rec_ = write_le! (string_bytes out) (untag_fix v) n;
+    out
+};
+
+let write_le! !at !v !n = if n == 0 { 0 } else {
+    prim.store8! at v;
+    write_le! (at + 1) (v >> 8) (n - 1)
+};
+
+/// `+` on what is not two fixnums, `-` and the rest being refused until floats and
+/// bignums are here.
+let add_slow! !p !a !b =
+    if is_string! a && is_string! b { concat2! p a b } else { 0 };
+
+let arith_slow! !p !a !b = 0;
+
+/// `==` and `!=` on what is not two words to compare: a 0 or a 1.
+let eq_slow! !p !a !b =
+    if is_string! a && is_string! b { string_eq! a b } else { a == b };
+
+/// Ordering, on strings: below zero, zero or above, as `memcmp` says.
+let order_slow! !p !a !b = 0;
+
+// A dialect image's roots are named by the compiler (`machine.runtime_roots`), and
+// a program needs an entry to be one at all, though nothing calls this.
+let main! () = 0;

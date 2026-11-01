@@ -1,0 +1,68 @@
+// The part of a native program's runtime that is ordinary Dream: the builtins that
+// have to force what they are given, which a function in the dialect cannot do. It
+// is compiled exactly as a program is, so laziness, the collector and deep recursion
+// are simply what they are everywhere else, and no builtin needs a protocol for
+// being suspended partway through.
+//
+// `rt.native` names functions of rt/main.dr, which take forced arguments.
+
+import rt.native;
+
+let quoted v = match type_of v {
+    :string => native.concat3 "\"" v "\"",
+    :char => native.concat3 "'" (show v) "'",
+    _ => show v,
+};
+
+let show_items xs = match xs {
+    [] => "",
+    [x] => quoted x,
+    [x, ..rest] => native.concat3 (quoted x) ", " (show_items rest),
+};
+
+let show v = match type_of v {
+    :string => v,
+    :integer => native.int_to_string v,
+    :atom => native.concat2 ":" (native.atom_name v),
+    :char => native.char_text v,
+    :bool => if v { "true" } else { "false" },
+    :unit => "()",
+    :list => native.concat3 "[" (show_items v) "]",
+    _ => "<a value>",
+};
+
+let length_from xs !n = match xs {
+    [] => n,
+    [_, ..rest] => length_from rest (n + 1),
+};
+
+let length v = match type_of v {
+    :list => length_from v 0,
+    _ => native.size v,
+};
+
+/// All the way down. Only lists hold anything lazy yet.
+let deep! v = match type_of v {
+    :list => {
+        let rec go! xs = match xs {
+            [] => (),
+            [x, ..rest] => { deep! x; go! rest },
+        };
+        go! v;
+        v
+    },
+    _ => v,
+};
+
+let concat_list xs = match xs {
+    [] => "",
+    [x, ..rest] => native.concat2 x (concat_list rest),
+};
+
+let main! () = {
+    show ();
+    length [];
+    deep! ();
+    concat_list [];
+    0
+};
