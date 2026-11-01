@@ -8,11 +8,13 @@
 // may use a builtin of the kind it defines: this is what they are.
 
 import rt.native;
+import std.json;
+import std.wire;
 
 // --- rendering --------------------------------------------------------------------
 
 let quoted v = match type_of v {
-    :string => native.concat3 "\"" v "\"",
+    :string => native.concat3 "\"" (native.escape_string v) "\"",
     :char => native.concat3 "'" (show v) "'",
     _ => show v,
 };
@@ -53,6 +55,7 @@ let show v = {
         :pure_fn => show_function v,
         :impure_fn => show_function v,
         :process => native.process_text v,
+        :trunk => native.concat3 "trunk[" (join_items (native.trunk_to_list v)) "]",
         _ => show_record v,
     }
 };
@@ -98,6 +101,7 @@ let settle v = match type_of v {
     :error => settle (native.error_payload v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
     :bool => true, :unit => true, :pure_fn => true, :impure_fn => true, :process => true,
+    :trunk => settle_list (native.trunk_to_list v),
     _ => settle_list (native.array_to_list (native.record_fields v)),
 };
 
@@ -163,6 +167,7 @@ let lists_equal xs ys = match [xs, ys] {
 let equal a b = match [type_of a, type_of b] {
     [:list, :list] => lists_equal a b,
     [:array, :array] => lists_equal (native.array_to_list a) (native.array_to_list b),
+    [:trunk, :trunk] => lists_equal (native.trunk_to_list a) (native.trunk_to_list b),
     [:map, :map] => native.size a == native.size b && map_within (native.map_pairs a) b,
     [:error, :error] => native.error_kind a == native.error_kind b && native.error_payload a == native.error_payload b,
     [:integer, :integer] => false,
@@ -282,7 +287,12 @@ let type_assert ok why v = if ok { v } else { lib_raise (native.error_new :type_
 
 let match_fail v path line col = lib_raise (native.error_new :match_error [v, path, line, col]);
 
-let error_trace! e = [];
+let error_trace! e = native.error_where e;
+
+let wire_encode v = wire.encode_value v;
+let wire_pack v = wire.encode_value v;
+let wire_decode text = wire.decode_by_hand text;
+let json_encode v = json.encode_value v;
 
 let raise_any! v = native.raise_or_wrap v;
 
@@ -313,9 +323,376 @@ let report_failures! es = match es {
     },
 };
 
+// --- files and directories, in terms of what the runtime has ---------------------------
+
+let merge_strings xs ys = match [xs, ys] {
+    [[], _] => ys,
+    [_, []] => xs,
+    [[x, ..xr], [y, ..yr]] => if y < x { y :: merge_strings xs yr } else { x :: merge_strings xr ys },
+};
+
+let sort_strings xs !n =
+    if n < 2 { xs }
+    else {
+        let half = n / 2;
+        let [left, right] = split_at xs half [];
+        merge_strings (sort_strings left half) (sort_strings right (n - half))
+    };
+
+let list_dir! path = {
+    let names = native.dir_list path;
+    deep! (sort_strings names (length_from names 0))
+};
+
+let path_join a b = native.concat3 a "/" b;
+
+let remove_all! path = match native.io_lstat path {
+    () => 0,
+    [_, _, kind] => if kind == :dir {
+        let rec go! names !count = match names {
+            [] => count,
+            [n, ..rest] => go! rest (count + remove_all! (path_join path n)),
+        };
+        let inside = go! (list_dir! path) 0;
+        native.io_remove path;
+        inside + 1
+    } else {
+        native.io_remove path;
+        1
+    },
+};
+
+let mkdir_all! path = {
+    let parent = parent_of path;
+    if native.io_is_dir path { () }
+    else {
+        if parent != "" && not (native.io_is_dir parent) { mkdir_all! parent };
+        native.io_mkdir path
+    }
+};
+
+let parent_of path = {
+    let i = native.str_rfind path "/" (native.size path);
+    if i <= 0 { "" } else { native.str_slice_any path 0 i }
+};
+
+/// Every regular file under a directory, sorted, each as a path from that directory.
+let walk! root = {
+    let rec under! dir prefix acc = {
+        let rec go! names acc1 = match names {
+            [] => acc1,
+            [n, ..rest] => {
+                let full = path_join dir n;
+                let shown = if prefix == "" { n } else { path_join prefix n };
+                // A link to a file is a file, and a link to a directory is not walked,
+                // since that is how a walk goes round for ever.
+                match [native.io_lstat full, native.io_stat full] {
+                    [[_, _, :dir], _] => go! rest (under! full shown acc1),
+                    [_, [_, _, :file]] => go! rest (shown :: acc1),
+                    _ => go! rest acc1,
+                }
+            },
+        };
+        go! (list_dir! dir) acc
+    };
+    let found = under! root "" [];
+    deep! (sort_strings found (length_from found 0))
+};
+
+// --- running a program ---------------------------------------------------------------------
+
+let read_all! h acc = {
+    let chunk = native.io_read_m h 65536;
+    if native.size chunk == 0 { concat_list (rev_onto acc []) }
+    else { read_all! h (chunk :: acc) }
+};
+
+/// Wait for a child, killing it past `deadline` (0 for none); `[code, timed_out]`.
+let wait_child! pid deadline !delay !killed = match native.child_status pid {
+    () => {
+        let late = deadline > 0 && native.now_ns_value () > deadline;
+        if late && not killed { native.child_kill pid };
+        native.sleep_until_m (native.now_ns_value () + delay);
+        wait_child! pid deadline (if delay < 20000000 { delay * 2 } else { delay }) (killed || late)
+    },
+    code => [code, killed],
+};
+
+let exec_full! dir env program args ms joined = {
+    let [pid, out, err] = native.spawn_child dir (forced_array env) program (forced_array args) joined;
+    let deadline = if ms > 0 { native.now_ns_value () + ms * 1000000 } else { 0 };
+    // Waiting is a process of its own, so that a child past its time is killed even
+    // while reading its output is what has not finished.
+    let waiter = spawn! $( wait_child! pid deadline 100000 false );
+    let err_reader = spawn! $( read_all! err [] );
+    let got = read_all! out [];
+    let got_err = join! err_reader;
+    native.io_close out;
+    native.io_close err;
+    let [code, timed_out] = join! waiter;
+    %{:code => code, :out => got, :err => got_err, :timed_out => timed_out}
+};
+
+let exec! program args = exec_full! () [] program args 0 false;
+let exec_for! program args ms = exec_full! () [] program args ms false;
+let exec_in! dir program args ms = exec_full! dir [] program args ms false;
+let valid_env env = match env {
+    [] => true,
+    [kv, ..rest] => {
+        let at = native.str_find_any kv "=" 0;
+        if at <= 0 { lib_raise (native.error_new :bad_argument (native.concat3 "exec_with!: `" kv "` is not NAME=value")) }
+        else { valid_env rest }
+    },
+};
+
+let exec_with! dir env program args ms = if valid_env env { exec_full! dir env program args ms false } else { () };
+let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env program args ms true } else { () };
+
+/// `vm.share!`: a value made safe to hand to any process. With one heap, being forced
+/// all the way down is all that takes.
+let share! v = { share_check v; v };
+
+/// What a process could not read if it were in another heap is refused here as it would
+/// be there, so that a program is told the same on either.
+let share_check v = match type_of v {
+    :pure_fn => lib_raise (native.error_new :type_error "vm.share! cannot share a function"),
+    :impure_fn => lib_raise (native.error_new :type_error "vm.share! cannot share a function"),
+    :list => share_list v,
+    :array => share_list (native.array_to_list v),
+    :map => share_list (native.map_pairs v),
+    :integer => true, :float => true, :string => true, :atom => true, :char => true,
+    :bool => true, :unit => true, :process => true, :error => true,
+    :trunk => share_list (native.trunk_to_list v),
+    _ => share_list (native.array_to_list (native.record_fields v)),
+};
+
+let share_list xs = match xs {
+    [] => true,
+    [x, ..rest] => { let done = share_check x; done && share_list rest },
+};
+
+// --- trunks: what looks at elements ---------------------------------------------------------
+
+let trunk_of xs = trunk_fill xs (native.trunk_empty ());
+let trunk_fill xs t = match xs {
+    [] => t,
+    [x, ..rest] => trunk_fill rest (native.trunk_push x t),
+};
+
+let trunk_concat a b = trunk_fill (native.trunk_to_list b) a;
+
+let trunk_index_from xs x !i = match xs {
+    [] => -1,
+    [y, ..rest] => if y == x { i } else { trunk_index_from rest x (i + 1) },
+};
+
+let trunk_index_of x t = trunk_index_from (native.trunk_to_list t) x 0;
+let trunk_contains x t = trunk_index_of x t >= 0;
+
+let trunk_count_from xs x !n = match xs {
+    [] => n,
+    [y, ..rest] => trunk_count_from rest x (if y == x { n + 1 } else { n }),
+};
+let trunk_count x t = trunk_count_from (native.trunk_to_list t) x 0;
+
+/// An association trunk's `[key, value]` pairs: the position of the first with this key.
+let trunk_lookup_from xs key !i = match xs {
+    [] => -1,
+    [p, ..rest] => if p.[0] == key { i } else { trunk_lookup_from rest key (i + 1) },
+};
+let trunk_lookup key t = trunk_lookup_from (native.trunk_to_list t) key 0;
+
+let trunk_put key v t = {
+    let at = trunk_lookup key t;
+    if at >= 0 { native.trunk_set at [key, v] t } else { native.trunk_push [key, v] t }
+};
+
+// --- ed25519 ---------------------------------------------------------------------------------
+//
+// RFC 8032, in the plainest arithmetic: integers and the extended twisted Edwards formulas.
+// Dream's integers are exact, so nothing here is more than the RFC's own reference code.
+
+let ed_p = native.pow 2 255 - 19;
+let ed_l = native.pow 2 252 + 27742317777372353535851937790883648493;
+let ed_d = mod_p (-121665 * mod_inverse 121666);
+let ed_i = pow_mod 2 ((ed_p - 1) / 4) ed_p;
+
+let mod_p !x = {
+    let r = x % ed_p;
+    if r < 0 { r + ed_p } else { r }
+};
+
+let pow_mod !b !e !m =
+    if e == 0 { 1 }
+    else {
+        let half = pow_mod (b * b % m) (e / 2) m;
+        if e % 2 == 1 { half * b % m } else { half }
+    };
+
+let mod_inverse x = pow_mod (mod_p x) (ed_p - 2) ed_p;
+
+let ed_recover y sign = {
+    let xx = mod_p ((y * y - 1) * mod_inverse (ed_d * y * y + 1));
+    if xx == 0 && sign != 0 { () }
+    else {
+        let root = pow_mod xx ((ed_p + 3) / 8) ed_p;
+        let fixed = if mod_p (root * root - xx) != 0 { mod_p (root * ed_i) } else { root };
+        if mod_p (fixed * fixed - xx) != 0 { () }
+        else if fixed % 2 != sign { ed_p - fixed }
+        else { fixed }
+    }
+};
+
+let ed_base = {
+    let y = mod_p (4 * mod_inverse 5);
+    let x = ed_recover y 0;
+    [x, y, 1, mod_p (x * y)]
+};
+
+let ed_add a b = {
+    let [x1, y1, z1, t1] = a;
+    let [x2, y2, z2, t2] = b;
+    let aa = mod_p ((y1 - x1) * (y2 - x2));
+    let bb = mod_p ((y1 + x1) * (y2 + x2));
+    let cc = mod_p (2 * t1 * t2 * ed_d);
+    let dd = mod_p (2 * z1 * z2);
+    let e = bb - aa;
+    let f = dd - cc;
+    let g = dd + cc;
+    let h = bb + aa;
+    forced_point [mod_p (e * f), mod_p (g * h), mod_p (f * g), mod_p (e * h)]
+};
+
+/// Each coordinate computed now, so that a long multiplication is not a long chain.
+let forced_point q = {
+    let [a, b, c, d] = q;
+    if a + b + c + d >= 0 { q } else { q }
+};
+
+let ed_mul !s q = {
+    let rec go !k base acc = if k == 0 { acc } else {
+        let next = if k % 2 == 1 { ed_add acc base } else { acc };
+        go (k / 2) (ed_add base base) next
+    };
+    go s q [0, 1, 1, 0]
+};
+
+let ed_encode q = {
+    let [x, y, z, _] = q;
+    let zi = mod_inverse z;
+    let xx = mod_p (x * zi);
+    let yy = mod_p (y * zi);
+    le_bytes (yy + (if xx % 2 == 1 { native.pow 2 255 } else { 0 })) 32
+};
+
+let le_bytes !v !n = if n == 0 { "" } else {
+    native.concat2 (native.string_of_bytes (forced_array [v % 256])) (le_bytes (v / 256) (n - 1))
+};
+
+let ed_decode s = {
+    let raw = native.le_int s;
+    let sign = (raw / native.pow 2 255) % 2;
+    let y = raw % native.pow 2 255;
+    if y >= ed_p { () }
+    else {
+        match ed_recover y sign {
+            () => (),
+            x => [x, y, 1, mod_p (x * y)],
+        }
+    }
+};
+
+let ed_secret seed = {
+    let h = native.crypto_sha512 seed;
+    let low = native.le_int (native.str_slice_any h 0 32);
+    let clamped = (low - low % 8) % native.pow 2 254 + native.pow 2 254;
+    [clamped, native.str_slice_any h 32 32]
+};
+
+let need_seed seed what = if type_of seed != :string || native.size seed != 32 {
+    lib_raise (native.error_new :type_error what)
+} else { true };
+
+let ed25519_public seed = if need_seed seed "ed25519_public needs a 32-byte seed" {
+    let [a, _] = ed_secret seed;
+    ed_encode (ed_mul a ed_base)
+} else { "" };
+
+let ed25519_sign seed message = if need_seed seed "ed25519_sign needs a 32-byte seed" {
+    let [a, prefix] = ed_secret seed;
+    let public = ed_encode (ed_mul a ed_base);
+    let r = native.le_int (native.crypto_sha512 (native.concat2 prefix message)) % ed_l;
+    let big_r = ed_encode (ed_mul r ed_base);
+    let h = native.le_int (native.crypto_sha512 (native.concat3 big_r public message)) % ed_l;
+    native.concat2 big_r (le_bytes ((r + h * a) % ed_l) 32)
+} else { "" };
+
+let ed25519_verify key message signature =
+    if type_of key != :string || type_of message != :string || type_of signature != :string {
+        lib_raise (native.error_new :type_error "ed25519_verify needs a key, a message and a signature, all strings")
+    }
+    else if native.size key != 32 || native.size signature != 64 { false }
+    else {
+        let big_r = native.str_slice_any signature 0 32;
+        let s = native.le_int (native.str_slice_any signature 32 32);
+        match [ed_decode key, ed_decode big_r] {
+            [(), _] => false,
+            [_, ()] => false,
+            [a, r] => s < ed_l && {
+                let h = native.le_int (native.crypto_sha512 (native.concat3 big_r key message)) % ed_l;
+                ed_encode (ed_mul s ed_base) == ed_encode (ed_add r (ed_mul h a))
+            },
+        }
+    };
+
+/// What a person reads of an uncaught error. A function and the value it made, side by
+/// side, are one place, and a run of the standard library is one line.
+let error_text e = match type_of e {
+    :error => concat_list [describe_error e, trace_lines (kept_places (native.error_where e) ()) true],
+    _ => show e,
+};
+
+let describe_error e = match [native.error_kind e, native.error_payload e] {
+    [:match_error, [value, path, line, col]] =>
+        concat_list [path, ":", show line, ":", show col, ": no pattern fits ", show value],
+    _ => show e,
+};
+
+let kept_places places last = match places {
+    [] => [],
+    [at, ..rest] => {
+        let this = [at.[1], at.[2], at.[3]];
+        if last == this { kept_places rest last } else { at :: kept_places rest this }
+    },
+};
+
+let in_std at = native.str_find_any at.[2] "std/" 0 == 0;
+
+let std_run places = match places {
+    [at, ..rest] => if in_std at { 1 + std_run rest } else { 0 },
+    [] => 0,
+};
+
+let drop_some xs !n = if n == 0 { xs } else { match xs { [_, ..rest] => drop_some rest (n - 1), [] => [] } };
+
+let trace_lines places first = match places {
+    [] => "",
+    [at, ..rest] => {
+        let run = if first { 0 } else { std_run places };
+        if run >= 3 {
+            concat_list ["\n    ... ", show run, " more in std", trace_lines (drop_some places run) false]
+        } else {
+            let [how, name, path, line, col] = at;
+            concat_list [if how == :made { "\n    forcing a value made in `" } else { "\n    in `" }, name, "`",
+                         if line == 0 { "" } else { concat_list [" (", path, ":", show line, ":", show col, ")"] },
+                         trace_lines rest false]
+        }
+    },
+};
+
 /// An error nothing caught ends the program, saying what it was.
 let uncaught! e = {
-    native.write_err (native.concat3 "dream: uncaught error: " (show e) "\n");
+    native.write_err (native.concat3 "dream: uncaught error: " (error_text e) "\n");
     native.exit 1
 };
 

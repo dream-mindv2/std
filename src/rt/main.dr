@@ -56,6 +56,12 @@ let ctx_run_tail = 160;
 let ctx_live = 168;
 let ctx_unique = 176;
 let ctx_ticking = 184;
+let ctx_handles = 192;
+let ctx_handle_cap = 200;
+let ctx_handle_count = 208;
+let ctx_argc = 216;
+let ctx_argv = 224;
+let ctx_k512 = 232;
 let ctx_size = 256;
 
 let kind_thunk = 0;
@@ -73,6 +79,7 @@ let kind_leaf = 11;
 let kind_big = 12;
 let kind_error = 13;
 let kind_process = 14;
+let kind_trunk = 15;
 
 // What a frame is, in its info's kind: nothing the unwinder need notice, or one of these.
 let frame_catch = 20;
@@ -87,6 +94,7 @@ let info_arity = 24;
 let info_call = 32;
 let info_name = 40;
 let info_impure = 48;
+let info_place = 56;
 
 let word = 8;
 /// Everything below this is the executable; the heap and stacks are `mmap`ed far
@@ -138,7 +146,10 @@ let more! !p !bytes = {
     alloc! p bytes
 };
 
-let alloc! !p !bytes = {
+/// Every allocation is whole words, whatever was asked for, because the low bits of an
+/// object's address are what say it is one.
+let alloc! !p !asked = {
+    let bytes = (asked + 7) & (0 - 8);
     let at = prim.load64! (p + ctx_hp);
     let next = at + bytes;
     if prim.ugt next (prim.load64! (p + ctx_limit)) { more! p bytes }
@@ -441,6 +452,7 @@ let init! () = {
     prim.store64! (p + ctx_table_cap) table_grow;
     prim.store64! (p + ctx_table) (prim.c2! "calloc" table_grow word);
     prim.store64! (p + ctx_next_id) 1;
+    init_handles! p;
     make_current! p (new_pcb! p);
     p
 };
@@ -460,10 +472,11 @@ let new_string! !p !bytes = {
 
 /// An error: a kind, and what it carries.
 let error_new! !p !kind !payload = {
-    let o = alloc! p (3 * word);
+    let o = alloc! p (4 * word);
     prim.store64! o (prim.info "error");
     prim.store64! (o + word) kind;
     prim.store64! (o + 2 * word) payload;
+    prim.store64! (o + 3 * word) unit_word;
     o
 };
 
@@ -533,16 +546,10 @@ let concat3! !p !a !b !c = concat2! p (concat2! p a b) c;
 let string_eq! !a !b = string_len! a == string_len! b
     && prim.sext32 (prim.c3! "memcmp" (string_bytes a) (string_bytes b) (string_len! a)) == 0;
 
-/// `std.io`'s `write!`: how many bytes went, as `io.write!` answers it.
-let io_write! !p !h !s = {
-    let n = prim.c3! "write" (untag_fix h) (string_bytes s) (string_len! s);
-    tag_fix n
-};
+let is_string! !v = is_object v && prim.load64! (prim.load64! v + info_kind) == kind_string;
 
 let io_stdout! !p !unit = tag_fix 1;
 let io_stderr! !p !unit = tag_fix 2;
-
-let is_string! !v = is_object v && prim.load64! (prim.load64! v + info_kind) == kind_string;
 
 // The atoms the compiler numbers first, always in this order (`machine.first_atoms`),
 // so that this can say them without a table.
@@ -564,6 +571,7 @@ let type_of! !p !v =
         else if kind == kind_map { atom_word 9 }
         else if kind == kind_error { atom_word 12 }
         else if kind == kind_process { atom_process }
+        else if kind == kind_trunk { prim.atom "trunk" }
         else if kind == kind_record {
             atom_word (prim.load64! (prim.info "atom_types" + word * (prim.load64! (v + 2 * word) >> 8)))
         }
@@ -584,6 +592,7 @@ let atom_name! !p !v = prim.load64! (prim.info "atoms" + word * (v >> 8));
 let size! !p !v = if is_string! v { tag_fix (string_len! v) }
     else if is_kind! v kind_array { prim.load64! (v + word) }
     else if is_kind! v kind_map { prim.load64! (v + 2 * word) }
+    else if is_trunk! v { prim.load64! (v + 2 * word) }
     else { type_fail! p "len needs a string, a list, an array or a map" };
 
 let str_le! !p !v !width = {
@@ -707,7 +716,51 @@ let code_raised! !p !sp !self !b !c !d = unwind! p sp (prim.load64! (self + word
 let frame_catch_return! !p !sp !v !b !c !d =
     return! p (sp + frame_words! sp (prim.load64! sp) * word) v;
 
-let native_failed! !p !sp !a !b !c !d = unwind! p sp (prim.load64! (p + ctx_error)) 0 0 0;
+let native_failed! !p !sp !a !b !c !d = {
+    let e = prim.load64! (p + ctx_error);
+    if is_object e && kind_of! e == kind_error { locate! p e sp 0; };
+    unwind! p sp e 0 0 0
+};
+
+// Where an error was raised, written on it once: a `catch` that raises it again keeps
+// where it started. A place is the compiler's static `[name, path, line, col, made]`,
+// found by a frame's info, and at most so many are kept, because what is read is the
+// top of it and a stack may be a million frames deep.
+
+let trace_limit = 12;
+let trace_scan = 512;
+
+let place_entry! !p !place = {
+    let tail_ = new_cons! p (tag_fix (prim.load64! (place + 2 * word)))
+        (new_cons! p (tag_fix (prim.load64! (place + 3 * word))) nil_word);
+    new_cons! p (if prim.load64! (place + 4 * word) != 0 { prim.atom "made" } else { prim.atom "in" })
+        (new_cons! p (prim.load64! place) (new_cons! p (prim.load64! (place + word)) tail_))
+};
+
+let places_from! !p !at !left !room !last = {
+    let info = prim.load64! at;
+    let kind = prim.load64! (info + info_kind);
+    if kind == frame_halt || left == 0 || room == 0 { nil_word }
+    else {
+        let place = prim.load64! (info + info_place);
+        let next = at + frame_words! at info * word;
+        if place != 0 && place != last {
+            let entry = place_entry! p place;
+            new_cons! p entry (places_from! p next (left - 1) (room - 1) place)
+        } else { places_from! p next (left - 1) room last }
+    }
+};
+
+let locate! !p !e !sp !site = if prim.load64! (e + 3 * word) == unit_word {
+    let below = places_from! p sp trace_scan (if site != 0 { trace_limit - 1 } else { trace_limit }) site;
+    prim.store64! (e + 3 * word) (if site != 0 { new_cons! p (place_entry! p site) below } else { below });
+    0
+} else { 0 };
+
+let error_where! !p !e = {
+    let w = prim.load64! (e + 3 * word);
+    if w == unit_word { nil_word } else { w }
+};
 
 let not_bool! !p !sp !a !b !c !d = {
     fail_value! p atom_type_error (concat2! p (text_of! p "`if` needs a bool, got ") (describe! p a));
@@ -715,15 +768,20 @@ let not_bool! !p !sp !a !b !c !d = {
 };
 
 /// `raise!`: an error goes up as it is, anything else inside one.
-let raise! !p !sp !self !v !c !d =
+let raise! !p !sp !site !v !c !d =
     if is_object v && kind_of! v == kind_error {
+        locate! p v sp site;
         // The kill itself going on up after a cleanup: nothing may catch it from here.
         if prim.load64! (v + word) == atom_killed && prim.load64! (current! p + pcb_kill) != 0 {
             prim.store64! (current! p + pcb_killing) 1;
         };
         unwind! p sp v 0 0 0
     }
-    else { unwind! p sp (error_new! p atom_error v) 0 0 0 };
+    else {
+        let e = error_new! p atom_error v;
+        locate! p e sp site;
+        unwind! p sp e 0 0 0
+    };
 
 /// A thunk the runtime makes, for what only the library can finish: `[f, a, b]`.
 let deferred2! !p !f !a !b = {
@@ -1005,7 +1063,8 @@ let cannot_apply! !p name !a !b = fail_value! p atom_type_error
                 (concat2! p (describe! p a) (concat2! p (text_of! p " and ") (describe! p b))));
 
 let int_or_float_op! !p !op !a !b =
-    if is_float! a || is_float! b {
+    if (is_float! a || is_float! b) && op == 3 && b == tag_fix 0 { fail! p atom_divide_by_zero "division by zero" }
+    else if is_float! a || is_float! b {
         let x = float_bits! a;
         let y = float_bits! b;
         new_float! p (if op == 0 { prim.fadd x y } else if op == 1 { prim.fsub x y }
@@ -1106,8 +1165,8 @@ let ordered! !p !op !a !b = {
         fail_value! p atom_type_error (concat2! p (concat2! p (text_of! p "cannot order ") (describe! p a))
                                        (concat2! p (text_of! p " against ") (describe! p b)))
     }
-    // A NaN is on no side of anything.
-    else if c == 2 { false_word }
+    // The VM's rule: a NaN is neither below nor above, so it reads as equal to both.
+    else if c == 2 { as_word (op == 1 || op == 3) }
     else { as_word (if op == 0 { c < 0 } else if op == 1 { c <= 0 } else if op == 2 { c > 0 } else { c >= 0 }) }
 };
 
@@ -1449,7 +1508,11 @@ let join_at! !a !i !n !to = if i >= n { 0 } else {
     join_at! a (i + 1) n (to + m)
 };
 
-let join_strings! !p !a = {
+let all_strings! !a !i !n = i >= n || (is_string! (prim.load64! (a + (2 + i) * word)) && all_strings! a (i + 1) n);
+
+let join_strings! !p !a = if not (all_strings! a 0 (untag_fix (prim.load64! (a + word)))) {
+    type_fail! p "str_concat needs a list of strings"
+} else {
     let n = untag_fix (prim.load64! (a + word));
     let out = new_string! p (joined_size! a 0 n 0);
     join_at! a 0 n (string_bytes out);
@@ -1789,6 +1852,9 @@ let match_key! !p !m !k = {
 /// walking one forces it, and is told apart before this.
 let peek! !p !c !k =
     if is_kind! c kind_map { let l = map_find! c (key_hash! k) k 0; if l == 0 { 0 } else { prim.load64! (l + 3 * word) } }
+    else if is_trunk! c {
+        if is_fix k && untag_fix k >= 0 && untag_fix k < trunk_size! c { trunk_read! p k c } else { 0 }
+    }
     else if is_fix k && (is_kind! c kind_array || is_record! c) {
         let i = untag_fix k;
         let off = if is_record! c { 3 } else { 2 };
@@ -1798,7 +1864,11 @@ let peek! !p !c !k =
 
 /// Why `peek!` found nothing, as the raise that follows when no `else` was written.
 let index_absent! !p !c !k =
-    if is_kind! c kind_map { fail_value! p atom_no_such_key (concat2! p (text_of! p "the map has no key ") (describe! p k)) }
+    if is_trunk! c {
+        fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "index " (describe! p k) " is outside a trunk of ")
+                                                  (int_to_string! p (prim.load64! (c + 2 * word))))
+    }
+    else if is_kind! c kind_map { fail_value! p atom_no_such_key (concat2! p (text_of! p "the map has no key ") (describe! p k)) }
     else if is_record! c {
         if is_fix k {
             fail_value! p atom_out_of_bounds (concat2! p (concat_parts! p "field " (int_to_string! p k) " is outside ") (describe! p c))
@@ -1819,6 +1889,7 @@ let past_end_error! !p !k !walked =
 
 let index_set! !p !c !k !v =
     if is_kind! c kind_map { map_put! p c k v }
+    else if is_trunk! c { trunk_set! p k v c }
     else if is_fix k && (is_kind! c kind_array || is_record! c) {
         let n = untag_fix (prim.load64! (c + word));
         let i = untag_fix k;
@@ -1906,6 +1977,8 @@ let pcb_kill = 112;
 let pcb_resume = 120;
 let pcb_joined = 128;
 let pcb_killing = 136;
+let pcb_wait_fd = 144;
+let pcb_wait_write = 152;
 let pcb_size = 160;
 
 let state_ready = 0;
@@ -2043,13 +2116,19 @@ let dispatch! !p !pcb !b !c !d !e = {
 let idle! !p !a !b !c !d !e = {
     let n = prim.load64! (p + ctx_next_id);
     let at = earliest_at! p 1 n (0 - 1);
-    if at >= 0 {
-        let now = now_ns! p;
-        if at > now {
+    let now = now_ns! p;
+    let wait = if at < 0 { 0 - 1 } else if at <= now { 0 } else { (at - now) / 1000000 + 1 };
+    // Someone is parked on the system, so the system may yet answer: that is not a
+    // deadlock, however long it takes.
+    if poll_fds! p wait != 0 {
+        wake_expired! p 1 n (now_ns! p);
+        schedule! p 0 0 0 0 0
+    }
+    else if at >= 0 {
+        if wait > 0 {
             let ts = alloc! p (2 * word);
-            let gap = at - now;
-            prim.store64! ts (gap / 1000000000);
-            prim.store64! (ts + word) (gap % 1000000000);
+            prim.store64! ts (wait / 1000);
+            prim.store64! (ts + word) (wait % 1000 * 1000000);
             prim.c2! "nanosleep" ts 0;
         };
         wake_expired! p 1 n (now_ns! p);
@@ -2063,6 +2142,8 @@ let schedule! !p !a !b !c !d !e = {
     let n = prim.load64! (p + ctx_next_id);
     let at = earliest_at! p 1 n (0 - 1);
     if at >= 0 { wake_expired! p 1 n (now_ns! p); };
+    // Those waiting on the system get a look in even while others are busy.
+    if prim.load64! (p + ctx_run_head) != 0 { poll_fds! p 0; };
     let next = run_pop! p;
     if next == 0 { idle! p 0 0 0 0 0 } else { dispatch! p next 0 0 0 0 }
 };
@@ -2351,3 +2432,1778 @@ let start_ticking! !p = if prim.load64! (p + ctx_ticking) == 0 {
 } else { 0 };
 
 let process_id! !p !v = prim.load64! (v + word);
+
+// --- math -----------------------------------------------------------------------------
+
+let math_sqrt! !p !v = if is_number! v { new_float! p (prim.d1! "sqrt" (float_bits! v)) } else { fail! p atom_type_error "sqrt needs a number" };
+let math_exp! !p !v = if is_number! v { new_float! p (prim.d1! "exp" (float_bits! v)) } else { fail! p atom_type_error "exp needs a number" };
+let math_log! !p !v = if is_number! v { new_float! p (prim.d1! "log" (float_bits! v)) } else { fail! p atom_type_error "log needs a number" };
+let math_sin! !p !v = if is_number! v { new_float! p (prim.d1! "sin" (float_bits! v)) } else { fail! p atom_type_error "sin needs a number" };
+let math_cos! !p !v = if is_number! v { new_float! p (prim.d1! "cos" (float_bits! v)) } else { fail! p atom_type_error "cos needs a number" };
+let math_tan! !p !v = if is_number! v { new_float! p (prim.d1! "tan" (float_bits! v)) } else { fail! p atom_type_error "tan needs a number" };
+let math_tanh! !p !v = if is_number! v { new_float! p (prim.d1! "tanh" (float_bits! v)) } else { fail! p atom_type_error "tanh needs a number" };
+let math_atan! !p !v = if is_number! v { new_float! p (prim.d1! "atan" (float_bits! v)) } else { fail! p atom_type_error "atan needs a number" };
+let math_pow! !p !a !b = if is_number! a && is_number! b { new_float! p (prim.d2! "pow" (float_bits! a) (float_bits! b)) } else { fail! p atom_type_error "pow needs two numbers" };
+
+let math_abs! !p !v =
+    if is_float! v { new_float! p (prim.fabs (prim.load64! (v + word))) }
+    else if is_fix v { if untag_fix v < 0 { neg! p v } else { v } }
+    else if is_big! v { if big_sign! v == 1 { neg! p v } else { v } }
+    else { fail! p atom_type_error "abs needs a number" };
+
+/// A float to the integer below it, past a fixnum if it has to be.
+let float_to_int! !p !bits =
+    if not (prim.feq bits bits) || prim.feq (prim.fabs bits) (prim.d1! "exp" (prim.i2f 800)) {
+        fail! p atom_type_error "floor of an infinity or a NaN"
+    }
+    else if prim.flt (prim.fabs bits) (prim.i2f (1 << 62)) { tag_fix (prim.f2i bits) }
+    else { float_to_big! p bits };
+
+let math_floor! !p !v =
+    if is_int! v { v }
+    else if is_float! v { float_to_int! p (prim.d1! "floor" (prim.load64! (v + word))) }
+    else { fail! p atom_type_error "floor needs a number" };
+
+// --- handles ----------------------------------------------------------------------------
+//
+// A handle is a small integer, not a file descriptor, so that one closed stays closed
+// after the system has given its number to something else. Standard input, output and
+// error are the first three. A regular file is read and written where it is: the system
+// has no way to say it would block. A stream is non-blocking, and a process that finds
+// nothing to do parks until `poll` says otherwise.
+
+let handle_words = 2;
+let kind_file_handle = 0;
+let kind_stream_handle = 1;
+let kind_listener_handle = 2;
+
+let fd_of! !p !h = {
+    let table = prim.load64! (p + ctx_handles);
+    let id = untag_fix h;
+    if is_fix h && id >= 0 && id < prim.load64! (p + ctx_handle_count) && table != 0 {
+        prim.load64! (table + id * handle_words * word)
+    } else { 0 - 1 }
+};
+
+let handle_kind! !p !h = prim.load64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word + word);
+
+let init_handles! !p = {
+    let cap = 256;
+    let table = prim.c2! "calloc" (cap * handle_words) word;
+    prim.store64! (p + ctx_handles) table;
+    prim.store64! (p + ctx_handle_cap) cap;
+    prim.store64! (p + ctx_handle_count) 3;
+    prim.store64! table 0;
+    prim.store64! (table + word) kind_stream_handle;
+    prim.store64! (table + 2 * word) 1;
+    prim.store64! (table + 3 * word) kind_stream_handle;
+    prim.store64! (table + 4 * word) 2;
+    prim.store64! (table + 5 * word) kind_stream_handle;
+    0
+};
+
+let add_handle! !p !fd !kind = {
+    let id = prim.load64! (p + ctx_handle_count);
+    if id >= prim.load64! (p + ctx_handle_cap) {
+        let cap = prim.load64! (p + ctx_handle_cap) * 2;
+        prim.store64! (p + ctx_handles) (prim.c2! "realloc" (prim.load64! (p + ctx_handles)) (cap * handle_words * word));
+        prim.store64! (p + ctx_handle_cap) cap;
+    };
+    let at = prim.load64! (p + ctx_handles) + id * handle_words * word;
+    prim.store64! at fd;
+    prim.store64! (at + word) kind;
+    prim.store64! (p + ctx_handle_count) (id + 1);
+    tag_fix id
+};
+
+let errno! () = prim.sext32 (prim.load32! (prim.c0! "__errno_location"));
+
+let errno_kind !e =
+    if e == 2 { prim.atom "not_found" }
+    else if e == 13 || e == 1 { prim.atom "permission_denied" }
+    else if e == 17 { prim.atom "already_exists" }
+    else if e == 21 || e == 20 { prim.atom "wrong_kind" }
+    else if e == 111 { prim.atom "connection_refused" }
+    else if e == 104 || e == 32 { prim.atom "connection_lost" }
+    else if e == 98 { prim.atom "address_in_use" }
+    else if e == 110 { prim.atom "timed_out" }
+    else { prim.atom "io_error" };
+
+let c_text! !p !at = {
+    let n = prim.c1! "strlen" at;
+    let s = new_string! p n;
+    prim.c3! "memcpy" (string_bytes s) at n;
+    s
+};
+
+/// The system's reason, as `what: reason`. Its kind says what a program can do about it.
+let fail_errno! !p !what = {
+    let e = errno! ();
+    fail_value! p (errno_kind e) (concat3! p what (text_of! p ": ") (c_text! p (prim.c1! "strerror" e)))
+};
+
+let fail_path! !p verb !path = fail_errno! p (concat3! p (text_of! p verb) (text_of! p " ") path);
+
+let closed! !p s = fail! p (prim.atom "io_closed") s;
+
+let set_nonblocking! !fd = prim.c3! "fcntl" fd 4 (prim.sext32 (prim.c2! "fcntl" fd 3) | 2048);
+
+let io_stdin! !p !unit = tag_fix 0;
+
+/// A stat's fields at this system's offsets.
+let stat_mode! !buf = prim.load32! (buf + stat_mode_at);
+let stat_size! !buf = prim.load64! (buf + stat_size_at);
+let stat_mtime_ns! !buf = prim.load64! (buf + stat_mtime_at) * 1000000000 + prim.load64! (buf + stat_mtime_at + word);
+let stat_mode_at = 24;
+let stat_size_at = 48;
+let stat_mtime_at = 88;
+let stat_bytes = 256;
+
+let is_regular !mode = mode & 61440 == 32768;
+let is_directory !mode = mode & 61440 == 16384;
+let is_symlink !mode = mode & 61440 == 40960;
+
+let io_open! !p !path !mode =
+    if not (is_string! path) { fail! p atom_type_error "open! needs a path" }
+    else if mode & 255 != 26 { fail! p atom_type_error "open! needs a mode: :read, :write, :append or :update" }
+    else {
+        let flags =
+            if mode == prim.atom "read" { 0 }
+            else if mode == prim.atom "write" { 1 | 64 | 512 }
+            else if mode == prim.atom "append" { 1 | 64 | 1024 }
+            else if mode == prim.atom "update" { 2 | 64 }
+            else { 0 - 1 };
+        if flags < 0 {
+            fail_value! p (prim.atom "bad_argument") (concat3! p (text_of! p "`:") (atom_name! p mode) (text_of! p "` is not a mode; use :read, :write, :append or :update"))
+        } else {
+            let fd = prim.sext32 (prim.c3! "open" (string_bytes path) (flags | 524288) 420);
+            if fd < 0 { fail_path! p "open" path }
+            else {
+                let buf = alloc! p stat_bytes;
+                prim.c2! "fstat" fd buf;
+                if is_regular (stat_mode! buf) { add_handle! p fd kind_file_handle }
+                else {
+                    set_nonblocking! fd;
+                    add_handle! p fd kind_stream_handle
+                }
+            }
+        }
+    };
+
+let io_close! !p !h = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is already closed" }
+    else {
+        prim.store64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word) (0 - 1);
+        prim.c1! "close" fd;
+        unit_word
+    }
+};
+
+let is_open! !p !h = as_word (fd_of! p h >= 0);
+
+/// Wait until `fd` can be read or written, by being called again.
+let wait_fd! !p !sp !code !a !b !fd = {
+    let pcb = current! p;
+    prim.store64! (pcb + pcb_wait_fd) (fd + 1);
+    park! p sp code a b unit_word
+};
+
+let io_read_m! !p !sp !self_ !h !n !d = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is closed, or was never opened"; native_failed! p sp 0 0 0 0 }
+    else if not (is_fix n) || untag_fix n < 0 { fail! p atom_type_error "read! needs a byte count"; native_failed! p sp 0 0 0 0 }
+    else if n == tag_fix 0 { return! p sp (text_of! p "") }
+    else {
+        let want = if untag_fix n > 16777216 { 16777216 } else { untag_fix n };
+        let s = new_string! p want;
+        let got = prim.c3! "read" fd (string_bytes s) want;
+        if got >= 0 { prim.store64! (s + word) got; prim.store8! (string_bytes s + got) 0; return! p sp s }
+        else {
+            let e = errno! ();
+            if e == 11 { wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd }
+            else if e == 4 { io_read_m! p sp 0 h n 0 }
+            else if e == 5 { return! p sp (text_of! p "") }
+            else { fail_errno! p (text_of! p "read"); native_failed! p sp 0 0 0 0 }
+        }
+    }
+};
+
+let io_write_m! !p !sp !self_ !h !s !d = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is closed, or was never opened"; native_failed! p sp 0 0 0 0 }
+    else if not (is_string! s) { fail! p atom_type_error "write! needs a string"; native_failed! p sp 0 0 0 0 }
+    else if string_len! s == 0 { return! p sp (tag_fix 0) }
+    else {
+        let put = prim.c3! "write" fd (string_bytes s) (string_len! s);
+        if put >= 0 { return! p sp (tag_fix put) }
+        else {
+            let e = errno! ();
+            if e == 11 {
+                prim.store64! (current! p + pcb_wait_write) 1;
+                wait_fd! p sp (prim.load64! (prim.info "m_write")) h s fd
+            }
+            else if e == 4 { io_write_m! p sp 0 h s 0 }
+            else { fail_errno! p (text_of! p "write"); native_failed! p sp 0 0 0 0 }
+        }
+    }
+};
+
+let io_flush! !p !h = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is closed" }
+    else {
+        if handle_kind! p h == kind_file_handle && prim.sext32 (prim.c1! "fsync" fd) < 0 { fail_errno! p (text_of! p "flush") } else { unit_word }
+    }
+};
+
+let io_seek! !p !h !off = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is closed" }
+    else if not (is_fix off) { fail! p atom_type_error "seek! needs a byte offset" }
+    else {
+        let at = prim.c3! "lseek" fd (untag_fix off) 0;
+        if at < 0 { fail_errno! p (text_of! p "seek") } else { tag_fix at }
+    }
+};
+
+let io_size! !p !h = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this handle is closed" }
+    else {
+        let buf = alloc! p stat_bytes;
+        if prim.sext32 (prim.c2! "fstat" fd buf) < 0 { fail_errno! p (text_of! p "size") } else { tag_fix (stat_size! buf) }
+    }
+};
+
+let io_kind! !p !h = {
+    if fd_of! p h < 0 { closed! p "this handle is closed" }
+    else {
+        let k = handle_kind! p h;
+        if k == kind_file_handle { prim.atom "file" } else if k == kind_listener_handle { prim.atom "listener" } else { prim.atom "stream" }
+    }
+};
+
+let io_is_terminal! !p !h = {
+    let fd = fd_of! p h;
+    as_word (fd >= 0 && prim.sext32 (prim.c1! "isatty" fd) == 1)
+};
+
+let io_enable_ansi! !p !h = true_word;
+
+let stat_via! !p !path !link what = {
+    let buf = alloc! p stat_bytes;
+    let r = if link { prim.c2! "lstat" (string_bytes path) buf } else { prim.c2! "stat" (string_bytes path) buf };
+    if prim.sext32 r != 0 {
+        let e = errno! ();
+        if e == 2 || e == 20 { unit_word } else { fail_path! p what path }
+    } else {
+        let mode = stat_mode! buf;
+        let k = if is_symlink mode { prim.atom "link" }
+                else if is_directory mode { prim.atom "dir" }
+                else if is_regular mode { prim.atom "file" }
+                else { prim.atom "other" };
+        new_cons! p (tag_fix (stat_size! buf)) (new_cons! p (tag_fix (stat_mtime_ns! buf)) (new_cons! p k nil_word))
+    }
+};
+
+let need_path! !p !v what = if is_string! v { 1 } else { fail! p atom_type_error what };
+
+let io_stat! !p !path = if need_path! p path "stat! needs a path" == 0 { 0 } else { stat_via! p path false "stat" };
+let io_lstat! !p !path = if need_path! p path "lstat! needs a path" == 0 { 0 } else { stat_via! p path true "lstat" };
+
+let stat_kind! !p !path = {
+    let buf = alloc! p stat_bytes;
+    if prim.sext32 (prim.c2! "stat" (string_bytes path) buf) != 0 { 0 } else { stat_mode! buf }
+};
+
+let io_exists! !p !path = if not (is_string! path) { fail! p atom_type_error "exists! needs a path" } else {
+    let buf = alloc! p stat_bytes;
+    as_word (prim.sext32 (prim.c2! "stat" (string_bytes path) buf) == 0)
+};
+
+let io_is_dir! !p !path = if not (is_string! path) { fail! p atom_type_error "is_dir! needs a path" } else {
+    as_word (is_directory (stat_kind! p path))
+};
+
+let io_is_link! !p !path = if not (is_string! path) { fail! p atom_type_error "is_link! needs a path" } else {
+    let buf = alloc! p stat_bytes;
+    as_word (prim.sext32 (prim.c2! "lstat" (string_bytes path) buf) == 0 && is_symlink (stat_mode! buf))
+};
+
+let io_mode! !p !path = if not (is_string! path) { fail! p atom_type_error "mode! needs a path" } else {
+    let buf = alloc! p stat_bytes;
+    if prim.sext32 (prim.c2! "stat" (string_bytes path) buf) != 0 {
+        let e = errno! ();
+        if e == 2 || e == 20 { unit_word } else { fail_path! p "mode" path }
+    } else { tag_fix (stat_mode! buf & 4095) }
+};
+
+/// A call that answers -1 and sets `errno`, or unit.
+let checked! !p !r verb !path = if prim.sext32 r != 0 { fail_path! p verb path } else { unit_word };
+
+let io_remove! !p !path = {
+    if not (is_string! path) { fail! p atom_type_error "remove! needs a path" }
+    else { checked! p (prim.c1! "remove" (string_bytes path)) "remove" path }
+};
+let io_rename! !p !a !b = checked! p (prim.c2! "rename" (string_bytes a) (string_bytes b)) "rename" a;
+let io_mkdir! !p !path = checked! p (prim.c2! "mkdir" (string_bytes path) 511) "mkdir" path;
+let io_link! !p !a !b = if prim.sext32 (prim.c2! "link" (string_bytes a) (string_bytes b)) == 0 { prim.atom "linked" } else { fail_path! p "link" b };
+let io_symlink! !p !a !b = checked! p (prim.c2! "symlink" (string_bytes a) (string_bytes b)) "symlink" b;
+let io_chmod! !p !path !mode = checked! p (prim.c2! "chmod" (string_bytes path) (untag_fix mode)) "chmod" path;
+
+let io_read_link! !p !path = {
+    let buf = alloc! p 4100;
+    let n = prim.c3! "readlink" (string_bytes path) buf 4096;
+    if n < 0 {
+        if errno! () == 22 { fail_value! p (prim.atom "wrong_kind") (concat2! p (text_of! p "read_link ") path) }
+        else { fail_path! p "read_link" path }
+    } else {
+        let s = new_string! p n;
+        prim.c3! "memcpy" (string_bytes s) buf n;
+        s
+    }
+};
+
+/// `dir/nameXXXXXX`, what `mkstemp` and `mkdtemp` fill in.
+let temp_template! !p !dir !name = concat3! p (concat2! p dir (text_of! p "/")) name (text_of! p "XXXXXX");
+
+let io_temp_file! !p !dir !name = {
+    let t = temp_template! p dir name;
+    let fd = prim.sext32 (prim.c1! "mkstemp" (string_bytes t));
+    if fd < 0 { fail_path! p "temp_file" dir }
+    else { new_cons! p t (new_cons! p (add_handle! p fd kind_file_handle) nil_word) }
+};
+
+let io_temp_dir! !p !dir !name = {
+    let t = temp_template! p dir name;
+    if prim.c1! "mkdtemp" (string_bytes t) == 0 { fail_path! p "temp_dir" dir } else { t }
+};
+
+let copy_fd! !from !to !buf = {
+    let n = prim.c3! "read" from buf 65536;
+    if n <= 0 { n } else {
+        prim.c3! "write" to buf n;
+        copy_fd! from to buf
+    }
+};
+
+let io_copy! !p !a !b = {
+    let from = prim.sext32 (prim.c3! "open" (string_bytes a) 524288 0);
+    if from < 0 { fail_path! p "copy" a }
+    else {
+        let stat = alloc! p stat_bytes;
+        prim.c2! "fstat" from stat;
+        let to = prim.sext32 (prim.c3! "open" (string_bytes b) (1 | 64 | 512 | 524288) (stat_mode! stat & 4095));
+        if to < 0 { prim.c1! "close" from; fail_path! p "copy" b }
+        else {
+            let buf = alloc! p 65536;
+            copy_fd! from to buf;
+            prim.c1! "close" from;
+            prim.c1! "close" to;
+            unit_word
+        }
+    }
+};
+
+// --- os ---------------------------------------------------------------------------------
+
+let set_args! !p !argc !argv = {
+    prim.store64! (p + ctx_argc) argc;
+    prim.store64! (p + ctx_argv) argv;
+    0
+};
+
+let args_from! !p !i !n !argv = if i >= n { nil_word } else {
+    new_cons! p (c_text! p (prim.load64! (argv + i * word))) (args_from! p (i + 1) n argv)
+};
+
+/// What the program was given: the executable's own name is not one of them.
+let os_args! !p !unit = args_from! p 1 (prim.load64! (p + ctx_argc)) (prim.load64! (p + ctx_argv));
+
+let os_env! !p !name = if not (is_string! name) { fail! p atom_type_error "env! needs a name" } else {
+    let v = prim.c1! "getenv" (string_bytes name);
+    if v == 0 { unit_word } else { c_text! p v }
+};
+
+let os_set_env! !p !k !v = {
+    prim.c3! "setenv" (string_bytes k) (string_bytes v) 1;
+    unit_word
+};
+
+let os_cwd! !p !unit = {
+    let buf = alloc! p 4100;
+    if prim.c2! "getcwd" buf 4096 == 0 { fail! p (prim.atom "os_error") "getcwd failed" } else { c_text! p buf }
+};
+
+let os_chdir! !p !path = checked! p (prim.c1! "chdir" (string_bytes path)) "chdir" path;
+
+let dir_names! !p !d !acc = {
+    let entry = prim.c1! "readdir" d;
+    if entry == 0 { acc } else {
+        let name = entry + 19;
+        let dot = prim.load8! name == 46 && (prim.load8! (name + 1) == 0 || (prim.load8! (name + 1) == 46 && prim.load8! (name + 2) == 0));
+        dir_names! p d (if dot { acc } else { new_cons! p (c_text! p name) acc })
+    }
+};
+
+/// Unsorted: the library sorts it, as it does everything that needs comparing.
+let dir_list! !p !path = if not (is_string! path) { fail! p atom_type_error "list_dir! needs a path" } else {
+    let d = prim.c1! "opendir" (string_bytes path);
+    if d == 0 { fail_path! p "list_dir" path }
+    else {
+        let names = dir_names! p d nil_word;
+        prim.c1! "closedir" d;
+        names
+    }
+};
+
+let os_monotonic! !p !unit = tag_fix (now_ns! p / 1000000);
+let os_pid! !p !unit = tag_fix (prim.sext32 (prim.c0! "getpid"));
+let os_platform! !p !unit = prim.atom "linux";
+let os_arch! !p !unit = prim.atom "x86_64";
+let os_exit! !p !code = if is_fix code { prim.c1! "exit" (untag_fix code) } else { fail! p atom_type_error "exit! needs an exit code" };
+
+/// `$MINDV2_PATH`, or `~/.mindv2`: where an installation is, for a program with no VM
+/// beside it to ask.
+let os_install_dirs! !p !unit = {
+    let set = prim.c1! "getenv" (string_bytes (text_of! p "MINDV2_PATH"));
+    if set != 0 { new_cons! p (c_text! p set) nil_word }
+    else {
+        let home = prim.c1! "getenv" (string_bytes (text_of! p "HOME"));
+        if home == 0 { nil_word } else { new_cons! p (concat2! p (c_text! p home) (text_of! p "/.mindv2")) nil_word }
+    }
+};
+
+// --- a child process --------------------------------------------------------------------
+//
+// Its output is read through handles by the library, in ordinary processes, so a child
+// blocks nothing. A failure to start is reported through a pipe that closes on exec:
+// bytes arriving on it mean the exec did not happen.
+
+let c_argv! !p !a !first = {
+    let n = untag_fix (prim.load64! (a + word));
+    let out = alloc! p ((n + 2) * word);
+    prim.store64! out (string_bytes first);
+    fill_argv! a out 0 n;
+    prim.store64! (out + (n + 1) * word) 0;
+    out
+};
+
+let fill_argv! !a !out !i !n = if i >= n { 0 } else {
+    prim.store64! (out + (i + 1) * word) (string_bytes (prim.load64! (a + (2 + i) * word)));
+    fill_argv! a out (i + 1) n
+};
+
+let child_env! !a !i !n = if i >= n { 0 } else {
+    prim.c1! "putenv" (string_bytes (prim.load64! (a + (2 + i) * word)));
+    child_env! a (i + 1) n
+};
+
+let pipe_pair! !p = {
+    let buf = alloc! p word;
+    prim.c2! "pipe2" buf 524288;
+    buf
+};
+
+let in_child! !p !dir !env !program !argv !fds = {
+    let out = prim.load64! fds;
+    let err = prim.load64! (fds + word);
+    let status = prim.load64! (fds + 2 * word);
+    prim.c2! "dup2" (prim.load32! (out + 4)) 1;
+    prim.c2! "dup2" (if prim.load64! (fds + 3 * word) == true_word { prim.load32! (out + 4) } else { prim.load32! (err + 4) }) 2;
+    if dir != unit_word && prim.sext32 (prim.c1! "chdir" (string_bytes dir)) != 0 { 0 } else {
+        child_env! env 0 (untag_fix (prim.load64! (env + word)));
+        prim.c2! "execvp" (string_bytes program) argv;
+        0
+    };
+    let e = alloc! p word;
+    prim.store32! e (errno! ());
+    prim.c3! "write" (prim.load32! (status + 4)) e 4;
+    prim.c1! "_exit" 127
+};
+
+/// `[pid, out handle, err handle]`. `env` and `args` are arrays of strings.
+let spawn_child! !p !dir !env !program !args !joined = {
+    let out = pipe_pair! p;
+    let err = pipe_pair! p;
+    let status = pipe_pair! p;
+    let argv = c_argv! p args program;
+    let pid = prim.sext32 (prim.c0! "fork");
+    if pid == 0 {
+        let fds = alloc! p (4 * word);
+        prim.store64! fds out;
+        prim.store64! (fds + word) err;
+        prim.store64! (fds + 2 * word) status;
+        prim.store64! (fds + 3 * word) joined;
+        in_child! p dir env program argv fds
+    }
+    else if pid < 0 { fail_path! p "exec" program }
+    else {
+        prim.c1! "close" (prim.load32! (out + 4));
+        prim.c1! "close" (prim.load32! (err + 4));
+        prim.c1! "close" (prim.load32! (status + 4));
+        let code = alloc! p word;
+        let got = prim.c3! "read" (prim.load32! status) code 4;
+        prim.c1! "close" (prim.load32! status);
+        if got > 0 {
+            prim.c1! "close" (prim.load32! out);
+            prim.c1! "close" (prim.load32! err);
+            prim.c3! "waitpid" pid 0 0;
+            fail_value! p (prim.atom "not_found") (concat3! p (text_of! p "exec ") program (concat2! p (text_of! p ": ") (c_text! p (prim.c1! "strerror" (prim.load32! code)))))
+        } else {
+            set_nonblocking! (prim.load32! out);
+            set_nonblocking! (prim.load32! err);
+            new_cons! p (tag_fix pid) (new_cons! p (add_handle! p (prim.load32! out) kind_stream_handle)
+                (new_cons! p (add_handle! p (prim.load32! err) kind_stream_handle) nil_word))
+        }
+    }
+};
+
+/// The exit code, or unit if it is still going.
+let child_status! !p !pid = {
+    let buf = alloc! p word;
+    let r = prim.c3! "waitpid" (untag_fix pid) buf 1;
+    if prim.sext32 r == 0 { unit_word }
+    else {
+        let status = prim.load32! buf;
+        if status & 127 == 0 { tag_fix ((status >> 8) & 255) } else { tag_fix (128 + (status & 127)) }
+    }
+};
+
+let child_kill! !p !pid = {
+    prim.c2! "kill" (untag_fix pid) 9;
+    unit_word
+};
+
+// --- sockets ----------------------------------------------------------------------------
+
+let af_inet = 2;
+let sock_stream = 1;
+let sockaddr_bytes = 16;
+
+/// The IPv4 address of `host`, in network order, or -1.
+let resolve_ipv4! !p !host = {
+    let hints = alloc! p 48;
+    zero_words! hints 6;
+    prim.store32! (hints + 4) af_inet;
+    prim.store32! (hints + 8) sock_stream;
+    let result = alloc! p word;
+    let r = prim.sext32 (prim.c4! "getaddrinfo" (string_bytes host) 0 hints result);
+    if r != 0 { 0 - 1 }
+    else {
+        let info = prim.load64! result;
+        let addr = prim.load64! (info + 24);
+        let ip = prim.load32! (addr + 4);
+        prim.c1! "freeaddrinfo" info;
+        ip
+    }
+};
+
+let write_addr! !at !ip !port = {
+    prim.store16! at af_inet;
+    prim.store8! (at + 2) (port >> 8);
+    prim.store8! (at + 3) (port & 255);
+    prim.store32! (at + 4) ip;
+    prim.store64! (at + 8) 0;
+    0
+};
+
+let new_socket! () = prim.sext32 (prim.c3! "socket" af_inet (sock_stream | 2048 | 524288) 0);
+
+let listen_at! !p !ip !port = {
+    let fd = new_socket! ();
+    if fd < 0 { fail_errno! p (text_of! p "socket") }
+    else {
+        let one = alloc! p word;
+        prim.store32! one 1;
+        prim.c5! "setsockopt" fd 1 2 one 4;
+        let addr = alloc! p sockaddr_bytes;
+        write_addr! addr ip port;
+        if prim.sext32 (prim.c3! "bind" fd addr sockaddr_bytes) < 0 || prim.sext32 (prim.c2! "listen" fd 128) < 0 {
+            let failure = fail_errno! p (text_of! p "listen");
+            prim.c1! "close" fd;
+            failure
+        } else { add_handle! p fd kind_listener_handle }
+    }
+};
+
+let port_ok !v = is_fix v && untag_fix v >= 0 && untag_fix v <= 65535;
+
+let net_listen! !p !port = if port_ok port { listen_at! p 0 (untag_fix port) } else { fail! p (prim.atom "bad_argument") "listen! needs a port between 0 and 65535" };
+
+let net_listen_on! !p !host !port =
+    if not (is_string! host) { fail! p atom_type_error "listen_on! needs a host to bind" }
+    else if not (port_ok port) { fail! p (prim.atom "bad_argument") "listen_on! needs a port between 0 and 65535" }
+    else {
+        let ip = resolve_ipv4! p host;
+        if ip < 0 { fail_value! p (prim.atom "not_found") (concat2! p (text_of! p "cannot resolve ") host) }
+        else { listen_at! p ip (untag_fix port) }
+    };
+
+let net_accept_m! !p !sp !self_ !h !c !d = {
+    let fd = fd_of! p h;
+    if fd < 0 { closed! p "this socket is closed"; native_failed! p sp 0 0 0 0 }
+    else {
+        let got = prim.sext32 (prim.c4! "accept4" fd 0 0 (2048 | 524288));
+        if got >= 0 { return! p sp (add_handle! p got kind_stream_handle) }
+        else {
+            let e = errno! ();
+            if e == 11 { wait_fd! p sp (prim.load64! (prim.info "m_accept")) h unit_word fd }
+            else if e == 4 { net_accept_m! p sp 0 h 0 0 }
+            else { fail_errno! p (text_of! p "accept"); native_failed! p sp 0 0 0 0 }
+        }
+    }
+};
+
+let net_connect_m! !p !sp !self_ !host !port !d = {
+    if not (is_string! host) || not (port_ok port) { fail! p atom_type_error "connect! needs a host and a port"; native_failed! p sp 0 0 0 0 }
+    else {
+        let ip = resolve_ipv4! p host;
+        if ip < 0 {
+            fail_value! p (prim.atom "not_found") (concat2! p (text_of! p "cannot resolve ") host);
+            native_failed! p sp 0 0 0 0
+        } else {
+            let fd = new_socket! ();
+            let addr = alloc! p sockaddr_bytes;
+            write_addr! addr ip (untag_fix port);
+            let r = prim.sext32 (prim.c3! "connect" fd addr sockaddr_bytes);
+            if r == 0 { return! p sp (add_handle! p fd kind_stream_handle) }
+            else if errno! () == 115 {
+                let h = add_handle! p fd kind_stream_handle;
+                prim.store64! (current! p + pcb_wait_write) 1;
+                wait_fd! p sp (prim.load64! (prim.info "m_connected")) h unit_word fd
+            } else {
+                fail_errno! p (concat2! p (text_of! p "connect ") host);
+                prim.c1! "close" fd;
+                native_failed! p sp 0 0 0 0
+            }
+        }
+    }
+};
+
+/// A connection in progress has become writable, which says only that it is finished.
+let net_connected_m! !p !sp !self_ !h !c !d = {
+    let fd = fd_of! p h;
+    let code = alloc! p word;
+    let size = alloc! p word;
+    prim.store32! size 4;
+    prim.c5! "getsockopt" fd 1 4 code size;
+    let e = prim.load32! code;
+    if e == 0 { return! p sp h }
+    else {
+        prim.c1! "close" fd;
+        prim.store64! (prim.load64! (p + ctx_handles) + untag_fix h * handle_words * word) (0 - 1);
+        fail_value! p (errno_kind e) (concat2! p (text_of! p "connect: ") (c_text! p (prim.c1! "strerror" e)));
+        native_failed! p sp 0 0 0 0
+    }
+};
+
+let addr_port! !at = prim.load8! (at + 2) * 256 + prim.load8! (at + 3);
+
+let name_of! !p !h !peer = {
+    let fd = fd_of! p h;
+    let addr = alloc! p sockaddr_bytes;
+    let size = alloc! p word;
+    prim.store32! size sockaddr_bytes;
+    let r = if peer { prim.c3! "getpeername" fd addr size } else { prim.c3! "getsockname" fd addr size };
+    if prim.sext32 r < 0 { 0 } else { addr }
+};
+
+let net_peer! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" } else {
+    let addr = name_of! p h true;
+    if addr == 0 { fail_errno! p (text_of! p "peer") }
+    else {
+        let text = alloc! p 32;
+        prim.c4! "inet_ntop" af_inet (addr + 4) text 32;
+        concat3! p (c_text! p text) (text_of! p ":") (int_to_string! p (tag_fix (addr_port! addr)))
+    }
+};
+
+let net_port! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" } else {
+    let addr = name_of! p h false;
+    if addr == 0 { fail_errno! p (text_of! p "port") } else { tag_fix (addr_port! addr) }
+};
+
+let net_shutdown! !p !h = if fd_of! p h < 0 { closed! p "this socket is closed" } else {
+    prim.c2! "shutdown" (fd_of! p h) 1;
+    unit_word
+};
+
+// --- waiting for the system -------------------------------------------------------------
+
+let fill_polls! !p !buf !id !n !count = if id >= n { count } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting && prim.load64! (pcb + pcb_wait_fd) != 0 {
+        let at = buf + count * 8;
+        prim.store32! at (prim.load64! (pcb + pcb_wait_fd) - 1);
+        prim.store16! (at + 4) (if prim.load64! (pcb + pcb_wait_write) != 0 { 4 } else { 1 });
+        prim.store16! (at + 6) 0;
+        fill_polls! p buf (id + 1) n (count + 1)
+    } else { fill_polls! p buf (id + 1) n count }
+};
+
+let wake_polled! !p !buf !id !n !at = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && prim.load64! (pcb + pcb_state) == state_waiting && prim.load64! (pcb + pcb_wait_fd) != 0 {
+        if prim.load16! (buf + at * 8 + 6) != 0 {
+            prim.store64! (pcb + pcb_wait_fd) 0;
+            prim.store64! (pcb + pcb_wait_write) 0;
+            wake! p pcb;
+        };
+        wake_polled! p buf (id + 1) n (at + 1)
+    } else { wake_polled! p buf (id + 1) n at }
+};
+
+/// Ask the system which parked processes can go on, waiting up to `ms` (-1 for ever).
+/// Answers how many descriptors were asked about.
+let poll_fds! !p !ms = {
+    let n = prim.load64! (p + ctx_next_id);
+    let buf = alloc! p (n * 8 + 8);
+    let count = fill_polls! p buf 1 n 0;
+    if count == 0 { 0 } else {
+        prim.c3! "poll" buf count ms;
+        wake_polled! p buf 1 n 0;
+        count
+    }
+};
+
+// --- crypto ------------------------------------------------------------------------------
+//
+// The hashes written out, on raw words, as RFC 1321 and FIPS 180 give them. The constants
+// are hexadecimal text read once into memory, since the dialect has no static arrays and
+// the 64-bit ones do not fit a literal.
+
+let hex_digit !c = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 };
+
+let hex_words! !s !out !i !n !width = if i >= n { out } else {
+    prim.store64! (out + i * word) (hex_word! (s + i * width) width 0);
+    hex_words! s out (i + 1) n width
+};
+
+let hex_word! !s !left !acc = if left == 0 { acc } else {
+    hex_word! (s + 1) (left - 1) ((acc << 4) | hex_digit (prim.load8! s))
+};
+
+let k512_text = "428a2f98d728ae227137449123ef65cdb5c0fbcfec4d3b2fe9b5dba58189dbbc3956c25bf348b53859f111f1b605d019923f82a4af194f9bab1c5ed5da6d8118d807aa98a303024212835b0145706fbe243185be4ee4b28c550c7dc3d5ffb4e272be5d74f27b896f80deb1fe3b1696b19bdc06a725c71235c19bf174cf692694e49b69c19ef14ad2efbe4786384f25e30fc19dc68b8cd5b5240ca1cc77ac9c652de92c6f592b02754a7484aa6ea6e4835cb0a9dcbd41fbd476f988da831153b5983e5152ee66dfaba831c66d2db43210b00327c898fb213fbf597fc7beef0ee4c6e00bf33da88fc2d5a79147930aa72506ca6351e003826f142929670a0e6e7027b70a8546d22ffc2e1b21385c26c9264d2c6dfc5ac42aed53380d139d95b3df650a73548baf63de766a0abb3c77b2a881c2c92e47edaee692722c851482353ba2bfe8a14cf10364a81a664bbc423001c24b8b70d0f89791c76c51a30654be30d192e819d6ef5218d69906245565a910f40e35855771202a106aa07032bbd1b819a4c116b8d2d0c81e376c085141ab532748774cdf8eeb9934b0bcb5e19b48a8391c0cb3c5c95a634ed8aa4ae3418acb5b9cca4f7763e373682e6ff3d6b2b8a3748f82ee5defb2fc78a5636f43172f6084c87814a1f0ab728cc702081a6439ec90befffa23631e28a4506cebde82bde9bef9a3f7b2c67915c67178f2e372532bca273eceea26619cd186b8c721c0c207eada7dd6cde0eb1ef57d4f7fee6ed17806f067aa72176fba0a637dc5a2c898a6113f9804bef90dae1b710b35131c471b28db77f523047d8432caab7b40c724933c9ebe0a15c9bebc431d67c49c100d4c4cc5d4becb3e42b6597f299cfc657e2a5fcb6fab3ad6faec6c44198c4a475817";
+let h512_text = "6a09e667f3bcc908bb67ae8584caa73b3c6ef372fe94f82ba54ff53a5f1d36f1510e527fade682d19b05688c2b3e6c1f1f83d9abfb41bd6b5be0cd19137e2179";
+let h384_text = "cbbb9d5dc1059ed8629a292a367cd5079159015a3070dd17152fecd8f70e593967332667ffc00b318eb44a8768581511db0c2e0d64f98fa747b5481dbefa4fa4";
+let h256_text = "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19";
+
+/// The 80 round constants, made once: SHA-256's are the first 64 of them, cut short.
+let k512! !p = {
+    let have = prim.load64! (p + ctx_k512);
+    if have != 0 { have } else {
+        let t = hex_words! k512_text (prim.c1! "malloc" (80 * word)) 0 80 16;
+        prim.store64! (p + ctx_k512) t;
+        t
+    }
+};
+
+let mask32 = 4294967295;
+let rotr32 !x !n = ((x >> n) | (x << (32 - n))) & mask32;
+let rotl32 !x !n = ((x << n) | (x >> (32 - n))) & mask32;
+let be32! !at = (prim.load8! at << 24) | (prim.load8! (at + 1) << 16) | (prim.load8! (at + 2) << 8) | prim.load8! (at + 3);
+let le32! !at = prim.load32! at;
+let be64! !at = (be32! at << 32) | be32! (at + 4);
+let store_be32! !at !v = {
+    prim.store8! at (prim.ushr v 24);
+    prim.store8! (at + 1) (prim.ushr v 16);
+    prim.store8! (at + 2) (prim.ushr v 8);
+    prim.store8! (at + 3) v;
+    0
+};
+let store_be64! !at !v = {
+    store_be32! at (prim.ushr v 32);
+    store_be32! (at + 4) v;
+    0
+};
+let rotr64 !x !n = prim.ushr x n | (x << (64 - n));
+
+/// The message and its padding: a 1 bit, zeros, and the length in the last bytes.
+let padded! !p !data !n !block !len_bytes !big = {
+    let total = (n + 1 + len_bytes + block - 1) / block * block;
+    let m = alloc! p (total + word);
+    prim.c3! "memset" m 0 total;
+    prim.c3! "memcpy" m data n;
+    prim.store8! (m + n) 128;
+    let bits = n * 8;
+    if big { store_be64! (m + total - 8) bits; }
+    else { prim.store64! (m + total - 8) bits; };
+    prim.store64! (p + ctx_scratch) total;
+    m
+};
+
+let sha256_w! !w !i = if i >= 64 { 0 } else {
+    let x = prim.load64! (w + (i - 15) * word);
+    let y = prim.load64! (w + (i - 2) * word);
+    let s0 = rotr32 x 7 ^ rotr32 x 18 ^ (x >> 3);
+    let s1 = rotr32 y 17 ^ rotr32 y 19 ^ (y >> 10);
+    prim.store64! (w + i * word) ((prim.load64! (w + (i - 16) * word) + s0 + prim.load64! (w + (i - 7) * word) + s1) & mask32);
+    sha256_w! w (i + 1)
+};
+
+let sha256_load! !w !m !i = if i >= 16 { 0 } else {
+    prim.store64! (w + i * word) (be32! (m + i * 4));
+    sha256_load! w m (i + 1)
+};
+
+let sha256_rounds! !s !w !k !i = if i >= 64 { 0 } else {
+    let a = prim.load64! s;
+    let e = prim.load64! (s + 4 * word);
+    let f = prim.load64! (s + 5 * word);
+    let g = prim.load64! (s + 6 * word);
+    let b = prim.load64! (s + word);
+    let c = prim.load64! (s + 2 * word);
+    let s1 = rotr32 e 6 ^ rotr32 e 11 ^ rotr32 e 25;
+    let ch = (e & f) ^ ((e ^ mask32) & g);
+    let t1 = prim.load64! (s + 7 * word) + s1 + ch + (prim.ushr (prim.load64! (k + i * word)) 32) + prim.load64! (w + i * word);
+    let s0 = rotr32 a 2 ^ rotr32 a 13 ^ rotr32 a 22;
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    prim.store64! (s + 7 * word) g;
+    prim.store64! (s + 6 * word) f;
+    prim.store64! (s + 5 * word) e;
+    prim.store64! (s + 4 * word) ((prim.load64! (s + 3 * word) + t1) & mask32);
+    prim.store64! (s + 3 * word) c;
+    prim.store64! (s + 2 * word) b;
+    prim.store64! (s + word) a;
+    prim.store64! s ((t1 + s0 + maj) & mask32);
+    sha256_rounds! s w k (i + 1)
+};
+
+let add_state! !h !s !n !mask !i = if i >= n { 0 } else {
+    prim.store64! (h + i * word) ((prim.load64! (h + i * word) + prim.load64! (s + i * word)) & mask);
+    add_state! h s n mask (i + 1)
+};
+
+let sha256_blocks! !p !h !m !left !w !s = if left <= 0 { 0 } else {
+    sha256_load! w m 0;
+    sha256_w! w 16;
+    copy_words! h s 8;
+    sha256_rounds! s w (k512! p) 0;
+    add_state! h s 8 mask32 0;
+    sha256_blocks! p h (m + 64) (left - 64) w s
+};
+
+let out_be32! !out !h !i !n = if i >= n { 0 } else {
+    store_be32! (out + i * 4) (prim.load64! (h + i * word));
+    out_be32! out h (i + 1) n
+};
+
+let sha256! !p !data !n = {
+    let m = padded! p data n 64 8 true;
+    let total = prim.load64! (p + ctx_scratch);
+    let h = hex_words! h256_text (alloc! p (8 * word)) 0 8 8;
+    sha256_blocks! p h m total (alloc! p (64 * word)) (alloc! p (8 * word));
+    let out = new_string! p 32;
+    out_be32! (string_bytes out) h 0 8;
+    out
+};
+
+let sha512_load! !w !m !i = if i >= 16 { 0 } else {
+    prim.store64! (w + i * word) (be64! (m + i * 8));
+    sha512_load! w m (i + 1)
+};
+
+let sha512_w! !w !i = if i >= 80 { 0 } else {
+    let x = prim.load64! (w + (i - 15) * word);
+    let y = prim.load64! (w + (i - 2) * word);
+    let s0 = rotr64 x 1 ^ rotr64 x 8 ^ prim.ushr x 7;
+    let s1 = rotr64 y 19 ^ rotr64 y 61 ^ prim.ushr y 6;
+    prim.store64! (w + i * word) (prim.load64! (w + (i - 16) * word) + s0 + prim.load64! (w + (i - 7) * word) + s1);
+    sha512_w! w (i + 1)
+};
+
+let sha512_rounds! !s !w !k !i = if i >= 80 { 0 } else {
+    let a = prim.load64! s;
+    let e = prim.load64! (s + 4 * word);
+    let f = prim.load64! (s + 5 * word);
+    let g = prim.load64! (s + 6 * word);
+    let b = prim.load64! (s + word);
+    let c = prim.load64! (s + 2 * word);
+    let s1 = rotr64 e 14 ^ rotr64 e 18 ^ rotr64 e 41;
+    let ch = (e & f) ^ ((e ^ (0 - 1)) & g);
+    let t1 = prim.load64! (s + 7 * word) + s1 + ch + prim.load64! (k + i * word) + prim.load64! (w + i * word);
+    let s0 = rotr64 a 28 ^ rotr64 a 34 ^ rotr64 a 39;
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    prim.store64! (s + 7 * word) g;
+    prim.store64! (s + 6 * word) f;
+    prim.store64! (s + 5 * word) e;
+    prim.store64! (s + 4 * word) (prim.load64! (s + 3 * word) + t1);
+    prim.store64! (s + 3 * word) c;
+    prim.store64! (s + 2 * word) b;
+    prim.store64! (s + word) a;
+    prim.store64! s (t1 + s0 + maj);
+    sha512_rounds! s w k (i + 1)
+};
+
+let sha512_blocks! !p !h !m !left !w !s = if left <= 0 { 0 } else {
+    sha512_load! w m 0;
+    sha512_w! w 16;
+    copy_words! h s 8;
+    sha512_rounds! s w (k512! p) 0;
+    add_state! h s 8 (0 - 1) 0;
+    sha512_blocks! p h (m + 128) (left - 128) w s
+};
+
+let out_be64! !out !h !i !n = if i >= n { 0 } else {
+    store_be64! (out + i * 8) (prim.load64! (h + i * word));
+    out_be64! out h (i + 1) n
+};
+
+let sha512_family! !p !data !n !init !size = {
+    let m = padded! p data n 128 16 true;
+    let total = prim.load64! (p + ctx_scratch);
+    let h = hex_words! init (alloc! p (8 * word)) 0 8 16;
+    sha512_blocks! p h m total (alloc! p (80 * word)) (alloc! p (8 * word));
+    let out = new_string! p size;
+    let wide = alloc! p 64;
+    out_be64! wide h 0 8;
+    prim.c3! "memcpy" (string_bytes out) wide size;
+    out
+};
+
+let sha1_w! !w !i = if i >= 80 { 0 } else {
+    prim.store64! (w + i * word) (rotl32 (prim.load64! (w + (i - 3) * word) ^ prim.load64! (w + (i - 8) * word) ^ prim.load64! (w + (i - 14) * word) ^ prim.load64! (w + (i - 16) * word)) 1);
+    sha1_w! w (i + 1)
+};
+
+let sha1_rounds! !s !w !i = if i >= 80 { 0 } else {
+    let a = prim.load64! s;
+    let b = prim.load64! (s + word);
+    let c = prim.load64! (s + 2 * word);
+    let d = prim.load64! (s + 3 * word);
+    let f = if i < 20 { (b & c) | ((b ^ mask32) & d) }
+            else if i < 40 { b ^ c ^ d }
+            else if i < 60 { (b & c) | (b & d) | (c & d) }
+            else { b ^ c ^ d };
+    let k = if i < 20 { 1518500249 } else if i < 40 { 1859775393 } else if i < 60 { 2400959708 } else { 3395469782 };
+    let t = (rotl32 a 5 + f + prim.load64! (s + 4 * word) + k + prim.load64! (w + i * word)) & mask32;
+    prim.store64! (s + 4 * word) d;
+    prim.store64! (s + 3 * word) c;
+    prim.store64! (s + 2 * word) (rotl32 b 30);
+    prim.store64! (s + word) a;
+    prim.store64! s t;
+    sha1_rounds! s w (i + 1)
+};
+
+let sha1_blocks! !h !m !left !w !s = if left <= 0 { 0 } else {
+    sha256_load! w m 0;
+    sha1_w! w 16;
+    copy_words! h s 5;
+    sha1_rounds! s w 0;
+    add_state! h s 5 mask32 0;
+    sha1_blocks! h (m + 64) (left - 64) w s
+};
+
+let sha1! !p !data !n = {
+    let m = padded! p data n 64 8 true;
+    let total = prim.load64! (p + ctx_scratch);
+    let h = alloc! p (5 * word);
+    prim.store64! h 1732584193;
+    prim.store64! (h + word) 4023233417;
+    prim.store64! (h + 2 * word) 2562383102;
+    prim.store64! (h + 3 * word) 271733878;
+    prim.store64! (h + 4 * word) 3285377520;
+    sha1_blocks! h m total (alloc! p (80 * word)) (alloc! p (5 * word));
+    let out = new_string! p 20;
+    out_be32! (string_bytes out) h 0 5;
+    out
+};
+
+let md5_shift !i = {
+    let group = i / 16;
+    let at = i % 4;
+    if group == 0 { if at == 0 { 7 } else if at == 1 { 12 } else if at == 2 { 17 } else { 22 } }
+    else if group == 1 { if at == 0 { 5 } else if at == 1 { 9 } else if at == 2 { 14 } else { 20 } }
+    else if group == 2 { if at == 0 { 4 } else if at == 1 { 11 } else if at == 2 { 16 } else { 23 } }
+    else { if at == 0 { 6 } else if at == 1 { 10 } else if at == 2 { 15 } else { 21 } }
+};
+
+/// `floor(2^32 * |sin(i + 1)|)`, as RFC 1321 defines the table.
+let md5_k! !i = prim.f2i (prim.fmul (prim.fabs (prim.d1! "sin" (prim.i2f (i + 1)))) (prim.i2f 4294967296));
+
+let md5_rounds! !s !m !i = if i >= 64 { 0 } else {
+    let a = prim.load64! s;
+    let b = prim.load64! (s + word);
+    let c = prim.load64! (s + 2 * word);
+    let d = prim.load64! (s + 3 * word);
+    let group = i / 16;
+    let f = if group == 0 { (b & c) | ((b ^ mask32) & d) }
+            else if group == 1 { (d & b) | ((d ^ mask32) & c) }
+            else if group == 2 { b ^ c ^ d }
+            else { c ^ (b | (d ^ mask32)) };
+    let g = if group == 0 { i } else if group == 1 { (5 * i + 1) % 16 } else if group == 2 { (3 * i + 5) % 16 } else { (7 * i) % 16 };
+    let t = (a + (f & mask32) + md5_k! i + le32! (m + g * 4)) & mask32;
+    prim.store64! s d;
+    prim.store64! (s + 3 * word) c;
+    prim.store64! (s + 2 * word) b;
+    prim.store64! (s + word) ((b + rotl32 t (md5_shift i)) & mask32);
+    md5_rounds! s m (i + 1)
+};
+
+let md5_blocks! !h !m !left !s = if left <= 0 { 0 } else {
+    copy_words! h s 4;
+    md5_rounds! s m 0;
+    add_state! h s 4 mask32 0;
+    md5_blocks! h (m + 64) (left - 64) s
+};
+
+let md5! !p !data !n = {
+    let m = padded! p data n 64 8 false;
+    let total = prim.load64! (p + ctx_scratch);
+    let h = alloc! p (4 * word);
+    prim.store64! h 1732584193;
+    prim.store64! (h + word) 4023233417;
+    prim.store64! (h + 2 * word) 2562383102;
+    prim.store64! (h + 3 * word) 271733878;
+    md5_blocks! h m total (alloc! p (4 * word));
+    let out = new_string! p 16;
+    prim.store32! (string_bytes out) (prim.load64! h);
+    prim.store32! (string_bytes out + 4) (prim.load64! (h + word));
+    prim.store32! (string_bytes out + 8) (prim.load64! (h + 2 * word));
+    prim.store32! (string_bytes out + 12) (prim.load64! (h + 3 * word));
+    out
+};
+
+/// 0 for what is not a hash.
+let alg_code !a =
+    if a == prim.atom "sha256" { 1 } else if a == prim.atom "sha512" { 2 } else if a == prim.atom "sha384" { 3 }
+    else if a == prim.atom "sha1" { 4 } else if a == prim.atom "md5" { 5 } else { 0 };
+
+let hash_bytes! !p !alg !data !n =
+    if alg == 1 { sha256! p data n }
+    else if alg == 2 { sha512_family! p data n h512_text 64 }
+    else if alg == 3 { sha512_family! p data n h384_text 48 }
+    else if alg == 4 { sha1! p data n }
+    else { md5! p data n };
+
+let block_size !alg = if alg == 2 || alg == 3 { 128 } else { 64 };
+
+let hash_string! !p !alg !s = hash_bytes! p alg (string_bytes s) (string_len! s);
+
+let bad_alg! !p fn_name = fail_value! p atom_type_error (concat2! p (text_of! p fn_name) (text_of! p " needs a hash: :md5, :sha1, :sha256, :sha384 or :sha512"));
+
+let crypto_md5! !p !s = if is_string! s { hash_string! p 5 s } else { type_fail! p "digest needs a string" };
+let crypto_sha1! !p !s = if is_string! s { hash_string! p 4 s } else { type_fail! p "digest needs a string" };
+let crypto_sha256! !p !s = if is_string! s { hash_string! p 1 s } else { type_fail! p "digest needs a string" };
+let crypto_sha384! !p !s = if is_string! s { hash_string! p 3 s } else { type_fail! p "digest needs a string" };
+let crypto_sha512! !p !s = if is_string! s { hash_string! p 2 s } else { type_fail! p "digest needs a string" };
+
+let crypto_digest! !p !a !s = {
+    let alg = alg_code a;
+    if alg == 0 { bad_alg! p "digest" } else if is_string! s { hash_string! p alg s } else { type_fail! p "digest needs a string" }
+};
+
+let xor_block! !to !from !n !v = if n == 0 { 0 } else {
+    prim.store8! to (prim.load8! from ^ v);
+    xor_block! (to + 1) (from + 1) (n - 1) v
+};
+
+/// `H(k ^ opad, H(k ^ ipad, m))`, a key longer than a block being hashed first.
+let hmac_bytes! !p !alg !key !msg !n = {
+    let block = block_size alg;
+    let short = if string_len! key > block { hash_string! p alg key } else { key };
+    let padded_key = alloc! p (block + word);
+    prim.c3! "memset" padded_key 0 block;
+    prim.c3! "memcpy" padded_key (string_bytes short) (string_len! short);
+    let inner = alloc! p (block + n + word);
+    xor_block! inner padded_key block 54;
+    prim.c3! "memcpy" (inner + block) msg n;
+    let first = hash_bytes! p alg inner (block + n);
+    let outer = alloc! p (block + string_len! first + word);
+    xor_block! outer padded_key block 92;
+    prim.c3! "memcpy" (outer + block) (string_bytes first) (string_len! first);
+    hash_bytes! p alg outer (block + string_len! first)
+};
+
+let crypto_hmac! !p !a !key !msg = {
+    let alg = alg_code a;
+    if alg == 0 { bad_alg! p "hmac" }
+    else if not (is_string! key && is_string! msg) { type_fail! p "hmac needs a key and a message, both strings" }
+    else { hmac_bytes! p alg key (string_bytes msg) (string_len! msg) }
+};
+
+let pbkdf2_iter! !p !alg !key !u !t !left = if left == 0 { 0 } else {
+    let next = hmac_bytes! p alg key (string_bytes u) (string_len! u);
+    xor_into! (string_bytes t) (string_bytes next) (string_len! next);
+    pbkdf2_iter! p alg key next t (left - 1)
+};
+
+let xor_into! !to !from !n = if n == 0 { 0 } else {
+    prim.store8! to (prim.load8! to ^ prim.load8! from);
+    xor_into! (to + 1) (from + 1) (n - 1)
+};
+
+let pbkdf2_blocks! !p !a !key !salt !iters !state = {
+    let out = prim.load64! state;
+    let wanted = prim.load64! (state + word);
+    let done = prim.load64! (state + 2 * word);
+    if done >= wanted { 0 } else {
+        let alg = alg_code a;
+        let index = prim.load64! (state + 3 * word);
+        let m = alloc! p (string_len! salt + 8 + word);
+        prim.c3! "memcpy" m (string_bytes salt) (string_len! salt);
+        store_be32! (m + string_len! salt) index;
+        let first = hmac_bytes! p alg key m (string_len! salt + 4);
+        let t = str_slice_any! p first (tag_fix 0) (tag_fix (string_len! first));
+        pbkdf2_iter! p alg key first t (iters - 1);
+        let take = if wanted - done < string_len! t { wanted - done } else { string_len! t };
+        prim.c3! "memcpy" (out + done) (string_bytes t) take;
+        prim.store64! (state + 2 * word) (done + take);
+        prim.store64! (state + 3 * word) (index + 1);
+        pbkdf2_blocks! p a key salt iters state
+    }
+};
+
+let crypto_pbkdf2! !p !a !password !salt !iters !len = {
+    if alg_code a == 0 { bad_alg! p "pbkdf2" }
+    else if not (is_string! password && is_string! salt) { type_fail! p "pbkdf2 needs a password and a salt, both strings" }
+    else if not (is_fix iters) || untag_fix iters <= 0 { type_fail! p "pbkdf2 needs a positive iteration count" }
+    else if not (is_fix len) || untag_fix len <= 0 || untag_fix len > 16777216 { type_fail! p "pbkdf2 needs a key length between 1 and 2^24 bytes" }
+    else {
+        let out = new_string! p (untag_fix len);
+        let state = alloc! p (4 * word);
+        prim.store64! state (string_bytes out);
+        prim.store64! (state + word) (untag_fix len);
+        prim.store64! (state + 2 * word) 0;
+        prim.store64! (state + 3 * word) 1;
+        pbkdf2_blocks! p a password salt (untag_fix iters) state;
+        out
+    }
+};
+
+let hkdf_expand! !p !alg !prk !info !out_state = {
+    let out = prim.load64! out_state;
+    let wanted = prim.load64! (out_state + word);
+    let done = prim.load64! (out_state + 2 * word);
+    if done >= wanted { 0 } else {
+        let previous = prim.load64! (out_state + 3 * word);
+        let index = prim.load64! (out_state + 4 * word);
+        let before = string_len! previous;
+        let m = alloc! p (before + string_len! info + 1 + word);
+        prim.c3! "memcpy" m (string_bytes previous) before;
+        prim.c3! "memcpy" (m + before) (string_bytes info) (string_len! info);
+        prim.store8! (m + before + string_len! info) index;
+        let t = hmac_bytes! p alg prk m (before + string_len! info + 1);
+        let take = if wanted - done < string_len! t { wanted - done } else { string_len! t };
+        prim.c3! "memcpy" (out + done) (string_bytes t) take;
+        prim.store64! (out_state + 2 * word) (done + take);
+        prim.store64! (out_state + 3 * word) t;
+        prim.store64! (out_state + 4 * word) (index + 1);
+        hkdf_expand! p alg prk info out_state
+    }
+};
+
+let digest_size !alg = if alg == 1 { 32 } else if alg == 2 { 64 } else if alg == 3 { 48 } else if alg == 4 { 20 } else { 16 };
+
+let crypto_hkdf! !p !a !key !salt !info !len = {
+    let alg = alg_code a;
+    if alg == 0 { bad_alg! p "hkdf" }
+    else if not (is_string! key && is_string! salt && is_string! info) { type_fail! p "hkdf needs a key, a salt and an info, all strings" }
+    else if not (is_fix len) || untag_fix len <= 0 || untag_fix len > 255 * digest_size alg { type_fail! p "hkdf needs a length between 1 and 255 hash lengths" }
+    else {
+        // An empty salt is a block of zeros, which HMAC pads to the same thing.
+        let prk = hmac_bytes! p alg salt (string_bytes key) (string_len! key);
+        let out = new_string! p (untag_fix len);
+        let state = alloc! p (5 * word);
+        prim.store64! state (string_bytes out);
+        prim.store64! (state + word) (untag_fix len);
+        prim.store64! (state + 2 * word) 0;
+        prim.store64! (state + 3 * word) (text_of! p "");
+        prim.store64! (state + 4 * word) 1;
+        hkdf_expand! p alg prk info state;
+        out
+    }
+};
+
+let diff_bytes! !a !b !n !acc = if n == 0 { acc } else {
+    diff_bytes! (a + 1) (b + 1) (n - 1) (acc | (prim.load8! a ^ prim.load8! b))
+};
+
+/// In time that depends on the length only.
+let crypto_equal! !p !a !b =
+    if not (is_string! a && is_string! b) { type_fail! p "equal needs two strings" }
+    else if string_len! a != string_len! b { false_word }
+    else { as_word (diff_bytes! (string_bytes a) (string_bytes b) (string_len! a) 0 == 0) };
+
+let crypto_xor! !p !a !b =
+    if not (is_string! a && is_string! b) { type_fail! p "xor needs two strings" }
+    else if string_len! a != string_len! b { type_fail! p "xor needs two strings of one length" }
+    else {
+        let out = str_slice_any! p a (tag_fix 0) (tag_fix (string_len! a));
+        xor_into! (string_bytes out) (string_bytes b) (string_len! b);
+        out
+    };
+
+let hex_char !v = if v < 10 { 48 + v } else { 87 + v };
+
+let hex_into! !from !to !n = if n == 0 { 0 } else {
+    let b = prim.load8! from;
+    prim.store8! to (hex_char (b >> 4));
+    prim.store8! (to + 1) (hex_char (b & 15));
+    hex_into! (from + 1) (to + 2) (n - 1)
+};
+
+let crypto_hex! !p !s = if not (is_string! s) { type_fail! p "hex needs a string" } else {
+    let out = new_string! p (string_len! s * 2);
+    hex_into! (string_bytes s) (string_bytes out) (string_len! s);
+    out
+};
+
+let nibble !c = if c >= 48 && c <= 57 { c - 48 } else if c >= 97 && c <= 102 { c - 87 } else if c >= 65 && c <= 70 { c - 55 } else { 0 - 1 };
+
+let unhex_into! !from !to !n = if n == 0 { 1 } else {
+    let hi = nibble (prim.load8! from);
+    let lo = nibble (prim.load8! (from + 1));
+    if hi < 0 || lo < 0 { 0 } else {
+        prim.store8! to (hi * 16 + lo);
+        unhex_into! (from + 2) (to + 1) (n - 1)
+    }
+};
+
+let crypto_unhex! !p !s =
+    if not (is_string! s) { type_fail! p "unhex needs a string" }
+    else if string_len! s % 2 != 0 { unit_word }
+    else {
+        let out = new_string! p (string_len! s / 2);
+        if unhex_into! (string_bytes s) (string_bytes out) (string_len! s / 2) == 0 { unit_word } else { out }
+    };
+
+let base64_char !v =
+    if v < 26 { 65 + v } else if v < 52 { 71 + v } else if v < 62 { v - 4 } else if v == 62 { 43 } else { 47 };
+
+let base64_into! !from !to !n = if n <= 0 { 0 } else {
+    let a = prim.load8! from;
+    let b = if n > 1 { prim.load8! (from + 1) } else { 0 };
+    let c = if n > 2 { prim.load8! (from + 2) } else { 0 };
+    prim.store8! to (base64_char (a >> 2));
+    prim.store8! (to + 1) (base64_char (((a & 3) << 4) | (b >> 4)));
+    prim.store8! (to + 2) (if n > 1 { base64_char (((b & 15) << 2) | (c >> 6)) } else { 61 });
+    prim.store8! (to + 3) (if n > 2 { base64_char (c & 63) } else { 61 });
+    base64_into! (from + 3) (to + 4) (n - 3)
+};
+
+let crypto_base64! !p !s = if not (is_string! s) { type_fail! p "base64 needs a string" } else {
+    let out = new_string! p ((string_len! s + 2) / 3 * 4);
+    base64_into! (string_bytes s) (string_bytes out) (string_len! s);
+    out
+};
+
+let sextet !c =
+    if c >= 65 && c <= 90 { c - 65 } else if c >= 97 && c <= 122 { c - 71 } else if c >= 48 && c <= 57 { c + 4 }
+    else if c == 43 { 62 } else if c == 47 { 63 } else { 0 - 1 };
+
+/// Answers how many bytes it wrote, or -1 for what is not base64.
+let unbase64_into! !from !to !left !written =
+    if left == 0 { written }
+    else {
+        let a = sextet (prim.load8! from);
+        let b = sextet (prim.load8! (from + 1));
+        let c3 = prim.load8! (from + 2);
+        let c4 = prim.load8! (from + 3);
+        let c = sextet c3;
+        let d = sextet c4;
+        let pad3 = c3 == 61;
+        let pad4 = c4 == 61;
+        if a < 0 || b < 0 || (c < 0 && not pad3) || (d < 0 && not pad4) || (pad3 && not pad4) || ((pad3 || pad4) && left != 4) { 0 - 1 }
+        else {
+            prim.store8! to ((a << 2) | (b >> 4));
+            if not pad3 { prim.store8! (to + 1) (((b & 15) << 4) | (c >> 2)); };
+            if not pad4 { prim.store8! (to + 2) (((c & 3) << 6) | d); };
+            unbase64_into! (from + 4) (to + 3) (left - 4) (written + (if pad3 { 1 } else if pad4 { 2 } else { 3 }))
+        }
+    };
+
+let crypto_unbase64! !p !s =
+    if not (is_string! s) { type_fail! p "unbase64 needs a string" }
+    else if string_len! s % 4 != 0 { unit_word }
+    else {
+        let out = new_string! p (string_len! s / 4 * 3 + 3);
+        let n = unbase64_into! (string_bytes s) (string_bytes out) (string_len! s) 0;
+        if n < 0 { unit_word } else { str_slice_any! p out (tag_fix 0) (tag_fix n) }
+    };
+
+let fill_random! !at !n = if n <= 0 { 0 } else {
+    let got = prim.c3! "getrandom" at n 0;
+    if got <= 0 { fill_random! at n } else { fill_random! (at + got) (n - got) }
+};
+
+let crypto_random_bytes! !p !n =
+    if not (is_fix n) || untag_fix n < 0 || untag_fix n > 16777216 { type_fail! p "random_bytes! needs a count between 0 and 2^24" }
+    else {
+        let out = new_string! p (untag_fix n);
+        fill_random! (string_bytes out) (untag_fix n);
+        out
+    };
+
+/// The contents of a file, read whole: what `digest!` and `digest_file!` hash.
+let read_file_bytes! !p !path = {
+    let fd = prim.sext32 (prim.c3! "open" (string_bytes path) 524288 0);
+    if fd < 0 { 0 } else {
+        let stat = alloc! p stat_bytes;
+        prim.c2! "fstat" fd stat;
+        let size = stat_size! stat;
+        let s = new_string! p size;
+        read_fully! fd (string_bytes s) size;
+        prim.c1! "close" fd;
+        s
+    }
+};
+
+let read_fully! !fd !at !left = if left <= 0 { 0 } else {
+    let got = prim.c3! "read" fd at left;
+    if got <= 0 { 0 } else { read_fully! fd (at + got) (left - got) }
+};
+
+let crypto_digest_file! !p !a !path = {
+    let alg = alg_code a;
+    if alg == 0 { bad_alg! p "digest_file!" }
+    else if not (is_string! path) { type_fail! p "digest_file! needs a path" }
+    else {
+        if is_directory (stat_kind! p path) {
+            fail_value! p (prim.atom "wrong_kind") (concat2! p (text_of! p "digest_file!: a directory: ") path)
+        } else {
+            let s = read_file_bytes! p path;
+            if s == 0 { fail_path! p "digest_file!" path } else { hash_string! p alg s }
+        }
+    }
+};
+
+let io_digest_file! !p !path = if not (is_string! path) { type_fail! p "digest! needs a path" } else {
+    let s = read_file_bytes! p path;
+    if s == 0 { fail_path! p "digest" path } else { crypto_hex! p (hash_string! p 1 s) }
+};
+
+let io_digest! !p !s = if is_string! s { crypto_hex! p (hash_string! p 1 s) } else { type_fail! p "digest needs a string" };
+
+let int_of_le_bytes! !p !s !i !acc = if i < 0 { acc } else {
+    int_of_le_bytes! p s (i - 1) (int_or_float_op! p 0 (int_or_float_op! p 2 acc (tag_fix 256)) (tag_fix (prim.load8! (string_bytes s + i))))
+};
+
+/// A little-endian byte string as an integer, for the arithmetic of ed25519.
+let le_int! !p !s = int_of_le_bytes! p s (string_len! s - 1) (tag_fix 0);
+
+// --- trunks --------------------------------------------------------------------------------
+//
+// A window on a map from positions to elements: `[first, length, map]`. A push, a prepend
+// and a set are a path copied, and a slice shares everything. The VM's trunks choose a
+// representation by watching the program; this one is the same everywhere, and is what
+// the operations promise, which is that an old version still reads as it was.
+
+let new_trunk! !p !first !n !m = {
+    let o = alloc! p (4 * word);
+    prim.store64! o (prim.info "trunk");
+    prim.store64! (o + word) first;
+    prim.store64! (o + 2 * word) n;
+    prim.store64! (o + 3 * word) m;
+    o
+};
+
+let is_trunk! !v = is_kind! v kind_trunk;
+let trunk_first! !t = untag_fix (prim.load64! (t + word));
+let trunk_size! !t = untag_fix (prim.load64! (t + 2 * word));
+let trunk_map! !t = prim.load64! (t + 3 * word);
+
+let trunk_empty! !p !unit = new_trunk! p (tag_fix 0) (tag_fix 0) (map_empty! p);
+
+let trunk_len! !p !t = if is_trunk! t { prim.load64! (t + 2 * word) } else { type_fail! p "trunk.len needs a trunk" };
+
+/// The element, unforced.
+let trunk_read! !p !i !t = {
+    if not (is_trunk! t) { type_fail! p "trunk.at needs a trunk" }
+    else if not (is_fix i) || untag_fix i < 0 || untag_fix i >= trunk_size! t {
+        fail! p atom_out_of_bounds "trunk.at: no element at that position"
+    } else {
+        let k = tag_fix (trunk_first! t + untag_fix i);
+        prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0 + 3 * word)
+    }
+};
+
+let trunk_push! !p !x !t = if not (is_trunk! t) { type_fail! p "trunk.push needs a trunk" } else {
+    new_trunk! p (prim.load64! (t + word)) (tag_fix (trunk_size! t + 1))
+        (map_put! p (trunk_map! t) (tag_fix (trunk_first! t + trunk_size! t)) x)
+};
+
+let trunk_cons! !p !x !t = if not (is_trunk! t) { type_fail! p "trunk.cons needs a trunk" } else {
+    new_trunk! p (tag_fix (trunk_first! t - 1)) (tag_fix (trunk_size! t + 1))
+        (map_put! p (trunk_map! t) (tag_fix (trunk_first! t - 1)) x)
+};
+
+let trunk_set! !p !i !x !t = {
+    if not (is_trunk! t) { type_fail! p "trunk.set needs a trunk" }
+    else if not (is_fix i) || untag_fix i < 0 || untag_fix i >= trunk_size! t {
+        fail! p atom_out_of_bounds "trunk.set: no element at that position"
+    } else {
+        new_trunk! p (prim.load64! (t + word)) (prim.load64! (t + 2 * word))
+            (map_put! p (trunk_map! t) (tag_fix (trunk_first! t + untag_fix i)) x)
+    }
+};
+
+let trunk_slice! !p !a !b !t = {
+    if not (is_trunk! t) { type_fail! p "trunk.slice needs a trunk" }
+    else if not (is_fix a && is_fix b) { type_fail! p "trunk.slice needs integer bounds" }
+    else {
+        let n = trunk_size! t;
+        let from = clamp (untag_fix a) 0 n;
+        let to = clamp (untag_fix b) from n;
+        new_trunk! p (tag_fix (trunk_first! t + from)) (tag_fix (to - from)) (trunk_map! t)
+    }
+};
+
+let trunk_list_from! !p !t !i !tail = if i < 0 { tail } else {
+    let k = tag_fix (trunk_first! t + i);
+    trunk_list_from! p t (i - 1) (new_cons! p (prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0 + 3 * word)) tail)
+};
+
+let trunk_to_list! !p !t = if is_trunk! t { trunk_list_from! p t (trunk_size! t - 1) nil_word } else { type_fail! p "trunk.to_list needs a trunk" };
+
+let esc_size! !s !n !acc = if n == 0 { acc } else {
+    let b = prim.load8! s;
+    esc_size! (s + 1) (n - 1) (acc + (if b == 34 || b == 92 || b == 10 || b == 9 { 2 } else { 1 }))
+};
+
+let esc_into! !from !to !n = if n == 0 { 0 } else {
+    let b = prim.load8! from;
+    if b == 34 || b == 92 || b == 10 || b == 9 {
+        prim.store8! to 92;
+        prim.store8! (to + 1) (if b == 10 { 110 } else if b == 9 { 116 } else { b });
+        esc_into! (from + 1) (to + 2) (n - 1)
+    } else {
+        prim.store8! to b;
+        esc_into! (from + 1) (to + 1) (n - 1)
+    }
+};
+
+/// What a string is inside a list: a quote, a backslash, a newline and a tab said as
+/// they are written.
+let escape_string! !p !v = {
+    let out = new_string! p (esc_size! (string_bytes v) (string_len! v) 0);
+    esc_into! (string_bytes v) (string_bytes out) (string_len! v);
+    out
+};
+
+let to_existing_atom! !p !v = if not (is_string! v) { type_fail! p "to_existing_atom needs a string" } else { atom_named_from! p v };
+let atom_named_from! !p !v = atom_named! p v 0 (prim.load64! (prim.info "atom_count"));
+
+let atom_named! !p !v !i !n =
+    if i >= n { unit_word }
+    else if string_eq! v (prim.load64! (prim.info "atoms" + i * word)) { i * 256 + 26 }
+    else { atom_named! p v (i + 1) n };
+
+/// Natives the library stands in for when it has nothing faster: `()` sends `json.parse`
+/// to its own walk, which is exact, and is the whole of what a decoder needs to be.
+let json_decode! !p !text = unit_word;
+
+let no_shared_bytes! !p !unit = tag_fix 0;
+let release_nothing! !p !v = unit_word;
+
+// --- regular expressions --------------------------------------------------------------------
+//
+// `vm.regex_run code subject from mode`, whose program `std.regex` compiles (the layout is
+// at the head of dream/src/regex.cpp, which is the same format). A Pike VM: threads in
+// lockstep in a sparse set with a row of captures each, so it is linear in the text and
+// never backtracks. The VM also keeps a lazy DFA for speed; that is a thing to add here
+// when a program measures it, not a difference in what a match is.
+
+let rx_prog = 0;
+let rx_ninsts = 8;
+let rx_classes = 16;
+let rx_ncap = 24;
+let rx_s = 32;
+let rx_n = 40;
+let rx_a = 48;
+let rx_b = 56;
+let rx_work = 64;
+let rx_best = 72;
+let rx_stack = 80;
+let rx_starts = 88;
+let rx_prefix = 96;
+let rx_prefix_len = 104;
+let rx_bytes = 112;
+
+let rx_u32! !at = prim.load32! at;
+let rx_i32! !at = prim.sext32 (prim.load32! at);
+
+let inst_at !r !pc = r + pc * 9;
+let inst_op! !insts !pc = prim.load8! (insts + pc * 9);
+let inst_a! !insts !pc = rx_i32! (insts + pc * 9 + 1);
+let inst_b! !insts !pc = rx_i32! (insts + pc * 9 + 5);
+
+/// The address of each class, walked once at the start of a run.
+let rx_walk_classes! !table !at !i !n = if i >= n { at } else {
+    prim.store64! (table + i * word) at;
+    rx_walk_classes! table (at + 5 + rx_u32! (at + 1) * 8) (i + 1) n
+};
+
+let in_ranges! !at !c !left = left > 0 && ((rx_u32! at <= c && c <= rx_u32! (at + 4)) || in_ranges! (at + 8) c (left - 1));
+
+let class_has! !cls !c = {
+    let found = in_ranges! (cls + 5) c (rx_u32! (cls + 1));
+    if prim.load8! cls != 0 { not found } else { found }
+};
+
+let consumes! !r !pc !c = {
+    let insts = prim.load64! (r + rx_prog);
+    let op = inst_op! insts pc;
+    if op == 0 { inst_a! insts pc == c }
+    else if op == 1 { c != 10 }
+    else if op == 2 { true }
+    else if op == 3 { class_has! (prim.load64! (prim.load64! (r + rx_classes) + inst_a! insts pc * word)) c }
+    else { false }
+};
+
+let list_new! !p !ninsts !ncap = {
+    let l = alloc! p (4 * word);
+    prim.store64! l 0;
+    prim.store64! (l + word) (alloc! p (ninsts * word));
+    prim.store64! (l + 2 * word) (alloc! p (ninsts * word));
+    prim.store64! (l + 3 * word) (alloc! p (ninsts * ncap * word + word));
+    l
+};
+
+let list_has! !l !pc = {
+    let at = prim.load64! (prim.load64! (l + word) + pc * word);
+    prim.ult at (prim.load64! l) && prim.load64! (prim.load64! (l + 2 * word) + at * word) == pc
+};
+
+let list_insert! !l !pc = {
+    let at = prim.load64! l;
+    prim.store64! (prim.load64! (l + word) + pc * word) at;
+    prim.store64! (prim.load64! (l + 2 * word) + at * word) pc;
+    prim.store64! l (at + 1);
+    at
+};
+
+let is_word_byte! !s !n !i = i >= 0 && i < n && {
+    let b = prim.load8! (s + i);
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+};
+
+let holds! !r !kind !pos = {
+    let s = prim.load64! (r + rx_s);
+    let n = prim.load64! (r + rx_n);
+    if kind == 0 { pos == 0 }
+    else if kind == 1 { pos >= n }
+    else if kind == 2 { pos == 0 || prim.load8! (s + pos - 1) == 10 }
+    else if kind == 3 { pos >= n || prim.load8! (s + pos) == 10 }
+    else if kind == 4 { is_word_byte! s n (pos - 1) != is_word_byte! s n pos }
+    else { is_word_byte! s n (pos - 1) == is_word_byte! s n pos }
+};
+
+/// Everything from `pc` that needs no character. `stack` holds `[pc, slot, value]`, a
+/// slot of -1 meaning nothing to restore: `a{0,1000}` is a chain of a thousand splits, and
+/// this walks them without a machine stack to run out of.
+let rx_add! !r !l !pos !sp = {
+    let stack = prim.load64! (r + rx_stack);
+    if sp == 0 { 0 } else {
+        let at = stack + (sp - 1) * 3 * word;
+        let pc = prim.load64! at;
+        let slot = prim.load64! (at + word);
+        let saved = prim.load64! (at + 2 * word);
+        let work = prim.load64! (r + rx_work);
+        if slot >= 0 { prim.store64! (work + slot * word) saved; };
+        if slot >= 0 || list_has! l pc { rx_add! r l pos (sp - 1) }
+        else {
+            let row = list_insert! l pc;
+            let insts = prim.load64! (r + rx_prog);
+            let op = inst_op! insts pc;
+            if op == 5 {
+                rx_push! stack (sp - 1) (inst_a! insts pc) (0 - 1) 0;
+                rx_add! r l pos sp
+            } else if op == 4 {
+                rx_push! stack (sp - 1) (inst_b! insts pc) (0 - 1) 0;
+                rx_push! stack sp (inst_a! insts pc) (0 - 1) 0;
+                rx_add! r l pos (sp + 1)
+            } else if op == 6 {
+                let cap = inst_a! insts pc;
+                rx_push! stack (sp - 1) 0 cap (prim.load64! (work + cap * word));
+                prim.store64! (work + cap * word) pos;
+                rx_push! stack sp (pc + 1) (0 - 1) 0;
+                rx_add! r l pos (sp + 1)
+            } else if op == 7 {
+                if holds! r (inst_a! insts pc) pos {
+                    rx_push! stack (sp - 1) (pc + 1) (0 - 1) 0;
+                    rx_add! r l pos sp
+                } else { rx_add! r l pos (sp - 1) }
+            } else {
+                let ncap = prim.load64! (r + rx_ncap);
+                copy_words! work (prim.load64! (l + 3 * word) + row * ncap * word) ncap;
+                rx_add! r l pos (sp - 1)
+            }
+        }
+    }
+};
+
+let rx_push! !stack !sp !pc !slot !value = {
+    let at = stack + sp * 3 * word;
+    prim.store64! at pc;
+    prim.store64! (at + word) slot;
+    prim.store64! (at + 2 * word) value;
+    0
+};
+
+let rx_start_thread! !r !l !pc !pos = {
+    rx_push! (prim.load64! (r + rx_stack)) 0 pc (0 - 1) 0;
+    rx_add! r l pos 1
+};
+
+/// One step of every thread on the character at `pos`. Answers whether any matched.
+let rx_step! !r !clist !nlist !i !c !meta = {
+    // `meta` holds pos, width and at_end, since this already takes all the registers.
+    if i >= prim.load64! clist { 0 } else {
+        let pc = prim.load64! (prim.load64! (clist + 2 * word) + i * word);
+        let ncap = prim.load64! (r + rx_ncap);
+        let row = prim.load64! (clist + 3 * word) + i * ncap * word;
+        if inst_op! (prim.load64! (r + rx_prog)) pc == 8 {
+            copy_words! row (prim.load64! (r + rx_best)) ncap;
+            1
+        } else {
+            if prim.load64! (meta + 2 * word) == 0 && consumes! r pc c {
+                copy_words! row (prim.load64! (r + rx_work)) ncap;
+                rx_start_thread! r nlist (pc + 1) (prim.load64! meta + prim.load64! (meta + word));
+            };
+            rx_step! r clist nlist (i + 1) c meta
+        }
+    }
+};
+
+let rx_next_start! !r !pos = {
+    let starts = prim.load64! (r + rx_starts);
+    let s = prim.load64! (r + rx_s);
+    let n = prim.load64! (r + rx_n);
+    if starts == 0 || pos >= n { pos }
+    else {
+        let b = prim.load8! (s + pos);
+        if prim.load8! (starts + b / 8) >> (b % 8) & 1 == 1 { pos } else { rx_next_start! r (pos + 1) }
+    }
+};
+
+let rx_fill! !at !n !v = if n == 0 { 0 } else {
+    prim.store64! at v;
+    rx_fill! (at + word) (n - 1) v
+};
+
+/// The loop of a search: threads are carried in `state`, because a loop with this much in
+/// hand does not fit in registers. Answers whether something matched.
+let rx_loop! !r !from !anchored !pos !matched !clist = {
+    let n = prim.load64! (r + rx_n);
+    let other = if clist == prim.load64! (r + rx_a) { prim.load64! (r + rx_b) } else { prim.load64! (r + rx_a) };
+    let idle = prim.load64! clist == 0 && matched == 0;
+    if idle && anchored != 0 && pos != from { 0 }
+    else {
+        let at = if idle && anchored == 0 { rx_next_start! r pos } else { pos };
+        if at > n { 0 } else {
+            if matched == 0 && (anchored == 0 || at == from) {
+                rx_fill! (prim.load64! (r + rx_work)) (prim.load64! (r + rx_ncap)) (0 - 1);
+                rx_start_thread! r clist 0 at;
+            };
+            let s = prim.load64! (r + rx_s);
+            let at_end = at >= n;
+            let width = if at_end { 0 } else { utf8_len! s n at };
+            let c = if at_end { 0 } else { utf8_value! s at width };
+            prim.store64! other 0;
+            let meta = r + rx_bytes;
+            prim.store64! meta at;
+            prim.store64! (meta + word) width;
+            prim.store64! (meta + 2 * word) (if at_end { 1 } else { 0 });
+            let hit = rx_step! r clist other 0 c meta;
+            let now = if hit != 0 { 1 } else { matched };
+            if at_end { now }
+            else if prim.load64! other == 0 && now != 0 { now }
+            else { rx_loop! r from anchored (at + width) now other }
+        }
+    }
+};
+
+let rx_search! !r !from !anchored = {
+    prim.store64! (prim.load64! (r + rx_a)) 0;
+    prim.store64! (prim.load64! (r + rx_b)) 0;
+    rx_loop! r from anchored from 0 (prim.load64! (r + rx_a))
+};
+
+/// The program read, and everything a run needs, or 0 for bytes that are not one.
+let rx_open! !p !code !s = {
+    let c = string_bytes code;
+    if string_len! code < 12 || prim.load32! c != 827871812 { 0 } else {
+        let groups = rx_u32! (c + 4);
+        let ninsts = rx_u32! (c + 8);
+        let ncap = 2 * groups;
+        let r = alloc! p (rx_bytes + 3 * word);
+        let insts = c + 12;
+        prim.store64! (r + rx_prog) insts;
+        prim.store64! (r + rx_ninsts) ninsts;
+        prim.store64! (r + rx_ncap) ncap;
+        let classes_at = insts + ninsts * 9;
+        let nclasses = rx_u32! classes_at;
+        let table = alloc! p (nclasses * word + word);
+        prim.store64! (r + rx_classes) table;
+        let after = rx_walk_classes! table (classes_at + 4) 0 nclasses;
+        let prefix_len = rx_u32! after;
+        let has_starts_at = after + 4 + prefix_len;
+        prim.store64! (r + rx_starts) (if prim.load8! has_starts_at != 0 { has_starts_at + 1 } else { 0 });
+        prim.store64! (r + rx_s) (string_bytes s);
+        prim.store64! (r + rx_n) (string_len! s);
+        prim.store64! (r + rx_a) (list_new! p ninsts ncap);
+        prim.store64! (r + rx_b) (list_new! p ninsts ncap);
+        prim.store64! (r + rx_work) (alloc! p (ncap * word + word));
+        prim.store64! (r + rx_best) (alloc! p (ncap * word + word));
+        prim.store64! (r + rx_stack) (alloc! p ((2 * ninsts + ncap + 8) * 3 * word));
+        r
+    }
+};
+
+let rx_captures! !p !r = {
+    let ncap = prim.load64! (r + rx_ncap);
+    let a = new_array! p ncap;
+    rx_copy_caps! (prim.load64! (r + rx_best)) (a + 2 * word) ncap;
+    a
+};
+
+let rx_copy_caps! !from !to !n = if n == 0 { 0 } else {
+    prim.store64! to (tag_fix (prim.load64! from));
+    rx_copy_caps! (from + word) (to + word) (n - 1)
+};
+
+/// After an empty match the next search starts a character on, so `a*` over "baa" finds
+/// "", "aa" and "". Answers the next place, or -1 when there is no more text.
+let rx_after! !r = {
+    let best = prim.load64! (r + rx_best);
+    let start = prim.load64! best;
+    let stop = prim.load64! (best + word);
+    let n = prim.load64! (r + rx_n);
+    if stop > start { stop }
+    else if stop < n { stop + utf8_len! (prim.load64! (r + rx_s)) n stop }
+    else { 0 - 1 }
+};
+
+let rx_all! !p !r !at !mode !count !found =
+    if at < 0 || at > prim.load64! (r + rx_n) || rx_search! r at 0 == 0 {
+        if mode == 3 { tag_fix count } else { reverse_onto! p found nil_word }
+    } else {
+        let next = rx_after! r;
+        rx_all! p r next mode (count + 1) (if mode == 2 { new_cons! p (rx_captures! p r) found } else { found })
+    };
+
+let reverse_onto! !p !xs !acc = if xs == nil_word { acc } else {
+    reverse_onto! p (prim.load64! (xs + 2 * word)) (new_cons! p (prim.load64! (xs + word)) acc)
+};
+
+let regex_run! !p !code !s !from !mode = {
+    if not (is_string! code) { type_fail! p "regex_run needs a compiled program" }
+    else if not (is_string! s) { type_fail! p "regex_run needs a string to search" }
+    else if not (is_fix from && is_fix mode) { type_fail! p "regex_run needs an offset and a mode" }
+    else {
+        let at = untag_fix from;
+        let m = untag_fix mode;
+        let r = rx_open! p code s;
+        if r == 0 { type_fail! p "regex_run was given bytes that are not a compiled pattern" }
+        else if at < 0 || at > string_len! s {
+            if m == 0 { false_word } else if m == 2 { nil_word } else if m == 3 { tag_fix 0 } else { unit_word }
+        }
+        else if m == 0 { as_word (rx_search! r at 0) }
+        else if m == 1 { if rx_search! r at 0 != 0 { rx_captures! p r } else { unit_word } }
+        else if m == 4 { if rx_search! r at 1 != 0 { rx_captures! p r } else { unit_word } }
+        else { rx_all! p r at m 0 nil_word }
+    }
+};
