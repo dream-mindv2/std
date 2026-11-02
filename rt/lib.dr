@@ -164,21 +164,23 @@ let lists_equal xs ys = match [xs, ys] {
     _ => false,
 };
 
-let equal a b = match [type_of a, type_of b] {
-    [:list, :list] => lists_equal a b,
-    [:array, :array] => lists_equal (native.array_to_list a) (native.array_to_list b),
-    [:trunk, :trunk] => lists_equal (native.trunk_to_list a) (native.trunk_to_list b),
-    [:map, :map] => native.size a == native.size b && map_within (native.map_pairs a) b,
-    [:error, :error] => native.error_kind a == native.error_kind b && native.error_payload a == native.error_payload b,
-    [:integer, :integer] => false,
-    [:string, :string] => false,
-    [:float, :float] => false,
-    [:pure_fn, :pure_fn] => false,
-    [:impure_fn, :impure_fn] => false,
+// One match on one type: a match on the pair of them is a test for every row against both, and came
+// to a third of the code in a program that only says hello. The runtime asks only when the two
+// are not the same word, so of these, scalars are simply different.
+let equal a b = match type_of a {
+    :list => type_of b == :list && lists_equal a b,
+    :array => type_of b == :array && lists_equal (native.array_to_list a) (native.array_to_list b),
+    :trunk => type_of b == :trunk && lists_equal (native.trunk_to_list a) (native.trunk_to_list b),
+    :map => type_of b == :map && native.size a == native.size b && map_within (native.map_pairs a) b,
+    :error => type_of b == :error && native.error_kind a == native.error_kind b && native.error_payload a == native.error_payload b,
+    :integer => false,
+    :string => false,
+    :float => false,
+    :pure_fn => false,
+    :impure_fn => false,
     _ => native.is_record_value a && native.is_record_value b && native.record_id a == native.record_id b
          && lists_equal (native.array_to_list (native.record_fields a)) (native.array_to_list (native.record_fields b)),
 };
-
 let map_within ps m = match ps {
     [] => true,
     [[k, v], ..rest] => match native.match_key m k {
@@ -1984,3 +1986,15 @@ let ffi_free! a = native.ffi_raw_free a;
 let ffi_read_cstr! a = native.ffi_read_text a;
 let ffi_read_u8! a i = native.ffi_peek_at 6 (a + i);
 let ffi_write_u8! a i v = native.ffi_store_at 6 (a + i) v;
+
+// --- std.os, what takes lists ---------------------------------------------------------------------
+
+let os_replace! program args = native.replace_start program (forced_array args);
+
+let os_pty_spawn! program args env dir cols rows =
+    if not (valid_env env) { () }
+    else if type_of cols != :integer || type_of rows != :integer || cols < 1 || rows < 1 || cols > 65535 || rows > 65535 {
+        lib_raise (native.error_new :bad_argument "pty_spawn! needs a size of 1 to 65535 columns and rows")
+    } else {
+        native.pty_start (forced_array [program, forced_array args, forced_array env, dir, cols, rows])
+    };

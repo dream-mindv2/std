@@ -76,7 +76,8 @@ let ctx_wait_ids = 320;
 let ctx_wait_count = 328;
 let ctx_wait_cap = 336;
 let ctx_poll_tick = 344;
-let ctx_size = 352;
+let ctx_ptys = 352;
+let ctx_size = 368;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -6331,4 +6332,169 @@ let sort_prim! !p !keys !items = {
         prim.c1! "free" b;
         out
     }
+};
+
+// --- a program on a terminal of its own, and replacing this one -----------------------------------
+//
+// As `os_pty_spawn` in dream/src/os.cpp, in the same order and for the same reasons: the far side is
+// opened here too and held until the child has run, because a reader that got in first on a master
+// nobody else has open is told the session ended. The numbers are Linux's.
+
+let tiocswinsz = 21524;
+let tiocsctty = 21518;
+
+let pty_window! !p !cols !rows = {
+    let ws = alloc! p word;
+    prim.store64! ws 0;
+    prim.store16! ws (untag_fix rows);
+    prim.store16! (ws + 2) (untag_fix cols);
+    ws
+};
+
+let reset_signals! !n = if n >= 32 { 0 } else {
+    prim.c2! "signal" n 0;
+    reset_signals! (n + 1)
+};
+
+let report_child! !p !fd !step = {
+    let e = alloc! p word;
+    prim.store32! e step;
+    prim.store32! (e + 4) (errno! ());
+    prim.c3! "write" fd e 8;
+    prim.c1! "_exit" 127
+};
+
+/// In the child, past `fork`. Each step that fails says which it was.
+let pty_child! !p !master !slave !spec !report = {
+    reset_signals! 1;
+    if prim.sext32 (prim.c0! "setsid") < 0 { report_child! p report 0 };
+    if prim.sext32 (prim.c3! "ioctl" slave tiocsctty 0) < 0 { report_child! p report 1 };
+    prim.c2! "dup2" slave 0;
+    prim.c2! "dup2" slave 1;
+    prim.c2! "dup2" slave 2;
+    if slave > 2 { prim.c1! "close" slave; };
+    prim.c1! "close" master;
+    let dir = prim.load64! (spec + (2 + 3) * word);
+    if string_len! dir != 0 && prim.sext32 (prim.c1! "chdir" (string_bytes dir)) != 0 { report_child! p report 3 };
+    let env = prim.load64! (spec + (2 + 2) * word);
+    child_env! env 0 (untag_fix (prim.load64! (env + word)));
+    let program = prim.load64! (spec + 2 * word);
+    prim.c2! "execvp" (string_bytes program) (c_argv! p (prim.load64! (spec + (2 + 1) * word)) program);
+    report_child! p report 4
+};
+
+let pty_refused! !p !program !step !code = fail_value! p (if code == 2 { prim.atom "not_found" } else if code == 13 { prim.atom "permission_denied" } else { prim.atom "io_error" })
+    (concat3! p (text_of! p "cannot run `") program
+        (text_of! p (if code == 2 { "`: it is not on PATH" } else if step == 3 { "`: cannot enter its directory" } else if step < 3 { "`: cannot give it its terminal" } else { "`: cannot run it" })));
+
+/// `spec` is `[program, args, env, dir, cols, rows]`, all forced. `[handle, pid]`.
+let pty_start! !p !spec = {
+    let program = prim.load64! (spec + 2 * word);
+    let master = prim.sext32 (prim.c1! "posix_openpt" 258);
+    let name = alloc! p 128;
+    if master < 0 || prim.sext32 (prim.c1! "grantpt" master) != 0 || prim.sext32 (prim.c1! "unlockpt" master) != 0
+        || prim.sext32 (prim.c3! "ptsname_r" master name 128) != 0 {
+        fail_value! p (prim.atom "io_error") (text_of! p "cannot open a terminal")
+    } else {
+        prim.c3! "fcntl" master 2 1;
+        prim.c3! "ioctl" master tiocswinsz (pty_window! p (prim.load64! (spec + (2 + 4) * word)) (prim.load64! (spec + (2 + 5) * word)));
+        let slave = prim.sext32 (prim.c2! "open" name (258 + 524288));
+        let report = pipe_pair! p;
+        let pid = prim.sext32 (prim.c0! "fork");
+        if pid == 0 { pty_child! p master slave spec (prim.load32! (report + 4)) }
+        else {
+            prim.c1! "close" (prim.load32! (report + 4));
+            let told = alloc! p word;
+            let got = prim.sext32 (prim.c3! "read" (prim.load32! report) told 8);
+            prim.c1! "close" (prim.load32! report);
+            prim.c1! "close" slave;
+            if pid < 0 { prim.c1! "close" master; fail_value! p (prim.atom "io_error") (text_of! p "cannot start a process") }
+            else if got == 8 {
+                prim.c3! "waitpid" pid 0 0;
+                prim.c1! "close" master;
+                pty_refused! p program (prim.load32! told) (prim.load32! (told + 4))
+            } else {
+                pty_note! p pid;
+                set_nonblocking! master;
+                new_cons! p (add_handle! p master kind_stream_handle) (new_cons! p (tag_fix pid) nil_word)
+            }
+        }
+    }
+};
+
+/// Which children are terminals' programs: a pid that is not one names nothing here, and must not
+/// be signalled. A list in memory of its own, as there are never many.
+let pty_note! !p !pid = {
+    let cell = prim.c1! "malloc" (2 * word);
+    prim.store64! cell pid;
+    prim.store64! (cell + word) (prim.load64! (p + ctx_ptys));
+    prim.store64! (p + ctx_ptys) cell;
+    0
+};
+
+let pty_known! !cell !pid = cell != 0 && (prim.load64! cell == pid || pty_known! (prim.load64! (cell + word)) pid);
+
+let pty_forget! !link !cell !pid = if cell == 0 { 0 }
+    else if prim.load64! cell == pid {
+        prim.store64! link (prim.load64! (cell + word));
+        prim.c1! "free" cell;
+        0
+    } else { pty_forget! (cell + word) (prim.load64! (cell + word)) pid };
+
+let pty_unknown! !p = fail_value! p (prim.atom "not_found") (text_of! p "no terminal's program has this pid");
+
+let pty_resize! !p !h !cols !rows = {
+    let fd = fd_of! p h;
+    if fd < 0 { fail_value! p (prim.atom "io_closed") (text_of! p "this terminal is closed") }
+    else {
+        prim.c3! "ioctl" fd tiocswinsz (pty_window! p cols rows);
+        unit_word
+    }
+};
+
+let pty_status! !p !pid = {
+    let id = untag_fix pid;
+    if not (pty_known! (prim.load64! (p + ctx_ptys)) id) { pty_unknown! p } else {
+        let buf = alloc! p word;
+        let got = prim.sext32 (prim.c3! "waitpid" id buf 1);
+        if got == 0 { unit_word } else {
+            pty_forget! (p + ctx_ptys) (prim.load64! (p + ctx_ptys)) id;
+            let status = prim.load32! buf;
+            if got < 0 { tag_fix (0 - 1) }
+            else if status & 127 != 0 { tag_fix (0 - (status & 127)) }
+            else { tag_fix ((status >> 8) & 255) }
+        }
+    }
+};
+
+let signal_number! !name =
+    if name == prim.atom "hangup" { 1 } else if name == prim.atom "interrupt" { 2 } else if name == prim.atom "quit" { 3 }
+    else if name == prim.atom "kill" { 9 } else if name == prim.atom "terminate" { 15 }
+    else if name == prim.atom "continue" { 18 } else if name == prim.atom "stop" { 19 } else { 0 };
+
+let pty_signal! !p !pid !name = {
+    let id = untag_fix pid;
+    let n = signal_number! name;
+    if not (pty_known! (prim.load64! (p + ctx_ptys)) id) { pty_unknown! p }
+    else if n == 0 { fail_value! p (prim.atom "bad_argument") (text_of! p "that is not a signal pty_signal! sends") }
+    else {
+        // The whole session's process group, as closing a terminal's window does.
+        if prim.sext32 (prim.c2! "kill" (0 - id) n) != 0 { prim.c2! "kill" id n; };
+        unit_word
+    }
+};
+
+let pty_foreground! !p !h = {
+    let fd = fd_of! p h;
+    if fd < 0 { fail_value! p (prim.atom "io_closed") (text_of! p "this terminal is closed") }
+    else {
+        let group = prim.sext32 (prim.c1! "tcgetpgrp" fd);
+        if group > 0 { tag_fix group } else { unit_word }
+    }
+};
+
+/// `os.replace!`: the arguments are an array of strings, and only a failure comes back.
+let replace_start! !p !program !args = {
+    prim.c2! "execvp" (string_bytes program) (c_argv! p args program);
+    fail_path! p "replace" program
 };
