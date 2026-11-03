@@ -85,7 +85,15 @@ let ctx_stacks = 504;
 let ctx_stack_count = 512;
 /// Small cells of raw memory -- a waiting message, a joiner's id -- freed here, to be used again.
 let ctx_cells = 520;
-let ctx_size = 528;
+/// The census's work: shared objects marked and not yet traced, the context it collects a parked
+/// process in, whether that context holds the process's record, and whether this collection reports.
+let ctx_marks = 528;
+let ctx_marks_n = 536;
+let ctx_marks_cap = 544;
+let ctx_census_ctx = 552;
+let ctx_holds_pcb = 560;
+let ctx_reporting = 568;
+let ctx_size = 576;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -313,14 +321,17 @@ let poll_buffer! !p !bytes = {
     prim.load64! (p + ctx_pollbuf)
 };
 
-// --- the shared region --------------------------------------------------------------
+// --- the shared region ---------------------------------------------------------------
 //
 // What every process may read by reference: the value of a CAF, what a process answered, a kill's
-// reason, the table of foreign handles. It is mapped at a fixed address above the executable and
-// grows upwards, one block after another, so that it is one range and the collector's test of an
-// address is one compare against its end. Nothing in it points into a process's heap, which is
-// what lets a collection leave it alone; it is never collected, and holds what a CAF holds anyway.
-// The world block (`prim.info "world"`) is the state no one process owns.
+// reason, a callback's function. It is mapped at a fixed address above the executable and grows
+// upwards, so that it is one range and the collector's test of an address is one compare against
+// its end. Nothing in it points into a process's heap, which is what lets a collection leave it
+// alone. The world block (`prim.info "world"`) is the state no one process owns.
+//
+// It is made of blocks of a megabyte, filled as a message fills segments, a large object taking a
+// run of them. A census (below) finds which blocks anything still reaches; one nothing does is
+// given back to the system and used again, and so the range stays one range.
 
 let w_shared_top = 0;
 let w_shared_hp = 8;
@@ -378,7 +389,24 @@ let w_pool_started = 336;
 let w_pool_pending = 344;
 let w_foreign_head = 352;
 let w_foreign_tail = 360;
-let shared_step = 2097152;
+/// The shared region's blocks, those free, and where promotion writes now (see "the census").
+let w_blocks = 368;
+let w_free_blocks = 376;
+let w_free_n = 384;
+let w_epoch = 392;
+let w_census = 400;
+let w_census_lock = 408;
+let w_census_waiting = 416;
+let w_pids_seen = 424;
+let w_shared_since = 432;
+let w_finished_since = 440;
+let w_shared_live = 448;
+let w_cb_roots = 456;
+let w_shared_cur = 464;
+/// `DREAM_CENSUS_TRACE` set: each round said on standard error.
+let w_census_trace = 472;
+let w_short_cur = 480;
+let w_short_hp = 488;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -387,21 +415,69 @@ let not_heap_limit! () = prim.load64! (world_at! w_shared_top);
 
 let is_heap_object! !v = is_object v && prim.uge v (not_heap_limit! ());
 
-/// The region made larger by at least `bytes`, directly after where it ends.
+let shared_block = 1048576;
+let max_blocks = 16384;
+/// A block's entry: `[state, epoch, marks, marked, head, mode]`, the mode the promotion that
+/// took it was in (`xc_shared` or `xc_short`).
+let block_words = 6;
+let block_unused = 0;
+let block_used = 1;
+let block_free = 2;
+let block_tail = 3;
+
+let block_entry! !i = prim.load64! (world_at! w_blocks) + i * block_words * word;
+let block_index !v = (v - static_limit) / shared_block;
+let block_at !i = static_limit + i * shared_block;
+
+/// The region made larger by `bytes`, directly after where it ends.
 let shared_more! !bytes = {
     let top = prim.load64! (world_at! w_shared_top);
-    let size = round_chunk! bytes shared_step;
     // MAP_FIXED_NOREPLACE: a mapping already there is an answer of another address, not lost data.
-    let at = prim.c6! "mmap" top size 3 1065010 (0 - 1) 0;
-    if at != top { fatal! "dream: the shared region cannot grow\n" } else {
-        prim.store64! (world_at! w_shared_top) (top + size);
-        0
+    let at = prim.c6! "mmap" top bytes 3 1065010 (0 - 1) 0;
+    if at != top || block_index (top + bytes) > max_blocks { fatal! "dream: the shared region cannot grow\n" } else {
+        prim.store64! (world_at! w_shared_top) (top + bytes);
+        top
     }
 };
 
 let shared_init! () = {
     prim.store64! (world_at! w_shared_top) static_limit;
-    prim.store64! (world_at! w_shared_hp) static_limit;
+    prim.store64! (world_at! w_blocks) (prim.c2! "calloc" (max_blocks * block_words) word);
+    prim.store64! (world_at! w_free_blocks) (prim.c2! "calloc" max_blocks word);
+    0
+};
+
+/// A block, or a run of `n` of them for an object that needs it, with the shared lock held:
+/// one freed before if a single will do, and otherwise more of the region.
+let take_blocks! !n !mode = {
+    let free_n = prim.load64! (world_at! w_free_n);
+    let at = if n == 1 && free_n > 0 {
+        prim.store64! (world_at! w_free_n) (free_n - 1);
+        block_at (prim.load64! (prim.load64! (world_at! w_free_blocks) + (free_n - 1) * word))
+    } else { shared_more! (n * shared_block) };
+    let head = block_index at;
+    mark_run! head 0 n;
+    prim.store64! (block_entry! head + 5 * word) mode;
+    prim.store64! at 0;
+    prim.store64! (at + word) (n * shared_block);
+    prim.store64! (at + 2 * word) 0;
+    prim.store64! (at + 3 * word) 0;
+    at
+};
+
+let mark_run! !head !i !n = if i >= n { 0 } else {
+    let e = block_entry! (head + i);
+    prim.store64! e (if i == 0 { block_used } else { block_tail });
+    prim.store64! (e + word) (prim.load64! (world_at! w_epoch));
+    prim.store64! (e + 3 * word) 0;
+    prim.store64! (e + 4 * word) head;
+    mark_run! head (i + 1) n
+};
+
+/// What a promotion writes into is new in this epoch, and no census of it frees it.
+let touch_block! !at = if at == 0 { 0 } else {
+    let head = prim.load64! (block_entry! (block_index at) + 4 * word);
+    prim.store64! (block_entry! head + word) (prim.load64! (world_at! w_epoch));
     0
 };
 
@@ -421,15 +497,26 @@ let shared_init! () = {
 
 let xc_message = 0;
 let xc_shared = 1;
+/// Into the shared region too, but into blocks of their own: what a process answered and a kill's
+/// reason, which go with their process. Mixed with what lives for the run -- a CAF's list, forced a
+/// cell at a time between answers -- one live cell kept every block it was in (see "the census").
+let xc_short = 2;
 /// A segment: `[next, size, end, 0]`, then objects. Taken into a heap, it is a chunk like any
 /// other, as a chunk's header is its first two words.
 let seg_header = 32;
 let first_segment = 512;
 
 let xc_more! !p !bytes =
-    if prim.load64! (p + ctx_xc_mode) == xc_shared {
-        shared_more! (bytes + (prim.load64! (p + ctx_xc_to) - prim.load64! (p + ctx_xc_limit)));
-        prim.store64! (p + ctx_xc_limit) (prim.load64! (world_at! w_shared_top));
+    if prim.load64! (p + ctx_xc_mode) != xc_message {
+        let need = bytes + seg_header;
+        let blk = take_blocks! ((need + shared_block - 1) / shared_block) (prim.load64! (p + ctx_xc_mode));
+        let last = prim.load64! (p + ctx_xc_last);
+        prim.store64! (last + 2 * word) (prim.load64! (p + ctx_xc_to));
+        prim.store64! last blk;
+        prim.store64! (p + ctx_xc_last) blk;
+        prim.store64! (p + ctx_xc_bytes) (prim.load64! (p + ctx_xc_bytes) + prim.load64! (blk + word));
+        prim.store64! (p + ctx_xc_to) (blk + seg_header);
+        prim.store64! (p + ctx_xc_limit) (blk + prim.load64! (blk + word));
         0
     } else {
         let last = prim.load64! (p + ctx_xc_last);
@@ -491,12 +578,18 @@ let xc_copy_object! !p !v !info = {
 };
 
 let xc_evac! !p !v =
-    if not (is_object v) || prim.ult v (not_heap_limit! ()) { v }
+    if not (is_object v) { v }
+    else if prim.ult v (not_heap_limit! ()) {
+        // Left in place: during a census, marked, as this copy may be what moves it past one.
+        if census_on! () { census_mark! p v; };
+        v
+    }
     else {
         let info = prim.load64! v;
         if info & 1 == 1 { info - 1 }
         else {
             let kind = prim.load64! (info + info_kind);
+            if kind == kind_process && census_on! () { census_pid! (untag_fix (prim.load64! (v + word))); };
             if kind == kind_ind { xc_evac! p (prim.load64! (v + word)) }
             else if kind == kind_hole {
                 let e = xc_alloc! p (4 * word);
@@ -506,7 +599,7 @@ let xc_evac! !p !v =
                 prim.store64! (e + 3 * word) unit_word;
                 xc_forward! p v info e
             }
-            else if kind == kind_thunk && prim.load64! (p + ctx_xc_mode) == xc_shared {
+            else if kind == kind_thunk && prim.load64! (p + ctx_xc_mode) != xc_message {
                 // The suspension itself, as data, and the shared thunk that stands for it.
                 let n = object_words! v info;
                 let t = xc_alloc! p (n * word);
@@ -537,10 +630,6 @@ let xc_scan_one! !p !at = {
     n * word
 };
 
-let xc_scan_flat! !p !at = if prim.uge at (prim.load64! (p + ctx_xc_to)) { 0 } else {
-    xc_scan_flat! p (at + xc_scan_one! p at)
-};
-
 let xc_scan_segments! !p !seg !at = {
     let last = prim.load64! (p + ctx_xc_last);
     let stop = if seg == last { prim.load64! (p + ctx_xc_to) } else { prim.load64! (seg + 2 * word) };
@@ -559,6 +648,8 @@ let copy_out! !p !v !mode =
     if not (is_heap_object! v) {
         prim.store64! (p + ctx_xc_first) 0;
         prim.store64! (p + ctx_xc_bytes) 0;
+        // A shared value handed on as itself moves a reference as much as a copy does.
+        if census_on! () { census_mark! p v; mark_drain! p; };
         v
     } else {
         prim.store64! (p + ctx_xc_mode) mode;
@@ -566,33 +657,65 @@ let copy_out! !p !v !mode =
         prim.store64! (p + ctx_xc_last) 0;
         prim.store64! (p + ctx_xc_bytes) 0;
         prim.store64! (p + ctx_xc_log_n) 0;
-        if mode == xc_shared {
-            prim.store64! (p + ctx_xc_to) (prim.load64! (world_at! w_shared_hp));
-            prim.store64! (p + ctx_xc_limit) (prim.load64! (world_at! w_shared_top));
+        let cur_at = world_at! (if mode == xc_short { w_short_cur } else { w_shared_cur });
+        let hp_at = world_at! (if mode == xc_short { w_short_hp } else { w_shared_hp });
+        if mode != xc_message {
+            // Into the block promotion is filling, which is new in this epoch now.
+            if prim.load64! cur_at == 0 {
+                let blk = take_blocks! 1 mode;
+                prim.store64! cur_at blk;
+                prim.store64! hp_at (blk + seg_header);
+            };
+            let cur = prim.load64! cur_at;
+            touch_block! cur;
+            prim.store64! (p + ctx_xc_first) cur;
+            prim.store64! (p + ctx_xc_last) cur;
+            prim.store64! (p + ctx_xc_to) (prim.load64! hp_at);
+            prim.store64! (p + ctx_xc_limit) (cur + prim.load64! (cur + word));
         } else {
             prim.store64! (p + ctx_xc_to) 0;
             prim.store64! (p + ctx_xc_limit) 0;
         };
         let start = prim.load64! (p + ctx_xc_to);
         let out = xc_evac! p v;
-        if mode == xc_shared {
-            xc_scan_flat! p start;
-            prim.store64! (world_at! w_shared_hp) (prim.load64! (p + ctx_xc_to));
+        if mode != xc_message {
+            xc_scan_segments! p (prim.load64! (p + ctx_xc_first)) start;
+            let last = prim.load64! (p + ctx_xc_last);
+            prim.store64! (last + 2 * word) (prim.load64! (p + ctx_xc_to));
+            prim.store64! cur_at last;
+            prim.store64! hp_at (prim.load64! (p + ctx_xc_to));
+            prim.store64! (world_at! w_shared_since) (prim.load64! (world_at! w_shared_since) + prim.load64! (p + ctx_xc_bytes));
+            prim.store64! (p + ctx_xc_first) 0;
+            prim.store64! (p + ctx_xc_bytes) 0;
         } else {
             let first = prim.load64! (p + ctx_xc_first);
             xc_scan_segments! p first (first + seg_header);
             prim.store64! (prim.load64! (p + ctx_xc_last) + 2 * word) (prim.load64! (p + ctx_xc_to));
         };
         xc_restore! (prim.load64! (p + ctx_xc_log)) 0 (prim.load64! (p + ctx_xc_log_n));
+        if census_on! () { mark_drain! p; };
         out
     };
 
-/// `v` where every process may read it. One promotion at a time writes the region.
-let promote! !p !v = if not (is_heap_object! v) { v } else {
+/// `v` where every process may read it, for as long as anything does. One promotion at a time
+/// writes the region.
+let promote! !p !v = promote_as! p v xc_shared;
+
+/// The promotion mode of the block holding `s`; anything static -- a CAF -- lives for the run.
+let shared_mode_of! !s = if prim.ult s static_limit { xc_shared } else {
+    let e = block_entry! (block_index s);
+    prim.load64! (block_entry! (prim.load64! (e + 4 * word)) + 5 * word)
+};
+
+/// `v` promoted with what goes when its process does: an answer, a kill's reason.
+let promote_short! !p !v = promote_as! p v xc_short;
+
+let promote_as! !p !v !mode = if not (is_heap_object! v) { v } else {
     let l = prim.load64! (world_at! w_shared_lock);
     lock! l;
-    let out = copy_out! p v xc_shared;
+    let out = copy_out! p v mode;
     unlock! l;
+    census_maybe! p;
     out
 };
 
@@ -612,6 +735,327 @@ let free_segments! !p !seg = if seg == 0 { 0 } else {
     let next = prim.load64! seg;
     chunk_put! p seg;
     free_segments! p next
+};
+
+// --- the census --------------------------------------------------------------------------
+//
+// Which shared blocks are still reached, and which finished processes still are, found without
+// stopping anything: each process says what it reaches at a collection of its own. A round
+// begins when the region has grown past a threshold, or many processes have finished since the
+// last; every live process is then due to report. One that is running reports at its next
+// collection, which its next function entry is asked for; one that is parked is collected on its
+// behalf, by whoever began the round, holding its record so that nothing can wake it meanwhile.
+// A report marks every shared object the collection meets, traced through the region, and every
+// process id it finds a pid object of. The last report marks what no heap holds: answers, kill
+// reasons, CAFs, foreign handles, callbacks. Then a finished process whose pid nobody holds can be
+// joined by nobody, and goes, record and answer (a failure nobody joined stays, for the report at
+// the end); and a block nothing marked, and nothing wrote to since the round began, is free.
+//
+// A reference must not slip past the round by moving, while it runs, from a process yet to report
+// into one that has. It moves only by being copied -- a message, a spawn, a promotion -- so a copy
+// made during a round marks every shared object it leaves in place and every pid it carries.
+// Reading a CAF or joining is reading a root, which the last report marks.
+
+let census_min = 33554432;
+let census_finished = 65536;
+
+let census_on! () = prim.load64! (world_at! w_census) != 0;
+
+/// The mark of a word in the region, set: answers whether it was not set before.
+let census_mark! !p !v = if not (is_object v) || prim.ult v static_limit || prim.uge v (prim.load64! (world_at! w_shared_top)) { 0 } else {
+    let e = block_entry! (block_index v);
+    let bits0 = prim.load64! (e + 2 * word);
+    let bits = if bits0 != 0 { bits0 } else {
+        let fresh_ = prim.c2! "calloc" (shared_block / word / 8) 1;
+        let old = prim.cas64! (e + 2 * word) 0 fresh_;
+        if old == 0 { fresh_ } else { prim.c1! "free" fresh_; old }
+    };
+    let n = (v - block_at (block_index v)) / word;
+    let at = bits + (n / 64) * word;
+    let bit = 1 << (n & 63);
+    if set_bit! at bit {
+        prim.store64! (e + 3 * word) 1;
+        mark_push! p v;
+    };
+    0
+};
+
+let set_bit! !at !bit = {
+    let old = prim.load64! at;
+    if old & bit != 0 { false }
+    else if prim.cas64! at old (old | bit) == old { true }
+    else { set_bit! at bit }
+};
+
+let mark_push! !p !v = {
+    let n = prim.load64! (p + ctx_marks_n);
+    if n >= prim.load64! (p + ctx_marks_cap) {
+        let cap = if n == 0 { 1024 } else { n * 2 };
+        prim.store64! (p + ctx_marks) (prim.c2! "realloc" (prim.load64! (p + ctx_marks)) (cap * word));
+        prim.store64! (p + ctx_marks_cap) cap;
+    };
+    prim.store64! (prim.load64! (p + ctx_marks) + n * word) v;
+    prim.store64! (p + ctx_marks_n) (n + 1);
+    0
+};
+
+/// A process id met: someone may still join it.
+let census_pid! !id = if id > 0 && id < table_cap {
+    let at = prim.load64! (world_at! w_pids_seen) + (id / 64) * word;
+    set_bit! at (1 << (id & 63));
+    0
+} else { 0 };
+
+/// What is marked, traced: each object's values, and the ids of the pids among them.
+let mark_drain! !p = {
+    let n = prim.load64! (p + ctx_marks_n);
+    if n == 0 { 0 } else {
+        let v = prim.load64! (prim.load64! (p + ctx_marks) + (n - 1) * word);
+        prim.store64! (p + ctx_marks_n) (n - 1);
+        census_trace! p v;
+        mark_drain! p
+    }
+};
+
+let census_trace! !p !v = {
+    let info = prim.load64! v;
+    let kind = prim.load64! (info + info_kind);
+    // A shared thunk claimed, or finished: its suspension or its value.
+    if kind == kind_hole || kind == kind_ind { census_mark! p (prim.load64! (v + word)) }
+    else {
+        if kind == kind_process { census_pid! (untag_fix (prim.load64! (v + word))); };
+        if has_values kind { census_range! p (v + word) (v + object_words! v info * word); };
+        0
+    }
+};
+
+let census_range! !p !at !stop = if prim.uge at stop { 0 } else {
+    census_mark! p (prim.load64! at);
+    census_range! p (at + word) stop
+};
+
+/// What a heap object holds that the census wants, as a collection or a copy meets it.
+let census_heap_object! !p !v !info = {
+    if prim.load64! (info + info_kind) == kind_process { census_pid! (untag_fix (prim.load64! (v + word))); };
+    0
+};
+
+/// Objects laid end to end -- a message's segments -- read for what the census wants.
+let census_objects! !p !at !stop = if prim.uge at stop { 0 } else {
+    let info = prim.load64! at;
+    let n = object_words! at info;
+    let kind = prim.load64! (info + info_kind);
+    if kind == kind_process { census_pid! (untag_fix (prim.load64! (at + word))); };
+    if has_values kind { census_range! p (at + word) (at + n * word); };
+    census_objects! p (at + n * word) stop
+};
+
+let census_segments! !p !seg = if seg == 0 { 0 } else {
+    let stop = prim.load64! (seg + 2 * word);
+    census_objects! p (seg + seg_header) (if stop == 0 { seg + prim.load64! (seg + word) } else { stop });
+    census_segments! p (prim.load64! seg)
+};
+
+/// A round begun, if none is going and one is due.
+let census_maybe! !p = if census_on! () { 0 } else {
+    let grown = prim.load64! (world_at! w_shared_since);
+    let finished = prim.load64! (world_at! w_finished_since);
+    let threshold = if prim.load64! (world_at! w_shared_live) > census_min { prim.load64! (world_at! w_shared_live) } else { census_min };
+    if grown > threshold || finished > census_finished { census_begin! p } else { 0 }
+};
+
+let census_begin! !p = {
+    let l = prim.load64! (world_at! w_census_lock);
+    lock! l;
+    if census_on! () { unlock! l; 0 } else {
+        let round = prim.load64! (world_at! w_epoch) + 1;
+        prim.store64! (world_at! w_epoch) round;
+        prim.store64! (world_at! w_shared_since) 0;
+        prim.store64! (world_at! w_finished_since) 0;
+        prim.c3! "memset" (prim.load64! (world_at! w_pids_seen)) 0 (table_cap / 8);
+        let n = prim.load64! (world_at! w_next_id);
+        // Counted first, and one more than there are, so that no report can end the round while
+        // this is still asking for them.
+        prim.store64! (world_at! w_census_waiting) (due_all! p 1 n round 1);
+        prim.store_rel! (world_at! w_census) round;
+        unlock! l;
+        ask_all! p 1 n round;
+        census_reported! p round
+    }
+};
+
+let due_all! !p !id !n !round !count = if id >= n { count } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && prim.load64! (pcb + pcb_state) != state_done {
+        prim.store64! (pcb + pcb_census_due) round;
+        due_all! p (id + 1) n round (count + 1)
+    } else { due_all! p (id + 1) n round count }
+};
+
+/// Every process due: the parked collected here, the others asked to collect.
+let ask_all! !p !id !n !round = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && pcb != current! p { ask_one! p pcb round; };
+    if pcb != 0 && pcb == current! p { prim.store64! (p + ctx_guard) (0 - 1); };
+    ask_all! p (id + 1) n round
+};
+
+let ask_one! !p !pcb !round = {
+    pcb_lock! pcb;
+    if prim.load64! (pcb + pcb_census_due) == round && prim.load64! (pcb + pcb_state) == state_waiting {
+        // Its collection is its report (`collect!`).
+        census_for! p pcb;
+        pcb_unlock! pcb;
+        0
+    } else {
+        let w = prim.load64! (pcb + pcb_worker);
+        if w != 0 { prim.store64! (w + ctx_guard) (0 - 1); };
+        pcb_unlock! pcb;
+        0
+    }
+};
+
+/// A parked process collected by this worker, in a context kept for the purpose, its record held.
+let census_for! !p !pcb = {
+    let s0 = prim.load64! (p + ctx_census_ctx);
+    let s = if s0 != 0 { s0 } else {
+        let c = prim.c2! "calloc" 1 ctx_size;
+        prim.store64! (c + ctx_classes) (prim.load64! (p + ctx_classes));
+        prim.store64! (c + ctx_timebuf) (prim.load64! (p + ctx_timebuf));
+        prim.store64! (p + ctx_census_ctx) c;
+        c
+    };
+    prim.store64! (s + ctx_current) pcb;
+    prim.store64! (s + ctx_current_id) (tag_fix (prim.load64! (pcb + pcb_id)));
+    prim.store64! (s + ctx_holds_pcb) 1;
+    load_heap! s pcb;
+    collect! s (prim.load64! (pcb + pcb_sp));
+    save_heap! s pcb;
+    prim.store64! (s + ctx_holds_pcb) 0;
+    0
+};
+
+/// One fewer to hear from; the last ends the round.
+let census_reported! !p !round = if prim.load64! (world_at! w_census) != round { 0 } else {
+    if prim.xadd64! (world_at! w_census_waiting) (0 - 1) == 1 { census_finish! p round } else { 0 }
+};
+
+/// A process that was due finishes: it has nothing more to say, and what it answered is a root.
+let census_gone! !p !pcb = {
+    let round = prim.load64! (pcb + pcb_census_due);
+    if round != 0 {
+        prim.store64! (pcb + pcb_census_due) 0;
+        census_reported! p round
+    } else { 0 }
+};
+
+let census_finish! !p !round = {
+    let n = prim.load64! (world_at! w_next_id);
+    mark_roots! p 1 n;
+    let cafs = prim.info "cafs";
+    mark_cafs! p cafs 0 (prim.load64! cafs);
+    mark_foreign! p (prim.load64! (world_at! w_foreign_head));
+    mark_callbacks! p (prim.load64! (world_at! w_cb_roots));
+    mark_drain! p;
+    let reaped = reap! p 2 n 0;
+    let l = prim.load64! (world_at! w_shared_lock);
+    lock! l;
+    let kept = sweep! p 0 (block_index (prim.load64! (world_at! w_shared_top))) round 0;
+    prim.store64! (world_at! w_shared_live) kept;
+    unlock! l;
+    if prim.load64! (world_at! w_census_trace) != 0 { census_trace_line! p round reaped kept; };
+    prim.store_rel! (world_at! w_census) 0;
+    0
+};
+
+let mark_roots! !p !id !n = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 {
+        census_mark! p (prim.load64! (pcb + pcb_result));
+        let k = prim.load64! (pcb + pcb_kill);
+        if k != 0 { census_mark! p k; };
+    };
+    mark_roots! p (id + 1) n
+};
+
+let mark_cafs! !p !table !i !n = if i >= n { 0 } else {
+    let caf = prim.load64! (table + word * (i + 1));
+    census_mark! p (prim.load64! (caf + word));
+    mark_cafs! p table (i + 1) n
+};
+
+let mark_foreign! !p !entry = if entry == 0 { 0 } else {
+    census_range! p (entry + fe_fields) (entry + fe_fields + 5 * word);
+    mark_foreign! p (prim.load64! (entry + fe_next))
+};
+
+let mark_callbacks! !p !cell = if cell == 0 { 0 } else {
+    census_mark! p (prim.load64! (cell + word));
+    mark_callbacks! p (prim.load64! cell)
+};
+
+/// Finished processes nobody can join any more, gone. Answers how many.
+let reap! !p !id !n !count = if id >= n { count } else {
+    let pcb = table_at! p id;
+    if pcb != 0 && prim.load64! (pcb + pcb_state) == state_done && not (pid_seen! id)
+        && not (prim.load64! (pcb + pcb_failed) != 0 && prim.load64! (pcb + pcb_joined) == 0) {
+        prim.store_rel! (prim.load64! (world_at! w_table) + id * word) 0;
+        prim.c1! "free" pcb;
+        reap! p (id + 1) n (count + 1)
+    } else { reap! p (id + 1) n count }
+};
+
+let census_trace_line! !p !round !reaped !kept = {
+    let buf = prim.c1! "malloc" 160;
+    let fmt = "dream: census %ld: %ld processes reaped, %ld KB of the shared region kept, %ld blocks free\n";
+    prim.c6! "snprintf" buf 160 fmt round reaped (kept / 1024) (prim.load64! (world_at! w_free_n));
+    prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+    prim.c1! "free" buf;
+    0
+};
+
+let pid_seen! !id = prim.load64! (prim.load64! (world_at! w_pids_seen) + (id / 64) * word) & (1 << (id & 63)) != 0;
+
+/// Blocks nothing marked and nothing wrote to in this round, freed: answers the bytes kept.
+let sweep! !p !i !n !round !kept = if i >= n { kept } else {
+    let e = block_entry! i;
+    if prim.load64! e != block_used { sweep! p (i + 1) n round kept }
+    else {
+        let len_ = run_length! i (i + 1) n;
+        let keep = prim.load64! (e + word) >= round || run_marked! i len_ || run_holds! i len_ (prim.load64! (world_at! w_shared_cur))
+            || run_holds! i len_ (prim.load64! (world_at! w_short_cur));
+        if keep { clear_marks! i len_; } else { free_run! i len_; };
+        sweep! p (i + len_) n round (if keep { kept + len_ * shared_block } else { kept })
+    }
+};
+
+let run_length! !head !i !n = if i < n && prim.load64! (block_entry! i) == block_tail && prim.load64! (block_entry! i + 4 * word) == head { run_length! head (i + 1) n } else { i - head };
+
+let run_marked! !head !len_ = len_ > 0 && (prim.load64! (block_entry! head + 3 * word) != 0 || run_marked! (head + 1) (len_ - 1));
+
+let run_holds! !head !len_ !at = at != 0 && prim.uge at (block_at head) && prim.ult at (block_at (head + len_));
+
+let clear_marks! !i !len_ = if len_ == 0 { 0 } else {
+    let e = block_entry! i;
+    if prim.load64! (e + 3 * word) != 0 {
+        prim.c3! "memset" (prim.load64! (e + 2 * word)) 0 (shared_block / word / 8);
+        prim.store64! (e + 3 * word) 0;
+    };
+    clear_marks! (i + 1) (len_ - 1)
+};
+
+/// Given back to the system, the pages, and kept as single blocks to be used again.
+let free_run! !i !len_ = if len_ == 0 { 0 } else {
+    let e = block_entry! i;
+    prim.c3! "madvise" (block_at i) shared_block 4;
+    if prim.load64! (e + 2 * word) != 0 { prim.c1! "free" (prim.load64! (e + 2 * word)); };
+    prim.store64! e block_free;
+    prim.store64! (e + 2 * word) 0;
+    prim.store64! (e + 3 * word) 0;
+    let n = prim.load64! (world_at! w_free_n);
+    prim.store64! (prim.load64! (world_at! w_free_blocks) + n * word) i;
+    prim.store64! (world_at! w_free_n) (n + 1);
+    free_run! (i + 1) (len_ - 1)
 };
 
 // --- the collector ----------------------------------------------------------------
@@ -643,7 +1087,11 @@ let copy_words! !from !to !n = if n == 0 { 0 } else {
 };
 
 let evacuate! !p !v =
-    if not (is_object v) || prim.ult v (not_heap_limit! ()) { v }
+    if not (is_object v) { v }
+    else if prim.ult v (not_heap_limit! ()) {
+        if prim.load64! (p + ctx_reporting) != 0 { census_mark! p v; };
+        v
+    }
     else {
         let info = prim.load64! v;
         if info & 1 == 1 { info - 1 }
@@ -652,6 +1100,7 @@ let evacuate! !p !v =
         // by then forwarded, or an immediate.
         else if prim.load64! (info + info_kind) == kind_ind { evacuate! p (prim.load64! (v + word)) }
         else {
+            if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p v info; };
             let n = object_words! v info;
             let to = prim.load64! (p + ctx_to);
             copy_words! v to n;
@@ -692,7 +1141,13 @@ let scan_stack! !p !at !top = if prim.uge at top { 0 } else {
 
 /// The messages a process has taken into its heap, which are its own to move.
 let scan_mail! !p !entry = if entry == 0 { 0 } else {
-    if prim.load64! (entry + mail_segments) == 0 { evacuate_at! p (entry + mail_value); };
+    let segs = prim.load64! (entry + mail_segments);
+    if segs == 0 { evacuate_at! p (entry + mail_value); }
+    else if prim.load64! (p + ctx_reporting) != 0 {
+        // Not taken in yet, and the census still wants what it holds.
+        census_segments! p segs;
+        census_mark! p (prim.load64! (entry + mail_value));
+    };
     scan_mail! p (prim.load64! entry)
 };
 
@@ -706,6 +1161,10 @@ let spare_count! !c !n = if c == 0 { n } else { spare_count! (prim.load64! c) (n
 
 let collect! !p !sp = {
     let pcb = current! p;
+    // Due to the census: this collection is the report.
+    let due = prim.load64! (pcb + pcb_census_due);
+    let reporting = due != 0 && due == prim.load64! (world_at! w_census);
+    prim.store64! (p + ctx_reporting) (if reporting { 1 } else { 0 });
     let old = prim.load64! (p + ctx_chunks);
     let budget = prim.load64! (pcb + pcb_budget);
     let space = round_chunk! (prim.load64! (p + ctx_total) + (if budget >= min_chunk { min_chunk } else { chunk_header })) budget;
@@ -734,6 +1193,12 @@ let collect! !p !sp = {
     let grown = if budget < max_budget { budget * 2 } else { budget };
     prim.store64! (pcb + pcb_budget) (if deep > grown { if deep > min_chunk { min_chunk } else { deep } } else { grown });
     new_chunk! p (live * 2);
+    if reporting {
+        mark_drain! p;
+        prim.store64! (p + ctx_reporting) 0;
+        prim.store64! (pcb + pcb_census_due) 0;
+        census_reported! p due;
+    };
     0
 };
 
@@ -808,7 +1273,8 @@ let code_shared_hole! !p !sp !self !b !c !d =
 
 let frame_shared_update! !p !sp !v !b !c !d = {
     let s = prim.load64! (sp + word);
-    prim.store64! (s + word) (promote! p v);
+    // Its value goes where it is: a thunk inside an answer lives as long as the answer does.
+    prim.store64! (s + word) (promote_as! p v (shared_mode_of! s));
     // The value before the info that says it is there, for a reader on another core.
     prim.store_rel! s (prim.info "ind");
     wake_shared_waiters! p s;
@@ -865,7 +1331,7 @@ let collect_at_entry! !p !sp !a !b !c !d =
         prim.store64! (at + 6 * word) c;
         prim.store64! (at + 7 * word) d;
         let inside_c = prim.load64! (p + ctx_in_callback) != 0;
-        if prim.load64! (p + ctx_want_gc) != 0 && not inside_c { collect! p at; };
+        if (prim.load64! (p + ctx_want_gc) != 0 || prim.load64! (current! p + pcb_census_due) != 0) && not inside_c { collect! p at; };
         prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
         // Asked for by the clock, or by a kill: another's turn, if there is another,
         // and a kill is seen where the process next resumes. One waiting for a time or for
@@ -2628,6 +3094,8 @@ let pcb_woken = 240;
 let pcb_lock = 248;
 /// The worker it is pinned to, or 0: one that has called C runs on that thread from then on.
 let pcb_pinned = 256;
+/// The census round it is to report to, or 0.
+let pcb_census_due = 264;
 let pcb_size = 312;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
@@ -3031,7 +3499,9 @@ let earliest_timer! () = if prim.load64! (world_at! w_wait_count) == 0 { 0 - 1 }
 let expire_timers! !p !now = if prim.load64! (world_at! w_wait_count) == 0 || prim.load64! (timer_at! 0) > now { 0 } else {
     let id = prim.load64! (timer_at! 0 + word);
     timer_pop! ();
-    expire! p (table_at! p id) now;
+    let pcb = table_at! p id;
+    // Gone, if the census reaped it: a finished process waits for nothing.
+    if pcb != 0 { expire! p pcb now; };
     expire_timers! p now
 };
 
@@ -3180,13 +3650,16 @@ let fd_ready! !p !fd = {
 let wake_fd_waiters! !p !list_ !fd = if list_ == 0 { 0 } else {
     let pcb = table_at! p (prim.load64! (list_ + word));
     prim.xadd64! (world_at! w_fd_waiting) (0 - 1);
-    pcb_lock! pcb;
-    if prim.load64! (pcb + pcb_wait_fd) == fd + 1 {
-        prim.store64! (pcb + pcb_wait_fd) 0;
-        prim.store64! (pcb + pcb_wait_write) 0;
+    // Killed while it waited, and reaped since: nobody to wake.
+    if pcb != 0 {
+        pcb_lock! pcb;
+        if prim.load64! (pcb + pcb_wait_fd) == fd + 1 {
+            prim.store64! (pcb + pcb_wait_fd) 0;
+            prim.store64! (pcb + pcb_wait_write) 0;
+        };
+        pcb_unlock! pcb;
+        wake! p pcb;
     };
-    pcb_unlock! pcb;
-    wake! p pcb;
     wake_fd_waiters! p (prim.load64! list_) fd
 };
 
@@ -3279,6 +3752,8 @@ let maybe_service! !p = {
 let dispatch! !p !pcb !b !c !d !e = {
     make_current! p pcb;
     load_heap! p pcb;
+    // Due to report to a census: at its first function entry.
+    if prim.load64! (pcb + pcb_census_due) != 0 { prim.store64! (p + ctx_guard) (0 - 1); };
     let sp = prim.load64! (pcb + pcb_sp);
     let reason = prim.load64! (pcb + pcb_kill);
     if reason != 0 && prim.load64! (pcb + pcb_killing) == 0 {
@@ -3541,12 +4016,14 @@ let down_of! !p !pcb = new_cons! p atom_down (new_cons! p (new_pid! p (prim.load
     (new_cons! p (new_result! p (prim.load64! (pcb + pcb_failed) == 0) (prim.load64! (pcb + pcb_result))) nil_word));
 
 let tell_monitors! !p !pcb !list_ = if list_ == 0 { 0 } else {
-    deliver! p (table_at! p (prim.load64! (list_ + word))) (down_of! p pcb);
+    let m = table_at! p (prim.load64! (list_ + word));
+    if m != 0 { deliver! p m (down_of! p pcb); };
     tell_monitors! p pcb (prim.load64! list_)
 };
 
 let wake_list! !p !list_ = if list_ == 0 { 0 } else {
-    wake! p (table_at! p (prim.load64! (list_ + word)));
+    let w = table_at! p (prim.load64! (list_ + word));
+    if w != 0 { wake! p w; };
     wake_list! p (prim.load64! list_)
 };
 
@@ -3555,7 +4032,7 @@ let wake_list! !p !list_ = if list_ == 0 { 0 } else {
 let finish! !p !v !failed !d !e !f = {
     let pcb = current! p;
     let is_root = prim.load64! (pcb + pcb_id) == 1;
-    let result = promote! p v;
+    let result = promote_short! p v;
     release_owned! p (tag_fix (prim.load64! (pcb + pcb_id)));
     pcb_lock! pcb;
     prim.store64! (pcb + pcb_result) result;
@@ -3583,7 +4060,13 @@ let finish! !p !v !failed !d !e !f = {
     prim.store64! (pcb + pcb_worker) 0;
     prim.store64! (p + ctx_hp) 0;
     prim.store64! (p + ctx_limit) 0;
-    if prim.xadd64! (world_at! w_live) (0 - 1) == 1 { all_done! p 0 0 0 0 0 } else { schedule! p 0 0 0 0 0 }
+    census_gone! p pcb;
+    prim.xadd64! (world_at! w_finished_since) 1;
+    if prim.xadd64! (world_at! w_live) (0 - 1) == 1 { all_done! p 0 0 0 0 0 }
+    else {
+        census_maybe! p;
+        schedule! p 0 0 0 0 0
+    }
 };
 
 /// The bottom of every process's stack.
@@ -3739,7 +4222,7 @@ let pool_loop! !p !a !b !c !d !e = {
     prim.store_rel! (job + job_done) 1;
     let pcb = table_at! p (prim.load64! (job + job_pcb));
     // Woken before it is no longer counted, so that nobody sees nothing left and nothing to run.
-    wake_from_pool! p pcb;
+    if pcb != 0 { wake_from_pool! p pcb; };
     prim.xadd64! (world_at! w_pool_pending) (0 - 1);
     pool_loop! p 0 0 0 0 0
 };
@@ -3820,6 +4303,9 @@ let world_init! !p = {
     prim.store64! (world_at! w_sched_lock) (new_lock! ());
     prim.store64! (world_at! w_shared_lock) (new_lock! ());
     prim.store64! (world_at! w_lock) (new_lock! ());
+    prim.store64! (world_at! w_census_lock) (new_lock! ());
+    prim.store64! (world_at! w_census_trace) (prim.c1! "getenv" "DREAM_CENSUS_TRACE");
+    prim.store64! (world_at! w_pids_seen) (map_memory! (table_cap / 8));
     prim.store64! (world_at! w_foreign) (map_memory! (foreign_cap * word));
     prim.store64! (world_at! w_pool_lock) (new_lock! ());
     prim.store64! (world_at! w_pool_cond) (prim.c2! "calloc" 1 64);
@@ -4042,7 +4528,7 @@ let demonitor! !p !pid = {
 /// more to be stopped; running on some worker, it is stopped at its next function entry.
 let kill_forced! !p !pid !reason = {
     let target = pcb_of_pid! p pid;
-    let shared = promote! p reason;
+    let shared = promote_short! p reason;
     pcb_lock! target;
     let state = prim.load64! (target + pcb_state);
     if state != state_done && prim.load64! (target + pcb_kill) == 0 {
@@ -7809,7 +8295,16 @@ let callback_stub! !spec = {
     prim.store64! rec_ p;
     // The function, where any worker's process that C calls back on can reach it, and no
     // collection moves it.
-    prim.store64! (rec_ + word) (promote! p (prim.load64! (spec + 2 * word)));
+    let f = promote! p (prim.load64! (spec + 2 * word));
+    prim.store64! (rec_ + word) f;
+    // A root of the census for as long as the run: C may call it at any time.
+    let l = prim.load64! (world_at! w_shared_lock);
+    lock! l;
+    let cell = prim.c1! "malloc" (2 * word);
+    prim.store64! cell (prim.load64! (world_at! w_cb_roots));
+    prim.store64! (cell + word) f;
+    prim.store64! (world_at! w_cb_roots) cell;
+    unlock! l;
     prim.store64! (rec_ + 2 * word) kinds;
     prim.store64! (rec_ + 3 * word) (untag_fix (prim.load64! (spec + 4 * word)));
     let code = prim.c6! "mmap" 0 4096 7 34 (0 - 1) 0;
