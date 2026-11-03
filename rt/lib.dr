@@ -1674,7 +1674,7 @@ let ffi_adopt! tag ptr dtor size parents = {
     let id = native.foreign_new_id ();
     // An array of forced fields, because the runtime reads one when the process that owns it
     // ends, and nothing can be forced by then.
-    native.foreign_set_table (native.map_put (native.foreign_table ()) id (forced_array [native.current_pid_id (), tag, ptr, dtor, size, parents]));
+    native.foreign_put id (forced_array [native.current_pid_id (), tag, ptr, dtor, size, parents]);
     [:foreign, tag, id]
 };
 
@@ -1709,7 +1709,7 @@ let ffi_release_id! id = match native.match_key (native.foreign_table ()) id {
     [e] => {
         ffi_release_all! (rev_onto (sort_strings_any (ffi_children id (native.map_pairs (native.foreign_table ())))) []);
         native.ffi_destroy e.[3] e.[2];
-        native.foreign_set_table (native.map_remove (native.foreign_table ()) id);
+        native.foreign_drop id;
         ()
     },
     _ => (),
