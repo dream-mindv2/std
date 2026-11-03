@@ -1676,15 +1676,18 @@ let ffi_adopt! tag ptr dtor size parents = {
     let id = native.foreign_new_id ();
     // An array of forced fields, because the runtime reads one when the process that owns it
     // ends, and nothing can be forced by then.
+    // Every parent id forced: the runtime copies the list out word by word, and a suspension
+    // in it would end it there.
+    settle parents;
     native.foreign_put id (forced_array [native.current_pid_id (), tag, ptr, dtor, size, parents]);
     [:foreign, tag, id]
 };
 
 let ffi_entry h = match h {
-    [:foreign, tag, id] => match native.match_key (native.foreign_table ()) id {
-        [e] => if e.[1] == tag && e.[0] == native.current_pid_id () { [id, e] }
-               else { concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"] },
-        _ => concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"],
+    [:foreign, tag, id] => match native.foreign_get id {
+        () => concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"],
+        e => if e.[1] == tag && e.[0] == native.current_pid_id () { [id, e] }
+             else { concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"] },
     },
     _ => "expected a handle, `[:foreign, tag, id]`",
 };
@@ -1702,19 +1705,14 @@ let ffi_live_as h prefix = match ffi_entry h {
     why => ffi_said prefix why,
 };
 
-let ffi_children id ps = match ps {
-    [] => [],
-    [[k, e], ..rest] => if list_has e.[5] id { k :: ffi_children id rest } else { ffi_children id rest },
-};
-
-let ffi_release_id! id = match native.match_key (native.foreign_table ()) id {
-    [e] => {
-        ffi_release_all! (rev_onto (sort_strings_any (ffi_children id (native.map_pairs (native.foreign_table ())))) []);
+let ffi_release_id! id = match native.foreign_get id {
+    () => (),
+    e => {
+        ffi_release_all! (rev_onto (sort_strings_any (native.foreign_children id)) []);
         native.ffi_destroy e.[3] e.[2];
         native.foreign_drop id;
         ()
     },
-    _ => (),
 };
 
 let sort_strings_any xs = sort_strings xs (length_from xs 0);
@@ -1734,24 +1732,8 @@ let ffi_alive! h = match ffi_entry h {
     _ => false,
 };
 
-let ffi_owned_pairs ps me = match ps {
-    [] => [],
-    [[id, e], ..rest] => if e.[0] == me { [:foreign, e.[1], id] :: ffi_owned_pairs rest me } else { ffi_owned_pairs rest me },
-};
-/// Oldest first, which is what a table keyed by id reads as on the VM and a map here does not.
-let ffi_owned! u = ffi_by_id (ffi_owned_pairs (native.map_pairs (native.foreign_table ())) (native.current_pid_id ()));
-let ffi_by_id hs = match hs {
-    [] => [],
-    [h, ..rest] => {
-        let older = ffi_by_id (ffi_older rest h.[2] true);
-        let newer = ffi_by_id (ffi_older rest h.[2] false);
-        concat_lists older (h :: newer)
-    },
-};
-let ffi_older hs id below = match hs {
-    [] => [],
-    [h, ..rest] => if (h.[2] < id) == below { h :: ffi_older rest id below } else { ffi_older rest id below },
-};
+/// Oldest first, which is what a table keyed by id reads as on the VM.
+let ffi_owned! u = native.foreign_owned (native.current_pid_id ());
 
 let ffi_buffer! n = if type_of n != :integer || n < 0 { ffi_fail "buffer! needs a size in bytes" } else {
     ffi_adopt! "buffer" (native.ffi_calloc n) (native.ffi_dlsym (native.ffi_dlopen ()) "free") n []

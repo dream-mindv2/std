@@ -339,6 +339,7 @@ let w_argc = 88;
 let w_argv = 96;
 let w_k512 = 104;
 let w_ssl = 112;
+/// The foreign handles' table, its live list's ends (see "the table of foreign handles").
 let w_foreign = 120;
 let w_foreign_next = 128;
 let w_opened = 136;
@@ -375,6 +376,8 @@ let w_pool_tail = 328;
 let w_pool_started = 336;
 /// Jobs handed to the pool and not finished: while there are any, nothing is deadlocked.
 let w_pool_pending = 344;
+let w_foreign_head = 352;
+let w_foreign_tail = 360;
 let shared_step = 2097152;
 
 let world_at! !field = prim.info "world" + field;
@@ -3817,6 +3820,7 @@ let world_init! !p = {
     prim.store64! (world_at! w_sched_lock) (new_lock! ());
     prim.store64! (world_at! w_shared_lock) (new_lock! ());
     prim.store64! (world_at! w_lock) (new_lock! ());
+    prim.store64! (world_at! w_foreign) (map_memory! (foreign_cap * word));
     prim.store64! (world_at! w_pool_lock) (new_lock! ());
     prim.store64! (world_at! w_pool_cond) (prim.c2! "calloc" 1 64);
     prim.store64! (world_at! w_cond) (prim.c2! "calloc" 1 64);
@@ -7356,39 +7360,143 @@ let tls_backend! !p !unit = {
 //
 // A C callback into Dream is the one thing this does not do: see `lib.dr`.
 
-let foreign_new_id! !p !unit = {
-    let n = prim.load64! (world_at! w_foreign_next) + 1;
-    prim.store64! (world_at! w_foreign_next) n;
-    tag_fix n
-};
+// The table of foreign handles: what C made, who owns it, how to destroy it, what it was made
+// from. It is every process's, and changes as handles are made and released, so it is raw memory
+// rather than a value: an array of entries by id, mapped at its largest and touched as it fills,
+// each entry `[prev, next, id, owner, tag, pointer, destructor, size, parent count, parents..]`
+// made with `malloc` and freed on release, and the live ones linked oldest first. A map in the
+// shared region, promoted at each change, kept every version of it, as that region is not
+// collected. All of it is under the world's lock. Every field is a word with no object behind it
+// -- an id, an atom, an integer -- and one that is not (an address past a fixnum) is promoted, which
+// is then the only thing a handle leaves behind.
 
-let foreign_table! !p !unit = {
-    let m = prim.load64! (world_at! w_foreign);
-    if m == 0 { map_empty! p } else { m }
-};
+let foreign_cap = 16777216;
+let fe_prev = 0;
+let fe_next = 8;
+let fe_id = 16;
+let fe_fields = 24;
+let fe_parents = 72;
 
-// The table is every process's, so it lives in the shared region; each change promotes what is new
-// of it, which for a map that is path-copied is a path. A change is read, made and written under
-// the world's lock, as two processes on two workers may each be adding a handle.
+let foreign_slot! !id = prim.load64! (world_at! w_foreign) + id * word;
+
+let foreign_new_id! !p !unit = tag_fix (prim.xadd64! (world_at! w_foreign_next) 1 + 1);
+
+let fe_field! !p !v = if is_heap_object! v { promote! p v } else { v };
+
+/// `[owner, tag, pointer, destructor, size, parents]`, forced, for handle `id`.
 let foreign_put! !p !id !e = {
+    let i = untag_fix id;
+    if i <= 0 || i >= foreign_cap { fail! p (prim.atom "ffi_error") "too many foreign handles" } else {
+        let parents = prim.load64! (e + 7 * word);
+        let n = list_count! parents 0;
+        let entry = prim.c1! "malloc" (fe_parents + n * word);
+        prim.store64! (entry + fe_id) id;
+        prim.store64! (entry + fe_fields) (fe_field! p (prim.load64! (e + 2 * word)));
+        prim.store64! (entry + fe_fields + word) (fe_field! p (prim.load64! (e + 3 * word)));
+        prim.store64! (entry + fe_fields + 2 * word) (fe_field! p (prim.load64! (e + 4 * word)));
+        prim.store64! (entry + fe_fields + 3 * word) (fe_field! p (prim.load64! (e + 5 * word)));
+        prim.store64! (entry + fe_fields + 4 * word) (fe_field! p (prim.load64! (e + 6 * word)));
+        prim.store64! (entry + fe_parents - word) n;
+        fill_parents! p entry parents 0;
+        let l = prim.load64! (world_at! w_lock);
+        lock! l;
+        let tail = prim.load64! (world_at! w_foreign_tail);
+        prim.store64! (entry + fe_prev) tail;
+        prim.store64! (entry + fe_next) 0;
+        if tail == 0 { prim.store64! (world_at! w_foreign_head) entry; } else { prim.store64! (tail + fe_next) entry; };
+        prim.store64! (world_at! w_foreign_tail) entry;
+        prim.store64! (foreign_slot! i) entry;
+        unlock! l;
+        unit_word
+    }
+};
+
+let list_count! !l !n = if is_kind! l kind_cons { list_count! (prim.load64! (l + 2 * word)) (n + 1) } else { n };
+
+let fill_parents! !p !entry !l !i = if is_kind! l kind_cons {
+    prim.store64! (entry + fe_parents + i * word) (fe_field! p (prim.load64! (l + word)));
+    fill_parents! p entry (prim.load64! (l + 2 * word)) (i + 1)
+} else { 0 };
+
+/// The entry for `id`, the world's lock held, or 0.
+let foreign_entry! !id = {
+    let i = untag_fix id;
+    if not (is_fix id) || i <= 0 || i >= foreign_cap { 0 } else { prim.load64! (foreign_slot! i) }
+};
+
+/// An entry as the library reads one, an array in this process's heap.
+let entry_value! !p !entry = {
+    let parents = parents_list! p entry (prim.load64! (entry + fe_parents - word)) nil_word;
+    let a = array_new! p (tag_fix 6) unit_word;
+    array_store! p a (tag_fix 0) (prim.load64! (entry + fe_fields));
+    array_store! p a (tag_fix 1) (prim.load64! (entry + fe_fields + word));
+    array_store! p a (tag_fix 2) (prim.load64! (entry + fe_fields + 2 * word));
+    array_store! p a (tag_fix 3) (prim.load64! (entry + fe_fields + 3 * word));
+    array_store! p a (tag_fix 4) (prim.load64! (entry + fe_fields + 4 * word));
+    array_store! p a (tag_fix 5) parents;
+    a
+};
+
+let parents_list! !p !entry !i !acc = if i <= 0 { acc } else {
+    parents_list! p entry (i - 1) (new_cons! p (prim.load64! (entry + fe_parents + (i - 1) * word)) acc)
+};
+
+/// The entry for `id` as an array, or `()` if it has been released or never was.
+let foreign_get! !p !id = {
     let l = prim.load64! (world_at! w_lock);
     lock! l;
-    prim.store64! (world_at! w_foreign) (promote! p (map_put! p (foreign_table! p unit_word) id e));
+    let entry = foreign_entry! id;
+    let v = if entry == 0 { unit_word } else { entry_value! p entry };
     unlock! l;
-    unit_word
+    v
 };
 
 let foreign_drop! !p !id = {
     let l = prim.load64! (world_at! w_lock);
     lock! l;
-    prim.store64! (world_at! w_foreign) (promote! p (map_remove! p (foreign_table! p unit_word) id));
+    let entry = foreign_entry! id;
+    if entry != 0 {
+        let prev = prim.load64! (entry + fe_prev);
+        let next = prim.load64! (entry + fe_next);
+        if prev == 0 { prim.store64! (world_at! w_foreign_head) next; } else { prim.store64! (prev + fe_next) next; };
+        if next == 0 { prim.store64! (world_at! w_foreign_tail) prev; } else { prim.store64! (next + fe_prev) prev; };
+        prim.store64! (foreign_slot! (untag_fix id)) 0;
+        prim.c1! "free" entry;
+    };
     unlock! l;
     unit_word
 };
 
-let foreign_set_table! !p !m = {
-    prim.store64! (world_at! w_foreign) (promote! p m);
-    unit_word
+/// The ids of the live handles made from `id`, oldest first.
+let foreign_children! !p !id = {
+    let l = prim.load64! (world_at! w_lock);
+    lock! l;
+    let out = children_from! p (prim.load64! (world_at! w_foreign_tail)) id nil_word;
+    unlock! l;
+    out
+};
+
+let children_from! !p !entry !id !acc = if entry == 0 { acc } else {
+    let hit = has_parent! entry id 0 (prim.load64! (entry + fe_parents - word));
+    children_from! p (prim.load64! (entry + fe_prev)) id (if hit { new_cons! p (prim.load64! (entry + fe_id)) acc } else { acc })
+};
+
+let has_parent! !entry !id !i !n = i < n && (prim.load64! (entry + fe_parents + i * word) == id || has_parent! entry id (i + 1) n);
+
+/// `[:foreign, tag, id]` for each live handle `owner` owns, oldest first.
+let foreign_owned! !p !owner = {
+    let l = prim.load64! (world_at! w_lock);
+    lock! l;
+    let out = owned_from! p (prim.load64! (world_at! w_foreign_tail)) owner nil_word;
+    unlock! l;
+    out
+};
+
+let owned_from! !p !entry !owner !acc = if entry == 0 { acc } else {
+    let mine = prim.load64! (entry + fe_fields) == owner;
+    owned_from! p (prim.load64! (entry + fe_prev)) owner
+        (if mine { new_cons! p (new_cons! p (prim.atom "foreign") (new_cons! p (prim.load64! (entry + fe_fields + word))
+            (new_cons! p (prim.load64! (entry + fe_id)) nil_word))) acc } else { acc })
 };
 
 let current_pid_id! !p !unit = tag_fix (prim.load64! (current! p + pcb_id));
@@ -7606,68 +7714,43 @@ let ffi_destroy! !p !dtor !ptr = {
     unit_word
 };
 
-/// Everything a process still owns, newest first, when it ends. An entry is
-/// `[owner, tag, pointer, destructor, size, parents]`, and the ids are in order of creation.
 /// What a process owned, destroyed when it ends: newest first, because what is made from a thing
 /// is newer than it and must go before it. Nothing here forces, and the fields were forced when
-/// the handle was made (`ffi_adopt!`). A shell sort over a C array, as a process may own many.
+/// the handle was made (`ffi_adopt!`). The ids are taken under the lock, and each is destroyed
+/// and dropped after, as a destructor is C and may take its time.
 let release_owned! !p !owner = {
-    let m = prim.load64! (world_at! w_foreign);
-    if m != 0 {
-        let ps = node_pairs! p m (popcount (branch_bitmap! m) - 1) nil_word;
-        let n = owned_count! ps owner 0;
-        if n > 0 {
-            let table = prim.c1! "malloc" (2 * word * n);
-            owned_fill! ps owner table 0;
-            owned_sort! table n (n / 2);
-            release_each! p table 0 n;
-            prim.c1! "free" table;
-        };
+    let l = prim.load64! (world_at! w_lock);
+    lock! l;
+    let n = owned_total! (prim.load64! (world_at! w_foreign_head)) owner 0;
+    let table = if n == 0 { 0 } else { prim.c1! "malloc" (word * n) };
+    if n > 0 { owned_ids! (prim.load64! (world_at! w_foreign_tail)) owner table 0; };
+    unlock! l;
+    if n > 0 {
+        release_each! p table 0 n;
+        prim.c1! "free" table;
     };
     0
 };
 
-let entry_field! !e !i = prim.load64! (e + (2 + i) * word);
-let pair_id! !pair = prim.load64! (pair + word);
-let pair_entry! !pair = prim.load64! (prim.load64! (pair + 2 * word) + word);
+let owned_total! !entry !owner !n = if entry == 0 { n }
+    else { owned_total! (prim.load64! (entry + fe_next)) owner (if prim.load64! (entry + fe_fields) == owner { n + 1 } else { n }) };
 
-let owned_count! !ps !owner !n = if ps == nil_word { n } else {
-    let hit = entry_field! (pair_entry! (prim.load64! (ps + word))) 0 == owner;
-    owned_count! (prim.load64! (ps + 2 * word)) owner (if hit { n + 1 } else { n })
-};
-
-let owned_fill! !ps !owner !at !i = if ps == nil_word { 0 } else {
-    let pair = prim.load64! (ps + word);
-    if entry_field! (pair_entry! pair) 0 == owner {
-        prim.store64! (at + i * 2 * word) (pair_id! pair);
-        prim.store64! (at + i * 2 * word + word) (pair_entry! pair);
-        owned_fill! (prim.load64! (ps + 2 * word)) owner at (i + 1)
-    } else { owned_fill! (prim.load64! (ps + 2 * word)) owner at i }
-};
-
-let owned_sort! !t !n !gap = if gap <= 0 { 0 } else {
-    owned_pass! t n gap gap;
-    owned_sort! t n (gap / 2)
-};
-let owned_pass! !t !n !gap !i = if i >= n { 0 } else {
-    owned_sink! t gap i (prim.load64! (t + i * 2 * word)) (prim.load64! (t + i * 2 * word + word));
-    owned_pass! t n gap (i + 1)
-};
-let owned_sink! !t !gap !j !id !e =
-    if j >= gap && prim.load64! (t + (j - gap) * 2 * word) < id {
-        prim.store64! (t + j * 2 * word) (prim.load64! (t + (j - gap) * 2 * word));
-        prim.store64! (t + j * 2 * word + word) (prim.load64! (t + (j - gap) * 2 * word + word));
-        owned_sink! t gap (j - gap) id e
-    } else {
-        prim.store64! (t + j * 2 * word) id;
-        prim.store64! (t + j * 2 * word + word) e;
-        0
-    };
+/// Newest first, from the tail.
+let owned_ids! !entry !owner !t !i = if entry == 0 { 0 }
+    else if prim.load64! (entry + fe_fields) == owner {
+        prim.store64! (t + i * word) (prim.load64! (entry + fe_id));
+        owned_ids! (prim.load64! (entry + fe_prev)) owner t (i + 1)
+    } else { owned_ids! (prim.load64! (entry + fe_prev)) owner t i };
 
 let release_each! !p !t !i !n = if i >= n { 0 } else {
-    let e = prim.load64! (t + i * 2 * word + word);
-    ffi_destroy! p (entry_field! e 3) (entry_field! e 2);
-    foreign_drop! p (prim.load64! (t + i * 2 * word));
+    let id = prim.load64! (t + i * word);
+    let l = prim.load64! (world_at! w_lock);
+    lock! l;
+    let entry = foreign_entry! id;
+    let dtor = if entry == 0 { 0 } else { prim.load64! (entry + fe_fields + 3 * word) };
+    let ptr = if entry == 0 { 0 } else { prim.load64! (entry + fe_fields + 2 * word) };
+    unlock! l;
+    if entry != 0 { ffi_destroy! p dtor ptr; foreign_drop! p id; };
     release_each! p t (i + 1) n
 };
 
