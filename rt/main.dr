@@ -147,7 +147,10 @@ let min_chunk = 8388608;
 let first_budget = 4096;
 let max_budget = 65536;
 let stack_bytes = 268435456;
-let first_stack = 32768;
+/// A process's first stack. A new process uses a few hundred bytes of it, and it doubles when it
+/// needs more (`move_stack!`); at 32 KB, each process's first page was a fault of its own, and
+/// starting 50,000 of them was a hundred milliseconds of the kernel's.
+let first_stack = 2048;
 let stack_margin = 1048576;
 
 let tag_fix !n = n * 2 + 1;
@@ -3387,7 +3390,10 @@ let make_current! !p !pcb = {
     // Room below the guard for what runs between two entries, and at full size for reporting
     // that the recursion has gone too deep.
     let size = prim.load64! (pcb + pcb_stack_size);
-    let floor = prim.load64! (pcb + pcb_stack) + (if size >= stack_bytes { stack_margin } else { size / 4 });
+    // A small stack keeps half of itself below the guard: what is pushed between two entries -- a
+    // frame, a call's arguments past the third, a partial application's -- lands there before
+    // anything asks whether it fits.
+    let floor = prim.load64! (pcb + pcb_stack) + (if size >= stack_bytes { stack_margin } else if size <= 65536 { size / 2 } else { size / 4 });
     prim.store64! (p + ctx_current) pcb;
     prim.store64! (p + ctx_current_id) (tag_fix (prim.load64! (pcb + pcb_id)));
     prim.store64! (p + ctx_stack_top) (stack_top! pcb);
@@ -7318,14 +7324,73 @@ let open_first! !a !b !c = {
     }
 };
 
+let ssl_names_tried! !dir !len_ = {
+    let buf = prim.c1! "malloc" 4096;
+    let h = ssl_in! buf dir len_ "libssl.so.3";
+    let h2 = if h != 0 { h } else { ssl_in! buf dir len_ "libssl.so.1.1" };
+    let h3 = if h2 != 0 { h2 } else { ssl_in! buf dir len_ "libssl.so" };
+    prim.c1! "free" buf;
+    h3
+};
+
+let ssl_in! !buf !dir !len_ !name = {
+    prim.c6! "snprintf" buf 4096 "%.*s/%s" len_ dir name;
+    prim.c2! "dlopen" buf 258
+};
+
+/// Each directory of a colon-separated list, from `at`, until one has the library.
+let ssl_in_list! !at = if at == 0 || prim.load8! at == 0 { 0 } else {
+    let n = until_colon! at 0;
+    let h = if n == 0 { 0 } else { ssl_names_tried! at n };
+    if h != 0 { h } else if prim.load8! (at + n) == 0 { 0 } else { ssl_in_list! (at + n + 1) }
+};
+
+let until_colon! !at !n = { let c = prim.load8! (at + n); if c == 0 || c == 58 { n } else { until_colon! at (n + 1) } };
+
+/// `$VAR` and `rest` joined, tried as a directory.
+let ssl_under! !var !rest = {
+    let base = prim.c1! "getenv" var;
+    if base == 0 { 0 } else {
+        let dir = prim.c1! "malloc" 4096;
+        prim.c5! "snprintf" dir 4096 "%s%s" base rest;
+        let h = ssl_names_tried! dir (prim.c1! "strlen" dir);
+        prim.c1! "free" dir;
+        h
+    }
+};
+
+let find_ssl! () = {
+    let a = ssl_in_list! (prim.c1! "getenv" "DREAM_LIBRARY_PATH");
+    let b = if a != 0 { a } else { ssl_under! "MINDV2_PATH" "/lib" };
+    let c = if b != 0 { b } else { ssl_under! "HOME" "/.mindv2/lib" };
+    let d = if c != 0 { c } else { open_first! "libssl.so.3" "libssl.so.1.1" "libssl.so" };
+    let e = if d != 0 { d } else { ssl_under! "HOME" "/.nix-profile/lib" };
+    let f = if e != 0 { e } else { ssl_user_profile! () };
+    let g = if f != 0 { f } else { ssl_names_tried! "/run/current-system/sw/lib" 26 };
+    if g != 0 { g } else { ssl_names_tried! "/nix/var/nix/profiles/default/lib" 33 }
+};
+
+/// NixOS's profile of the user's own packages.
+let ssl_user_profile! () = {
+    let user = prim.c1! "getenv" "USER";
+    if user == 0 { 0 } else {
+        let dir = prim.c1! "malloc" 4096;
+        prim.c4! "snprintf" dir 4096 "/etc/profiles/per-user/%s/lib" user;
+        let h = ssl_names_tried! dir (prim.c1! "strlen" dir);
+        prim.c1! "free" dir;
+        h
+    }
+};
+
 /// The library's handle, opened once, or 0.
 let ssl_lib! !p = {
     let have = prim.load64! (world_at! w_ssl);
     if have != 0 { have } else {
-        // Where a system keeps it is the system's business, except where it is not on the
-        // loader's path at all, which `DREAM_OPENSSL_LIB` is for.
+        // Looked for as the VM looks for a library on the system ("Finding a library" in
+        // dream/src/ffi.cpp): the file named, then what was set up on purpose, then the loader,
+        // then where a platform keeps what is installed but tells no loader -- Nix's profiles.
         let named = prim.c1! "getenv" "DREAM_OPENSSL_LIB";
-        let h = if named != 0 { prim.c2! "dlopen" named 258 } else { open_first! "libssl.so.3" "libssl.so.1.1" "libssl.so" };
+        let h = if named != 0 { prim.c2! "dlopen" named 258 } else { find_ssl! () };
         if h != 0 {
             prim.store64! (prim.info "tls_get_error") (prim.c2! "dlsym" h "X509_STORE_CTX_get_error");
             prim.store64! (prim.info "tls_set_error") (prim.c2! "dlsym" h "X509_STORE_CTX_set_error");
@@ -7505,7 +7570,7 @@ let tls_start! !p !h !server !c = {
         fail! p (prim.atom "wrong_kind") (if server == true_word { "tls.accept! needs an accepted connection" } else { "tls.connect! needs a connected socket" })
     }
     else if session_of! p h != 0 { h }
-    else if ssl_lib! p == 0 { fail! p (prim.atom "tls_error") "no OpenSSL could be opened on this system (libssl.so.3)" }
+    else if ssl_lib! p == 0 { fail! p (prim.atom "tls_error") "no OpenSSL could be opened: looked for libssl.so.3, libssl.so.1.1 and libssl.so in $DREAM_LIBRARY_PATH, the installation's lib, on the loader's path and in Nix's profiles; $DREAM_OPENSSL_LIB names the file" }
     else {
         let is_server = server == true_word;
         let ctx = new_context! p is_server c;
