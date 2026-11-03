@@ -1874,7 +1874,7 @@ let ffi_invoke! binding args = {
         },
     };
     let [values, codes, parents, outs] = fill! types args [] [] [] [] 1;
-    let answer = native.ffi_call_m f (forced_array [forced_array values, forced_array codes, ffi_raw_kind ret]);
+    let answer = native.ffi_call_m f (forced_array [forced_array values, forced_array codes, ffi_raw_kind ret, name]);
     let result = ffi_result! ret answer parents;
     match outs {
         [] => result,

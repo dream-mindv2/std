@@ -427,6 +427,8 @@ let w_shared_cur = 464;
 let w_census_trace = 472;
 let w_short_cur = 480;
 let w_short_hp = 488;
+/// A callback was called from a thread that may not run it (`cb_enter!`).
+let w_cb_refused = 496;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -8236,7 +8238,13 @@ let ffi_call_m! !p !sp0 !self_ !f !spec !d = {
     let raw = if k == 11 || k == 10 { prim.ffi_double! address ints doubles } else { prim.ffi_word! address ints doubles };
     prim.store64! (p + ctx_ffi_sp) outer_sp;
     let failed = prim.load64! (p + ctx_cb_error);
-    if failed != 0 {
+    if prim.load_acq! (world_at! w_cb_refused) != 0 && prim.xchg64! (world_at! w_cb_refused) 0 != 0 {
+        // Said of the C function, as the VM says it: the fourth of the call's description.
+        let name = prim.load64! (spec + 5 * word);
+        fail_value! p (prim.atom "ffi_error") (concat3! p (text_of! p "in a callback passed to `") (if is_string! name { name } else { text_of! p "?" })
+            (text_of! p "`: a callback was called from a thread other than the one that passed it"));
+        native_failed! p sp 0 0 0 0
+    } else if failed != 0 {
         prim.store64! (p + ctx_cb_error) 0;
         unwind! p sp failed 0 0 0
     } else if prim.load64! (p + ctx_cb_text) != 0 {
@@ -8497,10 +8505,18 @@ let cb_push! !sp !args = if args == nil_word { sp } else {
 };
 
 let cb_enter! !rec_ !regs = {
-    // The context of the worker C called back on, which the record's, of the one that made the
-    // callback, need not be.
+    // The context of the worker C called back on, which must be in a call to C: a callback runs on
+    // the stack of the process that made the call. From any other thread -- one the library made,
+    // or a worker running something else -- it is refused without running anything and answers
+    // zero, as on the VM, and the call to C raises once it returns (`w_cb_refused`).
     let mine = prim.c1! "pthread_getspecific" (prim.load64! (world_at! w_cb_key));
-    let p = if mine != 0 { mine } else { prim.load64! rec_ };
+    if mine == 0 || prim.load64! (mine + ctx_ffi_sp) == 0 {
+        prim.store_rel! (world_at! w_cb_refused) 1;
+        0
+    } else { cb_run! mine rec_ regs }
+};
+
+let cb_run! !p !rec_ !regs = {
     let f = prim.load64! (rec_ + word);
     let kinds = prim.load64! (rec_ + 2 * word);
     let n = untag_fix (prim.load64! (kinds + word));
