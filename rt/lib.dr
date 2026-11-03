@@ -420,22 +420,24 @@ let read_all! h acc = {
 };
 
 /// Wait for a child, killing it past `deadline` (0 for none); `[code, timed_out]`.
-let wait_child! pid deadline !delay !killed = match native.child_status pid {
+let wait_child! pid deadline killed = match native.child_wait_m pid (if killed { 0 } else { deadline }) {
     () => {
-        let late = deadline > 0 && native.now_ns_value () > deadline;
-        if late && not killed { native.child_kill pid };
-        native.sleep_until_m (native.now_ns_value () + delay);
-        wait_child! pid deadline (if delay < 20000000 { delay * 2 } else { delay }) (killed || late)
+        native.child_kill pid;
+        wait_child! pid deadline true
     },
     code => [code, killed],
 };
 
 let exec_full! dir env program args ms joined = {
-    let [pid, out, err] = native.spawn_child dir (forced_array env) program (forced_array args) joined;
+    // Forced here: a native looks pure to the compiler, so this could be a suspension, and the
+    // processes below are each given a copy of what they read, which would start the child again.
+    let child = native.spawn_child dir (forced_array env) program (forced_array args) joined;
+    strict! child;
+    let [pid, out, err] = child;
     let deadline = if ms > 0 { native.now_ns_value () + ms * 1000000 } else { 0 };
     // Waiting is a process of its own, so that a child past its time is killed even
     // while reading its output is what has not finished.
-    let waiter = spawn! $( wait_child! pid deadline 100000 false );
+    let waiter = spawn! $( wait_child! pid deadline false );
     let err_reader = spawn! $( read_all! err [] );
     let got = read_all! out [];
     let got_err = join! err_reader;

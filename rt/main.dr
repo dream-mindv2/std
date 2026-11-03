@@ -130,9 +130,14 @@ let word = 8;
 let static_limit = 4294967296;
 let chunk_header = 16;
 let min_chunk = 8388608;
-/// A process's first allocation area. It doubles at each collection up to `min_chunk`, so a
-/// process that lives long allocates as the first one does, and one that does little costs little.
+/// A process's first allocation area. It doubles at each collection up to `max_budget`, so one
+/// that does little costs little, and the chunks of one that does a lot stay small enough to come
+/// from the free lists: at `min_chunk`, as the first process has, two hundred busy connections each
+/// mapped and unmapped a to-space at every collection, and faulted in every page of it again. A
+/// process with more live data than that still gets chunks to fit it (`new_chunk!`), and one with a
+/// deep stack a budget to match it (`collect!`).
 let first_budget = 4096;
+let max_budget = 65536;
 let stack_bytes = 268435456;
 let first_stack = 32768;
 let stack_margin = 1048576;
@@ -358,6 +363,18 @@ let w_lock = 256;
 /// Which worker a thread is, for a callback from C.
 let w_cb_key = 264;
 let w_spinning = 272;
+/// The `epoll` descriptor, the table of descriptors' waiters, and how many processes wait on one.
+let w_epfd = 280;
+let w_fds = 288;
+let w_fd_waiting = 296;
+/// The blocking pool's jobs, its lock and condition, and how many threads it has.
+let w_pool_lock = 304;
+let w_pool_cond = 312;
+let w_pool_head = 320;
+let w_pool_tail = 328;
+let w_pool_started = 336;
+/// Jobs handed to the pool and not finished: while there are any, nothing is deadlocked.
+let w_pool_pending = 344;
 let shared_step = 2097152;
 
 let world_at! !field = prim.info "world" + field;
@@ -708,7 +725,11 @@ let collect! !p !sp = {
     prim.store64! (p + ctx_want_gc) 0;
     prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
     prim.store64! (p + ctx_collections) (prim.load64! (p + ctx_collections) + 1);
-    if budget < min_chunk { prim.store64! (pcb + pcb_budget) (budget * 2); };
+    // A collection scans the whole stack, so a deep one asks for room in proportion, or a deep
+    // recursion that allocates would scan its stack every few kilobytes.
+    let deep = round_chunk! ((stack_top! pcb - sp) * 2) budget;
+    let grown = if budget < max_budget { budget * 2 } else { budget };
+    prim.store64! (pcb + pcb_budget) (if deep > grown { if deep > min_chunk { min_chunk } else { deep } } else { grown });
     new_chunk! p (live * 2);
     0
 };
@@ -848,7 +869,7 @@ let collect_at_entry! !p !sp !a !b !c !d =
         // the system is another too, since only the scheduler looks at those: a process that
         // never parks would otherwise keep a sleeper from waking until it finished.
         if not inside_c && (prim.load64! (p + ctx_run_head) != 0 || prim.load64! (current! p + pcb_kill) != 0
-                            || prim.load64! (world_at! w_wait_count) != 0) {
+                            || (waiting_on_system! () && prim.load64! (world_at! w_polling) == 0)) {
             yield_now! p at unit_word 0 0 0
         } else {
             frame_resume_entry! p at unit_word 0 0 0
@@ -2670,14 +2691,17 @@ let new_pid! !p !id = {
 // another's. Only its own worker adds to a queue, which is why an empty one can be seen to be
 // empty without its lock.
 
-let run_push! !p !pcb = {
+let run_push! !p !pcb = run_push_on! p p pcb;
+
+/// `pcb` on worker `w`'s queue, from this context, which is `w` itself but for the blocking pool.
+let run_push_on! !p !w !pcb = {
     prim.store64! (pcb + pcb_next) 0;
-    let l = prim.load64! (p + ctx_run_lock);
+    let l = prim.load64! (w + ctx_run_lock);
     spin_lock! l;
-    let tail = prim.load64! (p + ctx_run_tail);
-    if tail == 0 { prim.store64! (p + ctx_run_head) pcb; } else { prim.store64! (tail + pcb_next) pcb; };
-    prim.store64! (p + ctx_run_tail) pcb;
-    prim.store64! (p + ctx_run_count) (prim.load64! (p + ctx_run_count) + 1);
+    let tail = prim.load64! (w + ctx_run_tail);
+    if tail == 0 { prim.store64! (w + ctx_run_head) pcb; } else { prim.store64! (tail + pcb_next) pcb; };
+    prim.store64! (w + ctx_run_tail) pcb;
+    prim.store64! (w + ctx_run_count) (prim.load64! (w + ctx_run_count) + 1);
     spin_unlock! l;
     // Someone asleep may have nothing, and this is something; unless someone is already looking,
     // who will find it without a trip through the kernel.
@@ -2894,30 +2918,129 @@ let now_ns! !p = {
     prim.load64! buf * 1000000000 + prim.load64! (buf + word)
 };
 
-// Who has a timer or a descriptor to be woken by, under the scheduler's lock. Asking this of every
-// process on every switch made a run with many of them quadratic, and few are ever in this state,
-// so those that enter it are listed, by id, and those that have left it are dropped when the list
-// is next read. A process's `wake_at` and `wait_fd` are written under its own lock.
+// Who is waiting for a time or for the system. Timers are a binary heap of `[at, id]`, earliest
+// first, under the scheduler's lock; a process woken some other way leaves its entry behind, which
+// is dropped when it comes to the top and is found not to be the process's timer any more.
+//
+// A descriptor has a slot, `[lock, ready, waiters, registered]`, in a table the size of the handle
+// table, under a lock of its own: every wait on a socket takes it, and with one lock for all of
+// them workers queued there, a system call each. It is registered with `epoll` once, the first
+// time anyone waits on it, edge-triggered, so that a wait is no system call at all. An edge that
+// comes with nobody waiting sets `ready`, and a process about to wait that finds its direction
+// there goes round again instead: the edge may have come after its read found nothing. Each
+// waiter says which direction it wants, and only those an event is for are woken. Before this,
+// the poller built its list from every waiter on every call, which was quadratic in sockets.
 
-let note_waiter! !p !pcb = {
-    sched_lock! p;
-    if prim.load64! (pcb + pcb_listed) == 0 {
-        let n = prim.load64! (world_at! w_wait_count);
-        if n >= prim.load64! (world_at! w_wait_cap) {
-            let cap = if n == 0 { 64 } else { n * 2 };
-            prim.store64! (world_at! w_wait_ids) (prim.c2! "realloc" (prim.load64! (world_at! w_wait_ids)) (cap * word));
-            prim.store64! (world_at! w_wait_cap) cap;
-        };
-        prim.store64! (prim.load64! (world_at! w_wait_ids) + n * word) (prim.load64! (pcb + pcb_id));
-        prim.store_rel! (world_at! w_wait_count) (n + 1);
-        prim.store64! (pcb + pcb_listed) 1;
+let fd_slots = 1048576;
+let epoll_in = 1;
+let epoll_out = 4;
+let epoll_err = 8;
+let epoll_hup = 16;
+let epoll_rdhup = 8192;
+let epoll_et = 2147483648;
+let epoll_batch = 128;
+let slot_words = 4;
+
+/// Anyone waiting for a time or a descriptor.
+let waiting_on_system! () = prim.load64! (world_at! w_wait_count) != 0 || prim.load64! (world_at! w_fd_waiting) != 0;
+
+let timer_at! !i = prim.load64! (world_at! w_wait_ids) + i * 2 * word;
+
+let timer_swap! !i !j = {
+    let a = timer_at! i;
+    let b = timer_at! j;
+    let at = prim.load64! a;
+    let id = prim.load64! (a + word);
+    prim.store64! a (prim.load64! b);
+    prim.store64! (a + word) (prim.load64! (b + word));
+    prim.store64! b at;
+    prim.store64! (b + word) id;
+    0
+};
+
+let timer_up! !i = if i == 0 { 0 } else {
+    let parent = (i - 1) / 2;
+    if prim.load64! (timer_at! i) < prim.load64! (timer_at! parent) { timer_swap! i parent; timer_up! parent } else { 0 }
+};
+
+let timer_down! !i !n = {
+    let l = 2 * i + 1;
+    let r = l + 1;
+    let least = if l < n && prim.load64! (timer_at! l) < prim.load64! (timer_at! i) { l } else { i };
+    let least2 = if r < n && prim.load64! (timer_at! r) < prim.load64! (timer_at! least) { r } else { least };
+    if least2 != i { timer_swap! i least2; timer_down! least2 n } else { 0 }
+};
+
+let timer_push! !at !id = {
+    let n = prim.load64! (world_at! w_wait_count);
+    if n >= prim.load64! (world_at! w_wait_cap) {
+        let cap = if n == 0 { 64 } else { n * 2 };
+        prim.store64! (world_at! w_wait_ids) (prim.c2! "realloc" (prim.load64! (world_at! w_wait_ids)) (cap * 2 * word));
+        prim.store64! (world_at! w_wait_cap) cap;
     };
-    let at = prim.load64! (pcb + pcb_wake_at);
-    let e = prim.load64! (world_at! w_earliest);
-    if at >= 0 && (e < 0 || at < e) { prim.store64! (world_at! w_earliest) at; };
-    // Whoever is polling is woken to look again, or someone asleep to start.
+    prim.store64! (timer_at! n) at;
+    prim.store64! (timer_at! n + word) id;
+    prim.store64! (world_at! w_wait_count) (n + 1);
+    timer_up! n;
+    0
+};
+
+let timer_pop! () = {
+    let n = prim.load64! (world_at! w_wait_count) - 1;
+    timer_swap! 0 n;
+    prim.store64! (world_at! w_wait_count) n;
+    timer_down! 0 n;
+    0
+};
+
+let earliest_timer! () = if prim.load64! (world_at! w_wait_count) == 0 { 0 - 1 } else { prim.load64! (timer_at! 0) };
+
+/// Every timer that has run out, its process woken if it is still that process's.
+let expire_timers! !p !now = if prim.load64! (world_at! w_wait_count) == 0 || prim.load64! (timer_at! 0) > now { 0 } else {
+    let id = prim.load64! (timer_at! 0 + word);
+    timer_pop! ();
+    expire! p (table_at! p id) now;
+    expire_timers! p now
+};
+
+/// The heap with only the timers some process is still waiting on: what the deadlock test asks.
+let live_timers! !p !i !kept = if i >= prim.load64! (world_at! w_wait_count) {
+    prim.store64! (world_at! w_wait_count) kept;
+    rebuild_timers! (kept / 2) kept;
+    kept
+} else {
+    let at = prim.load64! (timer_at! i);
+    let id = prim.load64! (timer_at! i + word);
+    let pcb = table_at! p id;
+    if prim.load64! (pcb + pcb_state) != state_done && prim.load64! (pcb + pcb_wake_at) == at {
+        prim.store64! (timer_at! kept) at;
+        prim.store64! (timer_at! kept + word) id;
+        live_timers! p (i + 1) (kept + 1)
+    } else { live_timers! p (i + 1) kept }
+};
+
+let rebuild_timers! !i !n = if i < 0 { 0 } else { timer_down! i n; rebuild_timers! (i - 1) n };
+
+/// After a new waiter: whoever is polling sees the change, or someone asleep wakes to poll.
+let tell_poller! !p = {
     if prim.load64! (world_at! w_polling) != 0 { interrupt_poll! p; }
     else if prim.load64! (world_at! w_idle) != 0 { prim.c1! "pthread_cond_signal" (prim.load64! (world_at! w_cond)); };
+    0
+};
+
+/// A time `pcb` is to be woken at, noted where the scheduler looks.
+let note_timer! !p !pcb !at = {
+    sched_lock! p;
+    timer_push! at (prim.load64! (pcb + pcb_id));
+    let e = prim.load64! (world_at! w_earliest);
+    if e < 0 || at < e {
+        prim.store64! (world_at! w_earliest) at;
+        // A poll waiting longer than this has to be cut short.
+        if prim.load64! (world_at! w_polling) != 0 { interrupt_poll! p; };
+    };
+    if prim.load64! (world_at! w_polling) == 0 && prim.load64! (world_at! w_idle) != 0 {
+        prim.c1! "pthread_cond_signal" (prim.load64! (world_at! w_cond));
+    };
     sched_unlock! p;
     0
 };
@@ -2929,32 +3052,114 @@ let interrupt_poll! !p = {
     0
 };
 
-let still_waiting! !pcb = prim.load64! (pcb + pcb_state) != state_done
-    && (prim.load64! (pcb + pcb_wake_at) >= 0 || prim.load64! (pcb + pcb_wait_fd) != 0);
+let fd_slot! !fd = prim.load64! (world_at! w_fds) + fd * slot_words * word;
 
-let refresh_waiters! !p !i !kept = if i >= prim.load64! (world_at! w_wait_count) {
-    prim.store64! (world_at! w_wait_count) kept;
-    kept
-} else {
-    let ids = prim.load64! (world_at! w_wait_ids);
-    let id = prim.load64! (ids + i * word);
-    let pcb = table_at! p id;
-    if pcb != 0 && still_waiting! pcb {
-        prim.store64! (ids + kept * word) id;
-        refresh_waiters! p (i + 1) (kept + 1)
+/// `fd` registered with `epoll`, if it is not yet. Answers whether the system will tell, which
+/// for a regular file it will not. The slot's lock is held.
+let epoll_register! !p !fd !slot = if prim.load64! (slot + 3 * word) != 0 { true } else {
+    let ev = prim.load64! (p + ctx_timebuf);
+    prim.store32! ev (epoll_in | epoll_out | epoll_rdhup | epoll_et);
+    prim.store32! (ev + 4) fd;
+    prim.store32! (ev + 8) 0;
+    let ep = prim.load64! (world_at! w_epfd);
+    let ok = prim.sext32 (prim.c4! "epoll_ctl" ep 1 fd ev) == 0 || errno! () == 17;
+    if ok {
+        prim.store64! (slot + 3 * word) 1;
+        // Whatever is already readable or writable came before the registration and is no edge.
+        prim.store64! (slot + word) (epoll_in | epoll_out);
+    };
+    ok
+};
+
+let wait_none = 0;
+let wait_parked = 1;
+let wait_again = 2;
+
+/// `pcb` waits for `fd`: parked, or to go round again at once because the system said ready
+/// while nobody was waiting, or not at all because the system cannot say.
+let note_fd! !p !pcb !fd !write = if fd < 0 || fd >= fd_slots { wait_none } else {
+    let slot = fd_slot! fd;
+    let want = if write { epoll_out } else { epoll_in };
+    spin_lock! slot;
+    let answer = if not (epoll_register! p fd slot) { wait_none }
+        else if prim.load64! (slot + word) & want != 0 {
+            prim.store64! (slot + word) (prim.load64! (slot + word) & (0 - 1 - want));
+            wait_again
+        } else {
+            let cell = id_push! p (prim.load64! (slot + 2 * word)) (prim.load64! (pcb + pcb_id));
+            prim.store64! (cell + 2 * word) want;
+            prim.store64! (slot + 2 * word) cell;
+            prim.xadd64! (world_at! w_fd_waiting) 1;
+            wait_parked
+        };
+    spin_unlock! slot;
+    // Nobody is asking the system, and someone could: they are woken to.
+    if answer == wait_parked && prim.load_acq! (world_at! w_polling) == 0 && prim.load_acq! (world_at! w_idle) != 0 { nudge! p; };
+    answer
+};
+
+/// What `epoll` said of `fd`: whoever waits for it in a direction it is ready in is woken, and
+/// a direction nobody waited for is remembered.
+let fd_event! !p !fd !events = if fd < 0 || fd >= fd_slots { 0 } else {
+    let broken = events & (epoll_err | epoll_hup | epoll_rdhup) != 0;
+    let ready = (if events & epoll_in != 0 || broken { epoll_in } else { 0 }) | (if events & epoll_out != 0 || broken { epoll_out } else { 0 });
+    let slot = fd_slot! fd;
+    spin_lock! slot;
+    let all = prim.load64! (slot + 2 * word);
+    prim.store64! (slot + 2 * word) 0;
+    let woken = split_waiters! all ready 0 slot;
+    // Only what nobody was woken for: a waiter woken reads or writes until it finds no more,
+    // and would otherwise go round once for nothing before it waited again.
+    prim.store64! (slot + word) (prim.load64! (slot + word) | (ready & (0 - 1 - wants_of! woken 0)));
+    spin_unlock! slot;
+    wake_fd_waiters! p woken fd;
+    id_free! p woken
+};
+
+/// The waiters `ready` is for, answered; the rest put back in the slot. Both made of the cells of
+/// the one list, which the slot's lock keeps.
+let split_waiters! !list_ !ready !woken !slot = if list_ == 0 { woken } else {
+    let next = prim.load64! list_;
+    if prim.load64! (list_ + 2 * word) & ready != 0 {
+        prim.store64! list_ woken;
+        split_waiters! next ready list_ slot
     } else {
-        if pcb != 0 { prim.store64! (pcb + pcb_listed) 0; };
-        refresh_waiters! p (i + 1) kept
+        prim.store64! list_ (prim.load64! (slot + 2 * word));
+        prim.store64! (slot + 2 * word) list_;
+        split_waiters! next ready woken slot
     }
 };
 
-let waiter_at! !p !i = table_at! p (prim.load64! (prim.load64! (world_at! w_wait_ids) + i * word));
+let wants_of! !list_ !acc = if list_ == 0 { acc } else { wants_of! (prim.load64! list_) (acc | prim.load64! (list_ + 2 * word)) };
 
-let earliest_at! !p !id !n !best = if id >= n { best } else {
-    let pcb = waiter_at! p id;
-    let at = if pcb == 0 { 0 - 1 } else { prim.load64! (pcb + pcb_wake_at) };
-    earliest_at! p (id + 1) n (if at >= 0 && (best < 0 || at < best) { at } else { best })
+/// Everyone waiting on `fd`, woken, and its slot forgotten: it is gone.
+let fd_ready! !p !fd = {
+    let slot = fd_slot! fd;
+    spin_lock! slot;
+    let waiters = prim.load64! (slot + 2 * word);
+    prim.store64! (slot + word) 0;
+    prim.store64! (slot + 2 * word) 0;
+    prim.store64! (slot + 3 * word) 0;
+    spin_unlock! slot;
+    wake_fd_waiters! p waiters fd;
+    id_free! p waiters
 };
+
+let wake_fd_waiters! !p !list_ !fd = if list_ == 0 { 0 } else {
+    let pcb = table_at! p (prim.load64! (list_ + word));
+    prim.xadd64! (world_at! w_fd_waiting) (0 - 1);
+    pcb_lock! pcb;
+    if prim.load64! (pcb + pcb_wait_fd) == fd + 1 {
+        prim.store64! (pcb + pcb_wait_fd) 0;
+        prim.store64! (pcb + pcb_wait_write) 0;
+    };
+    pcb_unlock! pcb;
+    wake! p pcb;
+    wake_fd_waiters! p (prim.load64! list_) fd
+};
+
+/// A descriptor closed: whoever waited on it is told by going round again and finding it closed.
+let fd_closed! !p !fd = if fd < 0 || fd >= fd_slots { 0 } else { fd_ready! p fd; 0 };
 
 /// A timer that has run out, under the process's lock, so that a new one it has just set is not
 /// mistaken for this one.
@@ -2975,72 +3180,47 @@ let expire! !p !pcb !now = {
     } else { pcb_unlock! pcb; 0 }
 };
 
-let wake_expired! !p !id !n !now = if id >= n { 0 } else {
-    let pcb = waiter_at! p id;
-    if pcb != 0 { expire! p pcb now; };
-    wake_expired! p (id + 1) n now
-};
-
 // --- waiting for the system -------------------------------------------------------------
 //
 // One worker at a time asks the system, with the scheduler's lock: without waiting when others
 // are busy, now and then (`maybe_service!`), and waiting when it has nothing else, with the lock
-// let go and a descriptor of its own in the set, which a new waiter writes to (`interrupt_poll!`).
+// let go. The wake descriptor is in the set for good, and a new timer earlier than the wait writes
+// to it (`interrupt_poll!`); a new descriptor needs no telling, as `epoll` sees it at once.
 
-/// The descriptors waited for, as `pollfd`s, each one's process id beside it; then the wake
-/// descriptor. Answers how many.
-let fill_polls! !p !buf !ids !id !n !count = if id >= n { count } else {
-    let pcb = waiter_at! p id;
-    if pcb != 0 && prim.load64! (pcb + pcb_wait_fd) != 0 {
-        let at = buf + count * 8;
-        prim.store32! at (prim.load64! (pcb + pcb_wait_fd) - 1);
-        prim.store16! (at + 4) (if prim.load64! (pcb + pcb_wait_write) != 0 { 4 } else { 1 });
-        prim.store16! (at + 6) 0;
-        prim.store64! (ids + count * word) (prim.load64! (pcb + pcb_id));
-        fill_polls! p buf ids (id + 1) n (count + 1)
-    } else { fill_polls! p buf ids (id + 1) n count }
-};
-
-let wake_polled! !p !buf !ids !i !count = if i >= count { 0 } else {
-    if prim.load16! (buf + i * 8 + 6) != 0 {
-        let pcb = table_at! p (prim.load64! (ids + i * word));
-        pcb_lock! pcb;
-        prim.store64! (pcb + pcb_wait_fd) 0;
-        prim.store64! (pcb + pcb_wait_write) 0;
-        pcb_unlock! pcb;
-        wake! p pcb;
-    };
-    wake_polled! p buf ids (i + 1) count
+let wake_events! !p !buf !i !n = if i >= n { 0 } else {
+    let fd = prim.load32! (buf + i * 12 + 4);
+    if fd == prim.load64! (world_at! w_wakefd) {
+        prim.c3! "read" fd (prim.load64! (p + ctx_timebuf)) 8;
+    } else { fd_event! p fd (prim.load32! (buf + i * 12)); };
+    wake_events! p buf (i + 1) n
 };
 
 /// With the scheduler's lock held: wake whoever the system or the clock has an answer for,
-/// waiting up to `ms` for one (-1 for ever, 0 not at all). Answers how many were asked about.
+/// waiting up to `ms` for one (-1 for ever, 0 not at all).
 let service_waiters! !p !ms = {
-    let n = refresh_waiters! p 0 0;
-    let at = earliest_at! p 0 n (0 - 1);
+    expire_timers! p (now_ns! p);
+    let at = earliest_timer! ();
     prim.store64! (world_at! w_earliest) at;
     let now = now_ns! p;
     let until_timer = if at < 0 { 0 - 1 } else if at <= now { 0 } else { (at - now) / 1000000 + 1 };
     let wait = if ms == 0 { 0 } else if until_timer < 0 { ms } else if ms < 0 { until_timer } else if until_timer < ms { until_timer } else { ms };
-    let buf = poll_buffer! p (n * 16 + 16);
-    let ids = buf + (n + 1) * 8;
-    let count = fill_polls! p buf ids 0 n 0;
-    if wait != 0 {
-        // The wake descriptor last, so that a new waiter or a new timer cuts the wait short.
-        let at_ = buf + count * 8;
-        prim.store32! at_ (prim.load64! (world_at! w_wakefd));
-        prim.store16! (at_ + 4) 1;
-        prim.store16! (at_ + 6) 0;
+    let buf = poll_buffer! p (epoll_batch * 12);
+    let ep = prim.load64! (world_at! w_epfd);
+    let n = if wait != 0 {
         prim.store64! (world_at! w_polling) 1;
         sched_unlock! p;
-        prim.c3! "poll" buf (count + 1) wait;
+        let got = prim.sext32 (prim.c4! "epoll_wait" ep buf epoll_batch wait);
+        // What it found is woken before the lock is taken again: a slot has a lock of its own.
+        if got > 0 { wake_events! p buf 0 got; };
         sched_lock! p;
         prim.store64! (world_at! w_polling) 0;
-        if prim.load16! (at_ + 6) != 0 { prim.c3! "read" (prim.load64! (world_at! w_wakefd)) (prim.load64! (p + ctx_timebuf)) 8; };
-    } else if count != 0 { prim.c3! "poll" buf count 0; };
-    wake_polled! p buf ids 0 count;
-    wake_expired! p 0 (prim.load64! (world_at! w_wait_count)) (now_ns! p);
-    n
+        0
+    } else if prim.load64! (world_at! w_fd_waiting) != 0 { prim.sext32 (prim.c4! "epoll_wait" ep buf epoll_batch 0) }
+    else { 0 };
+    if n > 0 { wake_events! p buf 0 n; };
+    expire_timers! p (now_ns! p);
+    prim.store64! (world_at! w_earliest) (earliest_timer! ());
+    0
 };
 
 /// Between two processes, now and then: the clock and the system get a look in while there is
@@ -3049,7 +3229,7 @@ let maybe_service! !p = {
     let tick = prim.load64! (p + ctx_poll_tick) + 1;
     prim.store64! (p + ctx_poll_tick) tick;
     let e = prim.load64! (world_at! w_earliest);
-    if tick & 63 == 0 || (e >= 0 && now_ns! p >= e) {
+    if (tick & 63 == 0 && prim.load64! (world_at! w_fd_waiting) != 0) || (e >= 0 && now_ns! p >= e) {
         let l = prim.load64! (world_at! w_sched_lock);
         if try_lock! l {
             prim.store64! (p + ctx_sched_held) 1;
@@ -3078,7 +3258,7 @@ let dispatch! !p !pcb !b !c !d !e = {
 };
 
 let schedule! !p !a !b !c !d !e = {
-    if prim.load64! (world_at! w_wait_count) != 0 { maybe_service! p; };
+    if waiting_on_system! () { maybe_service! p; };
     let next = run_pop! p;
     if next != 0 { dispatch! p next 0 0 0 0 }
     else {
@@ -3132,7 +3312,7 @@ let idle! !p !a !b !c !d !e = {
         sched_unlock! p;
         schedule! p 0 0 0 0 0
     } else {
-        let n = refresh_waiters! p 0 0;
+        let n = if waiting_on_system! () { 1 } else { 0 };
         if prim.load64! (world_at! w_live) == 0 {
             // The last process to finish runs the end; there is nothing for this one to do.
             sleep_worker! p;
@@ -3142,7 +3322,9 @@ let idle! !p !a !b !c !d !e = {
             service_waiters! p (0 - 1);
             sched_unlock! p;
             schedule! p 0 0 0 0 0
-        } else if n == 0 && prim.load64! (world_at! w_idle) == started {
+        } else if prim.load64! (world_at! w_idle) == started && prim.load64! (world_at! w_fd_waiting) == 0
+                  && prim.load64! (world_at! w_pool_pending) == 0
+                  && prim.load64! (world_at! w_polling) == 0 && live_timers! p 0 0 == 0 {
             sched_unlock! p;
             deadlock! p 0 0 0 0 0
         } else {
@@ -3443,6 +3625,110 @@ let frame_enter_again! !p !sp !v !b !c !d = enter! p (sp + 2 * word) (prim.load6
 /// A shared thunk waited for, entered again when its owner has finished or given it back.
 let m_enter! !p !sp !self_ !s !c !d = enter! p sp s;
 
+// --- the blocking pool --------------------------------------------------------------------
+//
+// What the system has no way to do without blocking -- looking up a name, above all, which can
+// take seconds -- is handed to a few threads of its own, and the process parks until it is done,
+// so that its worker runs others meanwhile. A job is raw memory, `[next, function, four
+// arguments, result, process, done]`, and room after it for what the call writes. It may point
+// into the process's heap, which does not move while the process is parked.
+
+let job_fn = 8;
+let job_args = 16;
+let job_result = 48;
+let job_pcb = 56;
+let job_done = 64;
+/// Where a job's own buffers start.
+let job_room = 72;
+let job_bytes = 256;
+let pool_threads = 4;
+
+let new_job! !f !a !b !c !d = {
+    let job = prim.c2! "calloc" 1 job_bytes;
+    prim.store64! (job + job_fn) f;
+    prim.store64! (job + job_args) a;
+    prim.store64! (job + job_args + word) b;
+    prim.store64! (job + job_args + 2 * word) c;
+    prim.store64! (job + job_args + 3 * word) d;
+    job
+};
+
+/// `job` run by the pool for the running process, which is woken when it is done.
+let submit_job! !p !job = {
+    prim.store64! (job + job_pcb) (prim.load64! (current! p + pcb_id));
+    prim.xadd64! (world_at! w_pool_pending) 1;
+    let l = prim.load64! (world_at! w_pool_lock);
+    lock! l;
+    if prim.load64! (world_at! w_pool_started) == 0 {
+        prim.store64! (world_at! w_pool_started) pool_threads;
+        start_pool! 0 pool_threads;
+    };
+    prim.store64! job 0;
+    let tail = prim.load64! (world_at! w_pool_tail);
+    if tail == 0 { prim.store64! (world_at! w_pool_head) job; } else { prim.store64! tail job; };
+    prim.store64! (world_at! w_pool_tail) job;
+    prim.c1! "pthread_cond_signal" (prim.load64! (world_at! w_pool_cond));
+    unlock! l;
+    0
+};
+
+let start_pool! !i !n = if i >= n { 0 } else {
+    let c = prim.c2! "calloc" 1 ctx_size;
+    prim.store64! (c + ctx_classes) (prim.c2! "calloc" small_class_count word);
+    prim.store64! (c + ctx_timebuf) (prim.c2! "calloc" 2 word);
+    prim.store64! (c + ctx_run_lock) (new_lock! ());
+    prim.start_pool! c;
+    start_pool! (i + 1) n
+};
+
+let next_job! !l = {
+    let job = prim.load64! (world_at! w_pool_head);
+    if job == 0 {
+        prim.c2! "pthread_cond_wait" (prim.load64! (world_at! w_pool_cond)) l;
+        next_job! l
+    } else {
+        let next = prim.load64! job;
+        prim.store64! (world_at! w_pool_head) next;
+        if next == 0 { prim.store64! (world_at! w_pool_tail) 0; };
+        job
+    }
+};
+
+/// A pool thread: take a job, call it, wake whoever is waiting, for ever.
+let pool_loop! !p !a !b !c !d !e = {
+    let l = prim.load64! (world_at! w_pool_lock);
+    lock! l;
+    let job = next_job! l;
+    unlock! l;
+    let args = job + job_args;
+    let r = prim.ptr4! (prim.load64! (job + job_fn)) (prim.load64! args) (prim.load64! (args + word))
+        (prim.load64! (args + 2 * word)) (prim.load64! (args + 3 * word));
+    prim.store64! (job + job_result) r;
+    prim.store_rel! (job + job_done) 1;
+    let pcb = table_at! p (prim.load64! (job + job_pcb));
+    // Woken before it is no longer counted, so that nobody sees nothing left and nothing to run.
+    wake_from_pool! p pcb;
+    prim.xadd64! (world_at! w_pool_pending) (0 - 1);
+    pool_loop! p 0 0 0 0 0
+};
+
+/// A wake from a thread that is no worker: onto a worker's queue, chosen by the process.
+let wake_from_pool! !p !pcb = {
+    pcb_lock! pcb;
+    if prim.load64! (pcb + pcb_state) == state_waiting {
+        prim.store64! (pcb + pcb_state) state_ready;
+        pcb_unlock! pcb;
+        let w = prim.load64! (prim.load64! (world_at! w_worker_ctx) + (prim.load64! (pcb + pcb_id) % prim.load64! (world_at! w_started)) * word);
+        run_push_on! p w pcb
+    } else {
+        prim.store64! (pcb + pcb_woken) 1;
+        pcb_unlock! pcb;
+        0
+    }
+};
+
+let job_is_done! !job = prim.load_acq! (job + job_done) != 0;
+
 // --- workers ----------------------------------------------------------------------------
 //
 // One OS thread a core, each a context of its own and the scheduler, started at the first
@@ -3502,9 +3788,19 @@ let world_init! !p = {
     prim.store64! (world_at! w_sched_lock) (new_lock! ());
     prim.store64! (world_at! w_shared_lock) (new_lock! ());
     prim.store64! (world_at! w_lock) (new_lock! ());
+    prim.store64! (world_at! w_pool_lock) (new_lock! ());
+    prim.store64! (world_at! w_pool_cond) (prim.c2! "calloc" 1 64);
     prim.store64! (world_at! w_cond) (prim.c2! "calloc" 1 64);
     // EFD_NONBLOCK | EFD_CLOEXEC
     prim.store64! (world_at! w_wakefd) (prim.sext32 (prim.c2! "eventfd" 0 526336));
+    // EPOLL_CLOEXEC; the wake descriptor is in it for good, level-triggered.
+    prim.store64! (world_at! w_epfd) (prim.sext32 (prim.c1! "epoll_create1" 524288));
+    prim.store64! (world_at! w_fds) (map_memory! (fd_slots * slot_words * word));
+    let ev = prim.load64! (p + ctx_timebuf);
+    prim.store32! ev epoll_in;
+    prim.store32! (ev + 4) (prim.load64! (world_at! w_wakefd));
+    prim.store32! (ev + 8) 0;
+    prim.c4! "epoll_ctl" (prim.load64! (world_at! w_epfd)) 1 (prim.load64! (world_at! w_wakefd)) ev;
     prim.store64! (world_at! w_worker_ctx) (prim.c2! "calloc" max_workers word);
     prim.c2! "pthread_key_create" (world_at! w_cb_key) 0;
     prim.store64! (p + ctx_run_lock) (new_lock! ());
@@ -3655,7 +3951,7 @@ let set_wake_at! !p !pcb !at = {
     pcb_lock! pcb;
     prim.store64! (pcb + pcb_wake_at) at;
     pcb_unlock! pcb;
-    if at >= 0 { note_waiter! p pcb; };
+    if at >= 0 { note_timer! p pcb at; };
     0
 };
 
@@ -3910,6 +4206,7 @@ let io_close! !p !h = {
         let s = session_of! p h;
         if s != 0 { tls_goodbye! p s fd; };
         prim.store64! (prim.load64! (world_at! w_handles) + untag_fix h * handle_words * word) (0 - 1);
+        fd_closed! p fd;
         prim.c1! "close" fd;
         unit_word
     }
@@ -3918,13 +4215,29 @@ let io_close! !p !h = {
 let is_open! !p !h = as_word (fd_of! p h >= 0);
 
 /// Wait until `fd` can be read or written, by being called again.
+/// Wait until `fd` can be read or written, by being called again. What the system cannot wait
+/// on is tried again at once, after others have had a turn.
 let wait_fd! !p !sp !code !a !b !fd = {
     let pcb = current! p;
+    let write = prim.load64! (pcb + pcb_wait_write) != 0;
     pcb_lock! pcb;
     prim.store64! (pcb + pcb_wait_fd) (fd + 1);
     pcb_unlock! pcb;
-    note_waiter! p pcb;
-    park! p sp code a b unit_word
+    let answer = note_fd! p pcb fd write;
+    if answer == wait_parked { park! p sp code a b unit_word }
+    else {
+        pcb_lock! pcb;
+        prim.store64! (pcb + pcb_wait_fd) 0;
+        prim.store64! (pcb + pcb_wait_write) 0;
+        pcb_unlock! pcb;
+        let at = sp - 5 * word;
+        prim.store64! at (prim.info "retry_call");
+        prim.store64! (at + word) code;
+        prim.store64! (at + 2 * word) a;
+        prim.store64! (at + 3 * word) b;
+        prim.store64! (at + 4 * word) unit_word;
+        yield_now! p at unit_word 0 0 0
+    }
 };
 
 let io_read_m! !p !sp !self_ !h !n !d = {
@@ -4229,57 +4542,76 @@ let pipe_pair! !p = {
     buf
 };
 
-let in_child! !p !dir !env !program !argv !fds = {
-    let out = prim.load64! fds;
-    let err = prim.load64! (fds + word);
-    let status = prim.load64! (fds + 2 * word);
-    prim.c2! "dup2" (prim.load32! (out + 4)) 1;
-    prim.c2! "dup2" (if prim.load64! (fds + 3 * word) == true_word { prim.load32! (out + 4) } else { prim.load32! (err + 4) }) 2;
-    if dir != unit_word && prim.sext32 (prim.c1! "chdir" (string_bytes dir)) != 0 { 0 } else {
-        child_env! env 0 (untag_fix (prim.load64! (env + word)));
-        prim.c2! "execvp" (string_bytes program) argv;
-        0
-    };
-    let e = alloc! p word;
-    prim.store32! e (errno! ());
-    prim.c3! "write" (prim.load32! (status + 4)) e 4;
-    prim.c1! "_exit" 127
+// A child is started by `posix_spawnp`, which shares the parent's memory until it has called
+// `exec` rather than copying its page tables. `fork` copied them, and from many workers at once
+// the copies queued on the kernel's lock for the address space: two hundred children started by
+// as many processes took three times as long on 24 workers as on one.
+
+/// The environment a child gets: `env`'s entries, then the parent's not named in them.
+let child_envp! !p !env = {
+    let n = untag_fix (prim.load64! (env + word));
+    let environ = prim.load64! (prim.c2! "dlsym" 0 "environ");
+    let inherited = count_words! environ 0;
+    let out = alloc! p ((n + inherited + 1) * word);
+    fill_argv_from! env out 0 n;
+    let k = keep_unnamed! env environ out n 0 inherited;
+    prim.store64! (out + k * word) 0;
+    out
+};
+
+let count_words! !at !n = if prim.load64! (at + n * word) == 0 { n } else { count_words! at (n + 1) };
+
+let fill_argv_from! !a !out !i !n = if i >= n { 0 } else {
+    prim.store64! (out + i * word) (string_bytes (prim.load64! (a + (2 + i) * word)));
+    fill_argv_from! a out (i + 1) n
+};
+
+/// The parent's entries whose name `env` does not give again, after the `k` already there.
+let keep_unnamed! !env !environ !out !k !i !m = if i >= m { k } else {
+    let entry = prim.load64! (environ + i * word);
+    if names_one_of! env 0 (untag_fix (prim.load64! (env + word))) entry { keep_unnamed! env environ out k (i + 1) m }
+    else {
+        prim.store64! (out + k * word) entry;
+        keep_unnamed! env environ out (k + 1) (i + 1) m
+    }
+};
+
+let names_one_of! !env !i !n !entry = i < n && (same_name! (string_bytes (prim.load64! (env + (2 + i) * word))) entry 0 || names_one_of! env (i + 1) n entry);
+
+/// Whether two `NAME=value` strings name the same variable.
+let same_name! !a !b !i = {
+    let x = prim.load8! (a + i);
+    let y = prim.load8! (b + i);
+    if x != y { false } else if x == 61 { true } else if x == 0 { false } else { same_name! a b (i + 1) }
 };
 
 /// `[pid, out handle, err handle]`. `env` and `args` are arrays of strings.
 let spawn_child! !p !dir !env !program !args !joined = {
     let out = pipe_pair! p;
     let err = pipe_pair! p;
-    let status = pipe_pair! p;
     let argv = c_argv! p args program;
-    let pid = prim.sext32 (prim.c0! "fork");
-    if pid == 0 {
-        let fds = alloc! p (4 * word);
-        prim.store64! fds out;
-        prim.store64! (fds + word) err;
-        prim.store64! (fds + 2 * word) status;
-        prim.store64! (fds + 3 * word) joined;
-        in_child! p dir env program argv fds
-    }
-    else if pid < 0 { fail_path! p "exec" program }
-    else {
-        prim.c1! "close" (prim.load32! (out + 4));
-        prim.c1! "close" (prim.load32! (err + 4));
-        prim.c1! "close" (prim.load32! (status + 4));
-        let code = alloc! p word;
-        let got = prim.c3! "read" (prim.load32! status) code 4;
-        prim.c1! "close" (prim.load32! status);
-        if got > 0 {
-            prim.c1! "close" (prim.load32! out);
-            prim.c1! "close" (prim.load32! err);
-            prim.c3! "waitpid" pid 0 0;
-            fail_value! p (prim.atom "not_found") (concat3! p (text_of! p "exec ") program (concat2! p (text_of! p ": ") (c_text! p (prim.c1! "strerror" (prim.load32! code)))))
-        } else {
-            set_nonblocking! (prim.load32! out);
-            set_nonblocking! (prim.load32! err);
-            new_cons! p (tag_fix pid) (new_cons! p (add_handle! p (prim.load32! out) kind_stream_handle)
-                (new_cons! p (add_handle! p (prim.load32! err) kind_stream_handle) nil_word))
-        }
+    let envp = child_envp! p env;
+    // posix_spawn_file_actions_t is 80 bytes on glibc; room to spare.
+    let actions = alloc! p 128;
+    prim.c1! "posix_spawn_file_actions_init" actions;
+    prim.c3! "posix_spawn_file_actions_adddup2" actions (prim.load32! (out + 4)) 1;
+    prim.c3! "posix_spawn_file_actions_adddup2" actions (if joined == true_word { prim.load32! (out + 4) } else { prim.load32! (err + 4) }) 2;
+    if dir != unit_word { prim.c2! "posix_spawn_file_actions_addchdir_np" actions (string_bytes dir); };
+    let pid_at = alloc! p word;
+    let r = prim.sext32 (prim.c6! "posix_spawnp" pid_at (string_bytes program) actions 0 argv envp);
+    prim.c1! "posix_spawn_file_actions_destroy" actions;
+    prim.c1! "close" (prim.load32! (out + 4));
+    prim.c1! "close" (prim.load32! (err + 4));
+    if r != 0 {
+        prim.c1! "close" (prim.load32! out);
+        prim.c1! "close" (prim.load32! err);
+        fail_value! p (prim.atom "not_found") (concat3! p (text_of! p "exec ") program (concat2! p (text_of! p ": ") (c_text! p (prim.c1! "strerror" r))))
+    } else {
+        let pid = prim.sext32 (prim.load32! pid_at);
+        set_nonblocking! (prim.load32! out);
+        set_nonblocking! (prim.load32! err);
+        new_cons! p (tag_fix pid) (new_cons! p (add_handle! p (prim.load32! out) kind_stream_handle)
+            (new_cons! p (add_handle! p (prim.load32! err) kind_stream_handle) nil_word))
     }
 };
 
@@ -4294,6 +4626,37 @@ let child_status! !p !pid = {
     }
 };
 
+/// A child's exit status, waited for without holding a worker: on a `pidfd`, which the system
+/// says is readable when the child has exited, and until `deadline` (in nanoseconds; 0 for none),
+/// past which it answers `()`. The descriptor travels in the retry frame and is closed at the end.
+let child_wait_m! !p !sp !self_ !pid !deadline !held = {
+    let status = child_status! p pid;
+    let at = untag_fix deadline;
+    let late = at > 0 && now_ns! p >= at;
+    if status != unit_word || late {
+        // Told as closed first, so that no registration of it outlives it.
+        if is_fix held { fd_closed! p (untag_fix held); prim.c1! "close" (untag_fix held); };
+        return! p sp status
+    } else {
+        let fd = if is_fix held { untag_fix held } else { prim.sext32 (prim.c3! "syscall" 434 (untag_fix pid) 0) };
+        let pcb = current! p;
+        if at > 0 { set_wake_at! p pcb at; };
+        let code = prim.load64! (prim.info "m_child");
+        if fd < 0 {
+            // A system without pidfds: look again in a millisecond.
+            set_wake_at! p pcb (now_ns! p + 1000000);
+            park! p sp code pid deadline unit_word
+        } else {
+            pcb_lock! pcb;
+            prim.store64! (pcb + pcb_wait_fd) (fd + 1);
+            prim.store64! (pcb + pcb_wait_write) 0;
+            pcb_unlock! pcb;
+            if note_fd! p pcb fd false == wait_again { prim.store64! (pcb + pcb_woken) 1; };
+            park! p sp code pid deadline (tag_fix fd)
+        }
+    }
+};
+
 let child_kill! !p !pid = {
     prim.c2! "kill" (untag_fix pid) 9;
     unit_word
@@ -4305,7 +4668,38 @@ let af_inet = 2;
 let sock_stream = 1;
 let sockaddr_bytes = 16;
 
-/// The IPv4 address of `host`, in network order, or -1.
+/// The IPv4 address of `host` if it is written as one, in network order, or -1.
+let numeric_ipv4! !p !host = {
+    let buf = prim.load64! (p + ctx_timebuf);
+    if prim.sext32 (prim.c3! "inet_pton" af_inet (string_bytes host) buf) == 1 { prim.load32! buf } else { 0 - 1 }
+};
+
+/// A lookup of `host` for the pool: `getaddrinfo` with its hints and its answer in the job.
+let resolve_job! !p !host = {
+    let job = new_job! (prim.c2! "dlsym" 0 "getaddrinfo") (string_bytes host) 0 0 0;
+    let hints = job + job_room;
+    prim.store32! (hints + 4) af_inet;
+    prim.store32! (hints + 8) sock_stream;
+    prim.store64! (job + job_args + 2 * word) hints;
+    prim.store64! (job + job_args + 3 * word) (job + job_room + 64);
+    job
+};
+
+/// What a finished lookup found, the job freed: an address or -1.
+let resolved! !job = {
+    let r = prim.sext32 (prim.load64! (job + job_result));
+    let ip = if r != 0 { 0 - 1 } else {
+        let info = prim.load64! (job + job_room + 64);
+        let ip_ = prim.load32! (prim.load64! (info + 24) + 4);
+        prim.c1! "freeaddrinfo" info;
+        ip_
+    };
+    prim.c1! "free" job;
+    ip
+};
+
+/// The IPv4 address of `host`, in network order, or -1. This one blocks its worker, and is for
+/// what cannot park; a process that can uses the pool (`net_connect_m!`).
 let resolve_ipv4! !p !host = {
     let hints = alloc! p 48;
     zero_words! hints 6;
@@ -4379,10 +4773,26 @@ let net_accept_m! !p !sp !self_ !h !c !d = {
     }
 };
 
-let net_connect_m! !p !sp !self_ !host !port !d = {
+/// `connect!`. A name that is not an address is looked up by the pool, the process parked
+/// meanwhile with the job, tagged, as its third word.
+let net_connect_m! !p !sp !self_ !host !port !d =
     if not (is_string! host) || not (port_ok port) { fail! p atom_type_error "connect! needs a host and a port"; native_failed! p sp 0 0 0 0 }
     else {
-        let ip = resolve_ipv4! p host;
+        let numeric = numeric_ipv4! p host;
+        if numeric >= 0 { connect_to! p sp host port numeric }
+        else if is_fix d {
+            let job = untag_fix d;
+            if job_is_done! job { connect_to! p sp host port (resolved! job) }
+            else { park! p sp (prim.load64! (prim.info "m_connect")) host port d }
+        } else {
+            let job = resolve_job! p host;
+            submit_job! p job;
+            park! p sp (prim.load64! (prim.info "m_connect")) host port (tag_fix job)
+        }
+    };
+
+let connect_to! !p !sp !host !port !ip = {
+    {
         if ip < 0 {
             fail_value! p (prim.atom "not_found") (concat2! p (text_of! p "cannot resolve ") host);
             native_failed! p sp 0 0 0 0
@@ -4415,6 +4825,7 @@ let net_connected_m! !p !sp !self_ !h !c !d = {
     let e = prim.load32! code;
     if e == 0 { return! p sp h }
     else {
+        fd_closed! p fd;
         prim.c1! "close" fd;
         prim.store64! (prim.load64! (world_at! w_handles) + untag_fix h * handle_words * word) (0 - 1);
         fail_value! p (errno_kind e) (concat2! p (text_of! p "connect: ") (c_text! p (prim.c1! "strerror" e)));
