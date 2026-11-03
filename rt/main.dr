@@ -93,7 +93,12 @@ let ctx_marks_cap = 544;
 let ctx_census_ctx = 552;
 let ctx_holds_pcb = 560;
 let ctx_reporting = 568;
-let ctx_size = 576;
+/// Receives that went on without parking since this worker last scheduled (`fair_turn!`).
+let ctx_quick = 576;
+/// Where cells are carved from next, and where that slab ends (`cell_get!`).
+let ctx_cell_cursor = 584;
+let ctx_cell_end = 592;
+let ctx_size = 600;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -192,23 +197,35 @@ let slab_bytes = 2097152;
 
 let class_of !size !c = if size <= small_chunk { c } else { class_of (size / 2) (c + 1) };
 
-let class_head! !p !size = prim.load64! (p + ctx_classes) + class_of size 0 * word;
+/// A class's state: `[free list, cursor, end]`, the cursor walking the slab it carves from.
+let class_words = 3;
 
-let carve! !head !at !size !left = if left < size { 0 } else {
-    prim.store64! at (prim.load64! head);
-    prim.store64! (at + word) size;
-    prim.store64! head at;
-    carve! head (at + size) size (left - size)
-};
+let class_head! !p !size = prim.load64! (p + ctx_classes) + class_of size 0 * class_words * word;
 
+// A slab is carved as it is used, one chunk at a time, not all at once: carving the whole of it
+// wrote a link into every chunk and so touched all 512 of its pages, a fault each, before the
+// first one was handed out. A worker new to a size paid a millisecond or two for that, in the
+// middle of whatever it was doing.
 let chunk_get! !p !size =
     if size > slab_bytes / 2 { take_chunk! p size }
     else {
         let head = class_head! p size;
-        if prim.load64! head == 0 { carve! head (map_memory! slab_bytes) size slab_bytes; };
+        let csize = small_chunk << class_of size 0;
         let c = prim.load64! head;
-        prim.store64! head (prim.load64! c);
-        c
+        if c != 0 {
+            prim.store64! head (prim.load64! c);
+            c
+        } else {
+            if prim.load64! (head + word) + csize > prim.load64! (head + 2 * word) {
+                let slab = map_memory! slab_bytes;
+                prim.store64! (head + word) slab;
+                prim.store64! (head + 2 * word) (slab + slab_bytes);
+            };
+            let fresh_ = prim.load64! (head + word);
+            prim.store64! (head + word) (fresh_ + csize);
+            prim.store64! (fresh_ + word) csize;
+            fresh_
+        }
     };
 
 let chunk_put! !p !c = {
@@ -1441,7 +1458,7 @@ let raise_text! !p !sp s = {
 /// A process's context and its empty stack, whose top holds the frame that ends it.
 let init! () = {
     let p = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (p + ctx_classes) (prim.c2! "calloc" small_class_count word);
+    prim.store64! (p + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
     prim.store64! (p + ctx_timebuf) (prim.c2! "calloc" 2 word);
     world_init! p;
     note_context! p;
@@ -1695,6 +1712,33 @@ let type_fail! !p s = fail! p atom_type_error s;
 
 // --- walking out of a raise ---------------------------------------------------------
 
+/// Which worker's queue holds `pcb`, or -1.
+let queued_on! !pcb !i !n = if i >= n { 0 - 1 } else {
+    let w = prim.load64! (prim.load64! (world_at! w_worker_ctx) + i * word);
+    if in_queue! (prim.load64! (w + ctx_run_head)) pcb { i } else { queued_on! pcb (i + 1) n }
+};
+
+let in_queue! !q !pcb = q != 0 && (q == pcb || in_queue! (prim.load64! (q + pcb_next)) pcb);
+
+/// `DREAM_DUMP`: every process's state, on standard error, when the first one fails -- for finding
+/// what a program that went wrong was waiting on.
+let dump_processes! !p !id !n = if id >= n { 0 } else {
+    let pcb = table_at! p id;
+    if pcb != 0 {
+        let buf = prim.c1! "malloc" 300;
+        prim.c6! "snprintf" buf 300 "process %ld: state %ld mail %ld wake_at %ld\n" id (prim.load64! (pcb + pcb_state))
+            (prim.load64! (pcb + pcb_mail_count)) (prim.load64! (pcb + pcb_wake_at));
+        prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+        prim.c6! "snprintf" buf 300 "    fd %ld worker %p woken %ld pinned %p\n" (prim.load64! (pcb + pcb_wait_fd)) (prim.load64! (pcb + pcb_worker))
+            (prim.load64! (pcb + pcb_woken)) (prim.load64! (pcb + pcb_pinned));
+        prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+        prim.c6! "snprintf" buf 300 "    queued on %ld\n" (queued_on! pcb 0 (prim.load64! (world_at! w_started))) 0;
+        prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+        prim.c1! "free" buf;
+    };
+    dump_processes! p (id + 1) n
+};
+
 /// Every thunk being forced on the way up is left raising the same error, because
 /// what it would have computed is gone, and forcing it again must not pretend.
 let unwind! !p !at !e !b !c !d = {
@@ -1710,6 +1754,7 @@ let unwind! !p !at !e !b !c !d = {
     } else if kind == frame_halt {
         // The first process failing ends the run; what it was is the library's to say.
         if prim.load64! (current! p + pcb_id) == 1 {
+            if prim.c1! "getenv" "DREAM_DUMP" != 0 { dump_processes! p 1 (prim.load64! (world_at! w_next_id)); };
             prim.store64! (at - word) e;
             apply! p (at - word) (prim.info "lib_uncaught") 1 0 0
         } else { finish! p e 1 0 0 0 }
@@ -3975,16 +4020,16 @@ let cell_get! !p = {
         prim.store64! (p + ctx_cells) (prim.load64! c);
         c
     } else {
-        let slab = map_memory! slab_bytes;
-        cells_carve! p (slab + cell_bytes) (slab_bytes / cell_bytes - 1);
-        slab
+        // Carved as used, as a chunk is (`chunk_get!`), so that a fresh slab is not a fault a page.
+        if prim.load64! (p + ctx_cell_cursor) + cell_bytes > prim.load64! (p + ctx_cell_end) {
+            let slab = map_memory! slab_bytes;
+            prim.store64! (p + ctx_cell_cursor) slab;
+            prim.store64! (p + ctx_cell_end) (slab + slab_bytes);
+        };
+        let fresh_ = prim.load64! (p + ctx_cell_cursor);
+        prim.store64! (p + ctx_cell_cursor) (fresh_ + cell_bytes);
+        fresh_
     }
-};
-
-let cells_carve! !p !at !n = if n == 0 { 0 } else {
-    prim.store64! at (prim.load64! (p + ctx_cells));
-    prim.store64! (p + ctx_cells) at;
-    cells_carve! p (at + cell_bytes) (n - 1)
 };
 
 let cell_put! !p !c = {
@@ -4099,10 +4144,22 @@ let park! !p !sp !code !a !b !c = {
         leave! p pcb;
         run_push! p pcb;
         schedule! p 0 0 0 0 0
-    } else if prim.load64! (pcb + pcb_woken) != 0 {
+    } else if prim.load64! (pcb + pcb_woken) != 0 && prim.load64! (p + ctx_run_head) == 0 {
         prim.store64! (pcb + pcb_woken) 0;
         pcb_unlock! pcb;
         frame_retry_call! p at unit_word 0 0 0
+    } else if prim.load64! (pcb + pcb_woken) != 0 {
+        // Woken already, but others are waiting here: going round at once would never let this
+        // worker reach its queue while two processes answer each other faster than either parks,
+        // which on two workers kept a third from running at all. It goes to the back instead.
+        prim.store64! (pcb + pcb_woken) 0;
+        prim.store64! (pcb + pcb_sp) at;
+        prim.store64! (pcb + pcb_resume) unit_word;
+        prim.store64! (pcb + pcb_state) state_ready;
+        pcb_unlock! pcb;
+        leave! p pcb;
+        run_push! p pcb;
+        schedule! p 0 0 0 0 0
     } else {
         prim.store64! (pcb + pcb_sp) at;
         prim.store64! (pcb + pcb_resume) unit_word;
@@ -4195,7 +4252,7 @@ let submit_job! !p !job = {
 
 let start_pool! !i !n = if i >= n { 0 } else {
     let c = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (c + ctx_classes) (prim.c2! "calloc" small_class_count word);
+    prim.store64! (c + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
     prim.store64! (c + ctx_timebuf) (prim.c2! "calloc" 2 word);
     prim.store64! (c + ctx_run_lock) (new_lock! ());
     prim.start_pool! c;
@@ -4260,7 +4317,7 @@ let max_workers = 256;
 
 let new_worker_ctx! !index = {
     let w = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (w + ctx_classes) (prim.c2! "calloc" small_class_count word);
+    prim.store64! (w + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
     prim.store64! (w + ctx_timebuf) (prim.c2! "calloc" 2 word);
     prim.store64! (w + ctx_run_lock) (new_lock! ());
     prim.store64! (w + ctx_index) index;
@@ -4415,7 +4472,32 @@ let mail_pop! !p !pcb = {
     v
 };
 
-let recv_m! !p !sp !self_ !a !c !d = {
+/// Whether a receive that could go straight on should give way first. Two processes answering each
+/// other on two workers never park, so neither worker reached its queue and what was waiting there
+/// ran only at the next tick -- ten milliseconds, in which a program polling for something a third
+/// process does asked five hundred times and gave up. The VM gives way after so many reductions;
+/// here it is after so many receives, when anything is waiting.
+let fair_turn! !p = {
+    let n = prim.load64! (p + ctx_quick) + 1;
+    prim.store64! (p + ctx_quick) n;
+    n & 63 == 0 && prim.load64! (p + ctx_run_head) != 0
+};
+
+/// A blocking call that could go on, put to the back of the queue instead, to be called again.
+let give_way! !p !sp !code !a !b !c = {
+    let at = sp - 5 * word;
+    prim.store64! at (prim.info "retry_call");
+    prim.store64! (at + word) code;
+    prim.store64! (at + 2 * word) a;
+    prim.store64! (at + 3 * word) b;
+    prim.store64! (at + 4 * word) c;
+    prim.store64! (p + ctx_quick) 1;
+    yield_now! p at unit_word 0 0 0
+};
+
+let recv_m! !p !sp !self_ !a !c !d = if fair_turn! p {
+    give_way! p sp (prim.load64! (prim.info "m_recv")) unit_word unit_word unit_word
+} else {
     let pcb = my_mail! p;
     if prim.load64! (pcb + pcb_mail_count) != 0 {
         let v = mail_pop! p pcb;
@@ -4480,7 +4562,9 @@ let set_wake_at! !p !pcb !at = {
     0
 };
 
-let await_message_m! !p !sp !self_ !n !deadline !d = {
+let await_message_m! !p !sp !self_ !n !deadline !d = if fair_turn! p {
+    give_way! p sp (prim.load64! (prim.info "m_await")) n deadline unit_word
+} else {
     let pcb = current! p;
     let at = untag_fix deadline;
     if prim.load64! (pcb + pcb_mail_count) > untag_fix n { return! p sp atom_ok }
@@ -4557,6 +4641,10 @@ let unique_value! !p !unit = tag_fix (prim.xadd64! (world_at! w_unique) 1 + 1);
 
 let start_ticking! !p = if prim.load64! (world_at! w_ticking) == 0 {
     prim.store64! (world_at! w_ticking) 1;
+    // `DREAM_TICK_US`: a shorter tick, for running a program under more preemption than it meets.
+    let us = prim.c1! "getenv" "DREAM_TICK_US";
+    let n = if us == 0 { 0 } else { prim.c3! "strtol" us 0 10 };
+    if n >= 50 { prim.store64! (prim.info "tick_us") n; };
     prim.store_rel! (prim.info "tick_count") (prim.load64! (world_at! w_started));
     prim.tick_thread! ()
 } else { 0 };
