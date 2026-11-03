@@ -2621,8 +2621,10 @@ let pcb_mail_fresh = 224;
 let pcb_worker = 232;
 /// A wake that came while it was not parked (see "locks").
 let pcb_woken = 240;
-/// A `pthread_mutex_t`, in place.
+/// A word spun on (see "locks").
 let pcb_lock = 248;
+/// The worker it is pinned to, or 0: one that has called C runs on that thread from then on.
+let pcb_pinned = 256;
 let pcb_size = 312;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
@@ -2694,7 +2696,9 @@ let new_pid! !p !id = {
 let run_push! !p !pcb = run_push_on! p p pcb;
 
 /// `pcb` on worker `w`'s queue, from this context, which is `w` itself but for the blocking pool.
-let run_push_on! !p !w !pcb = {
+let run_push_on! !p !w0 !pcb = {
+    let pinned = prim.load64! (pcb + pcb_pinned);
+    let w = if pinned != 0 { pinned } else { w0 };
     prim.store64! (pcb + pcb_next) 0;
     let l = prim.load64! (w + ctx_run_lock);
     spin_lock! l;
@@ -2704,8 +2708,14 @@ let run_push_on! !p !w !pcb = {
     prim.store64! (w + ctx_run_count) (prim.load64! (w + ctx_run_count) + 1);
     spin_unlock! l;
     // Someone asleep may have nothing, and this is something; unless someone is already looking,
-    // who will find it without a trip through the kernel.
-    if prim.load_acq! (world_at! w_idle) != 0 && prim.load_acq! (world_at! w_spinning) == 0 { nudge! p; };
+    // who will find it without a trip through the kernel. On another worker's queue it is for that
+    // worker -- it is pinned there, or the pool chose it -- and every sleeper is woken, as which
+    // of them a signal wakes is the kernel's choice, and only that one may take a pinned process.
+    if prim.load_acq! (world_at! w_idle) != 0 {
+        if w != p { nudge_all! p; } else if prim.load_acq! (world_at! w_spinning) == 0 { nudge! p; };
+    };
+    // And the worker it is for may be the one waiting in `epoll`, which no condition reaches.
+    if w != p && prim.load_acq! (world_at! w_polling) != 0 { interrupt_poll! p; };
     0
 };
 
@@ -2714,6 +2724,15 @@ let nudge! !p = if prim.load64! (p + ctx_sched_held) != 0 {
 } else {
     sched_lock! p;
     prim.c1! "pthread_cond_signal" (prim.load64! (world_at! w_cond));
+    sched_unlock! p;
+    0
+};
+
+let nudge_all! !p = if prim.load64! (p + ctx_sched_held) != 0 {
+    prim.c1! "pthread_cond_broadcast" (prim.load64! (world_at! w_cond))
+} else {
+    sched_lock! p;
+    prim.c1! "pthread_cond_broadcast" (prim.load64! (world_at! w_cond));
     sched_unlock! p;
     0
 };
@@ -2743,6 +2762,9 @@ let run_pop! !p = if prim.load64! (p + ctx_run_head) == 0 { 0 } else {
     pcb
 };
 
+let unpinned_run! !pcb !n !k = if k >= n || pcb == 0 || prim.load64! (pcb + pcb_pinned) != 0 { k }
+    else { unpinned_run! (prim.load64! (pcb + pcb_next)) n (k + 1) };
+
 /// The first `n` of a queue cut off it: the rest, which stays.
 let cut_after! !pcb !n = if n <= 1 || prim.load64! (pcb + pcb_next) == 0 { pcb } else { cut_after! (prim.load64! (pcb + pcb_next)) (n - 1) };
 
@@ -2752,8 +2774,9 @@ let steal_from! !p !w = if w == p || prim.load64! (w + ctx_run_head) == 0 { 0 } 
     spin_lock! l;
     let head = prim.load64! (w + ctx_run_head);
     let count = prim.load64! (w + ctx_run_count);
-    let got = if head == 0 { 0 } else {
-        let n = (count + 1) / 2;
+    let got = if head == 0 || prim.load64! (head + pcb_pinned) != 0 { 0 } else {
+        // Half, but no further than the first that is pinned here.
+        let n = unpinned_run! head ((count + 1) / 2) 0;
         let last = cut_after! head n;
         let rest = prim.load64! (last + pcb_next);
         prim.store64! (w + ctx_run_head) rest;
@@ -2787,9 +2810,15 @@ let steal! !p = {
     if n <= 1 { 0 } else { steal_round! p 0 n (prim.load64! (p + ctx_index) + 1) }
 };
 
-let anything_queued! !i !n = if i >= n { false } else {
+/// Anything in any queue, pinned or not: what the deadlock test asks, since a worker woken for
+/// a process pinned to it may not have taken the lock again yet.
+let any_queue! !i !n = i < n && (prim.load64! (prim.load64! (prim.load64! (world_at! w_worker_ctx) + i * word) + ctx_run_head) != 0 || any_queue! (i + 1) n);
+
+/// Anything this worker could run: its own queue, or another's not starting with one pinned there.
+let anything_queued! !p !i !n = if i >= n { false } else {
     let w = prim.load64! (prim.load64! (world_at! w_worker_ctx) + i * word);
-    prim.load64! (w + ctx_run_head) != 0 || anything_queued! (i + 1) n
+    let head = prim.load64! (w + ctx_run_head);
+    (head != 0 && (w == p || prim.load64! (head + pcb_pinned) == 0)) || anything_queued! p (i + 1) n
 };
 
 /// Runnable again, if it was parked; if not, it is told, so that the park it may be about
@@ -3307,7 +3336,7 @@ let idle! !p !a !b !c !d !e = {
     // Counted asleep before looking, so that a push after the look is sure to wake someone.
     prim.xadd64! (world_at! w_idle) 1;
     let started = prim.load64! (world_at! w_started);
-    if anything_queued! 0 started {
+    if anything_queued! p 0 started {
         prim.xadd64! (world_at! w_idle) (0 - 1);
         sched_unlock! p;
         schedule! p 0 0 0 0 0
@@ -3323,7 +3352,7 @@ let idle! !p !a !b !c !d !e = {
             sched_unlock! p;
             schedule! p 0 0 0 0 0
         } else if prim.load64! (world_at! w_idle) == started && prim.load64! (world_at! w_fd_waiting) == 0
-                  && prim.load64! (world_at! w_pool_pending) == 0
+                  && prim.load64! (world_at! w_pool_pending) == 0 && not (any_queue! 0 started)
                   && prim.load64! (world_at! w_polling) == 0 && live_timers! p 0 0 == 0 {
             sched_unlock! p;
             deadlock! p 0 0 0 0 0
@@ -6755,7 +6784,34 @@ let s_accepted = 64;
 let s_kind = 72;
 let s_message = 80;
 let s_server = 88;
-let s_bytes = 96;
+/// The process using the session now, or 0 (`session_hold!`).
+let s_holder = 96;
+let s_bytes = 104;
+
+// A session is one OpenSSL object and its buffers, and two processes on two workers may use one
+// connection at once -- one reading, one writing, as HTTP/2 and WebSockets do. So a call holds the
+// session for the stretch of work between two parks: by the process's id, so that a call going
+// round again holds it already, and given up before every park, answer and failure. A process
+// that finds it held waits for that stretch, which never waits for anything itself.
+
+let session_hold! !p !s = {
+    let me = prim.load64! (current! p + pcb_id);
+    if prim.load_acq! (s + s_holder) == me { 0 } else { session_take! s me 0 }
+};
+
+let session_take! !s !me !n =
+    if prim.cas64! (s + s_holder) 0 me == 0 { 0 }
+    else {
+        if n > 4096 { prim.c0! "sched_yield"; } else { prim.pause! (); };
+        session_take! s me (n + 1)
+    };
+
+let session_let_go! !s = if s != 0 { prim.store_rel! (s + s_holder) 0 } else { 0 };
+
+let tls_return! !p !sp !s !v = { session_let_go! s; return! p sp v };
+/// `wait_fd!` for a TLS handle `h`, whose session is let go first.
+let tls_wait_fd2! !p !sp !code !h !b !fd = { session_let_go! (session_of! p h); wait_fd! p sp code h b fd };
+let tls_failed_exit! !p !sp !s = { session_let_go! s; native_failed! p sp 0 0 0 0 };
 
 let tls_handshaking = 0;
 let tls_ready = 1;
@@ -7099,19 +7155,20 @@ let ssl_outcome! !p !s !fd !r !handshaking = {
 let tls_handshake_m! !p !sp !self_ !h !c !d = {
     let fd = fd_of! p h;
     let s = session_of! p h;
-    if fd < 0 || s == 0 { closed! p "this handle is closed"; native_failed! p sp 0 0 0 0 }
-    else if prim.load64! (s + s_state) == tls_failed { refused! p s; native_failed! p sp 0 0 0 0 }
+    if s != 0 { session_hold! p s; };
+    if fd < 0 || s == 0 { closed! p "this handle is closed"; tls_failed_exit! p sp s }
+    else if prim.load64! (s + s_state) == tls_failed { refused! p s; tls_failed_exit! p sp s }
     else {
         let flushed = flush_tls! p s fd;
         if flushed == 1 {
             prim.store64! (current! p + pcb_wait_write) 1;
-            wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
+            tls_wait_fd2! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
         }
         else if flushed == 2 {
             session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the connection failed");
-            native_failed! p sp 0 0 0 0
+            tls_failed_exit! p sp s
         }
-        else if prim.load64! (s + s_state) == tls_ready { return! p sp h }
+        else if prim.load64! (s + s_state) == tls_ready { tls_return! p sp s h }
         else {
             clear_ssl_errors! p;
             let r = prim.sext32 (prim.ptr1! (sym! p "SSL_do_handshake") (prim.load64! (s + s_ssl)));
@@ -7121,23 +7178,23 @@ let tls_handshake_m! !p !sp !self_ !h !c !d = {
                 tls_handshake_m! p sp 0 h 0 0
             } else {
                 let o = ssl_outcome! p s fd r true;
-                if o == 0 { native_failed! p sp 0 0 0 0 }
+                if o == 0 { tls_failed_exit! p sp s }
                 else if o == 3 {
                     session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the peer closed the connection during the handshake");
-                    native_failed! p sp 0 0 0 0
+                    tls_failed_exit! p sp s
                 }
                 else {
                     let more = flush_tls! p s fd;
                     if more == 1 {
                         prim.store64! (current! p + pcb_wait_write) 1;
-                        wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
+                        tls_wait_fd2! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd
                     }
                     else {
                         let pulled = pull_tls! p s fd;
-                        if pulled == 1 { wait_fd! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd }
+                        if pulled == 1 { tls_wait_fd2! p sp (prim.load64! (prim.info "m_tls_handshake")) h unit_word fd }
                         else if pulled == 2 {
                             session_failed! p s fd (prim.atom "handshake_failed") (text_of! p "the connection failed");
-                            native_failed! p sp 0 0 0 0
+                            tls_failed_exit! p sp s
                         }
                         else { tls_handshake_m! p sp 0 h 0 0 }
                     }
@@ -7150,14 +7207,15 @@ let tls_handshake_m! !p !sp !self_ !h !c !d = {
 let tls_read_m! !p !sp !self_ !h !n !d = {
     let fd = fd_of! p h;
     let s = session_of! p h;
-    if prim.load64! (s + s_state) != tls_ready { refused! p s; native_failed! p sp 0 0 0 0 }
+    if s != 0 { session_hold! p s; };
+    if prim.load64! (s + s_state) != tls_ready { refused! p s; tls_failed_exit! p sp s }
     else {
         let flushed = flush_tls! p s fd;
         if flushed == 1 {
             prim.store64! (current! p + pcb_wait_write) 1;
-            wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd
+            tls_wait_fd2! p sp (prim.load64! (prim.info "m_read")) h n fd
         }
-        else if flushed == 2 { fail_errno! p (text_of! p "write"); native_failed! p sp 0 0 0 0 }
+        else if flushed == 2 { fail_errno! p (text_of! p "write"); tls_failed_exit! p sp s }
         else {
             let want = if untag_fix n > 16777216 { 16777216 } else { untag_fix n };
             let out = new_string! p want;
@@ -7169,21 +7227,21 @@ let tls_read_m! !p !sp !self_ !h !n !d = {
                 let count = prim.load64! got;
                 prim.store64! (out + word) count;
                 prim.store8! (string_bytes out + count) 0;
-                return! p sp out
+                tls_return! p sp s out
             } else {
                 let o = ssl_outcome! p s fd 0 false;
-                if o == 0 { native_failed! p sp 0 0 0 0 }
-                else if o == 3 || prim.load64! (s + s_eof) != 0 { return! p sp (text_of! p "") }
+                if o == 0 { tls_failed_exit! p sp s }
+                else if o == 3 || prim.load64! (s + s_eof) != 0 { tls_return! p sp s (text_of! p "") }
                 else {
                     let more = flush_tls! p s fd;
                     if more == 1 {
                         prim.store64! (current! p + pcb_wait_write) 1;
-                        wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd
+                        tls_wait_fd2! p sp (prim.load64! (prim.info "m_read")) h n fd
                     }
                     else {
                         let pulled = pull_tls! p s fd;
-                        if pulled == 1 { wait_fd! p sp (prim.load64! (prim.info "m_read")) h n fd }
-                        else if pulled == 2 { fail_errno! p (text_of! p "read"); native_failed! p sp 0 0 0 0 }
+                        if pulled == 1 { tls_wait_fd2! p sp (prim.load64! (prim.info "m_read")) h n fd }
+                        else if pulled == 2 { fail_errno! p (text_of! p "read"); tls_failed_exit! p sp s }
                         else { tls_read_m! p sp 0 h n 0 }
                     }
                 }
@@ -7195,18 +7253,19 @@ let tls_read_m! !p !sp !self_ !h !n !d = {
 let tls_write_m! !p !sp !self_ !h !text !d = {
     let fd = fd_of! p h;
     let s = session_of! p h;
-    if prim.load64! (s + s_state) != tls_ready { refused! p s; native_failed! p sp 0 0 0 0 }
+    if s != 0 { session_hold! p s; };
+    if prim.load64! (s + s_state) != tls_ready { refused! p s; tls_failed_exit! p sp s }
     else {
         let flushed = flush_tls! p s fd;
         if flushed == 1 {
             prim.store64! (current! p + pcb_wait_write) 1;
-            wait_fd! p sp (prim.load64! (prim.info "m_write")) h text fd
+            tls_wait_fd2! p sp (prim.load64! (prim.info "m_write")) h text fd
         }
-        else if flushed == 2 { fail_errno! p (text_of! p "write"); native_failed! p sp 0 0 0 0 }
+        else if flushed == 2 { fail_errno! p (text_of! p "write"); tls_failed_exit! p sp s }
         else if prim.load64! (s + s_accepted) != 0 {
             let n = prim.load64! (s + s_accepted);
             prim.store64! (s + s_accepted) 0;
-            return! p sp (tag_fix n)
+            tls_return! p sp s (tag_fix n)
         }
         else {
             let take = if string_len! text > 65536 { 65536 } else { string_len! text };
@@ -7216,11 +7275,11 @@ let tls_write_m! !p !sp !self_ !h !text !d = {
             take_output! p s;
             if r != 1 && take != 0 {
                 let o = ssl_outcome! p s fd 0 false;
-                if o == 0 { native_failed! p sp 0 0 0 0 }
-                else { fail! p (prim.atom "connection_lost") "the connection closed during a write"; native_failed! p sp 0 0 0 0 }
+                if o == 0 { tls_failed_exit! p sp s }
+                else { fail! p (prim.atom "connection_lost") "the connection closed during a write"; tls_failed_exit! p sp s }
             } else {
                 prim.store64! (s + s_accepted) take;
-                if take == 0 { prim.store64! (s + s_accepted) 0; return! p sp (tag_fix 0) }
+                if take == 0 { prim.store64! (s + s_accepted) 0; tls_return! p sp s (tag_fix 0) }
                 else { tls_write_m! p sp 0 h text 0 }
             }
         }
@@ -7229,11 +7288,13 @@ let tls_write_m! !p !sp !self_ !h !text !d = {
 
 /// The close alert, sent if it can be without waiting.
 let tls_goodbye! !p !s !fd = if prim.load64! (s + s_state) == tls_ready {
+    session_hold! p s;
     clear_ssl_errors! p;
     prim.ptr1! (sym! p "SSL_shutdown") (prim.load64! (s + s_ssl));
     clear_ssl_errors! p;
     take_output! p s;
     flush_tls! p s fd;
+    session_let_go! s;
     0
 } else { 0 };
 
@@ -7408,6 +7469,10 @@ let ffi_answer! !p !k !w =
 /// `spec` is `[values, codes, kind]`. A machine function, because a callback from C runs on
 /// this process's stack, below where this stands.
 let ffi_call_m! !p !sp0 !self_ !f !spec !d = {
+    // A library may keep state for the thread that called it -- a GUI toolkit, a GL context, a
+    // thread-local error -- so a process that calls C stays on this worker from now on.
+    let me = current! p;
+    if prim.load64! (me + pcb_pinned) == 0 { prim.store64! (me + pcb_pinned) p; };
     // C may call back, onto this stack, which cannot move while it does.
     let sp = if prim.load64! (current! p + pcb_stack_size) < 1048576 && prim.load64! (p + ctx_in_callback) == 0 { move_stack! p sp0 1048576 } else { sp0 };
     let values = prim.load64! (spec + 2 * word);
