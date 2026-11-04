@@ -2814,6 +2814,16 @@ let byte_slice! !p !s !from !to = {
     out
 };
 
+/// Whether a function keeps only values: what `vm.share!` asks of one, as the VM's shared area
+/// refuses a closure that captured a suspension. A capture already forced is its value.
+let captures_settled! !p !v = as_word (not (is_kind! v kind_closure) || settled_words! v 1 (prim.load64! (prim.load64! v + info_size)));
+
+let settled_words! !v !i !n = if i > n { true } else {
+    let w = prim.load64! (v + i * word);
+    let pending = is_object w && (kind_of! w == kind_thunk || kind_of! w == kind_hole);
+    if pending { false } else { settled_words! v (i + 1) n }
+};
+
 /// `v` where every process can read it, and a root of the census for the rest of the run.
 let keep_forever! !p !v = {
     let kept = promote! p v;

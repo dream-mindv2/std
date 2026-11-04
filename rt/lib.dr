@@ -469,23 +469,28 @@ let valid_env env = match env {
 let exec_with! dir env program args ms = if valid_env env { exec_full! dir env program args ms false } else { () };
 let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env program args ms true } else { () };
 
-/// `vm.share!`: a value made safe to hand to any process. With one heap, being forced
-/// all the way down is all that takes.
-let share! v = if share_check v { v } else { v };
+/// `vm.share!`: a value forced all the way down and moved where every process can read it,
+/// so that handing it to one copies a pointer. It is promoted into the shared region and kept
+/// a root of the census for the rest of the run, as the VM's shared area keeps what it is given.
+let share! v = if share_check v { native.keep_forever v } else { v };
 
-/// What a process could not read if it were in another heap is refused here as it would
-/// be there, so that a program is told the same on either.
+/// Forced, as the VM forces what it shares. A function is shared as it is, as the VM shares
+/// one: what it captured was a value when it was made, or the program that made it is the
+/// one that knows (dre's compiled program is made so).
 let share_check v = match type_of v {
-    :pure_fn => lib_raise (native.error_new :type_error "vm.share! cannot share a function"),
-    :impure_fn => lib_raise (native.error_new :type_error "vm.share! cannot share a function"),
+    :pure_fn => shareable_function v,
+    :impure_fn => shareable_function v,
     :list => share_list v,
     :array => share_list (native.array_to_list v),
     :map => share_list (native.map_pairs v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
-    :bool => true, :unit => true, :process => true, :error => true, :tensor => true,
+    :bool => true, :unit => true, :process => true, :error => true, :tensor => true, :module => true,
     :trunk => share_list (native.trunk_to_list v),
     _ => share_list (native.array_to_list (native.record_fields v)),
 };
+
+let shareable_function f = if native.captures_settled f { true }
+    else { lib_raise (native.error_new :type_error "cannot share a thunk: force it first") };
 
 let share_list xs = match xs {
     [] => true,
