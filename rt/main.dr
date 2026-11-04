@@ -1237,7 +1237,16 @@ let enter! !p !sp !v =
 /// A value's code: it is already what it evaluates to.
 let code_value! !p !sp !self !b !c !d = return! p sp self;
 
-let code_ind! !p !sp !self !b !c !d = enter! p sp (prim.load64! (self + word));
+/// What `prim.arch ()` answers, as the compiler numbers machines.
+let arch_aarch64 = 1;
+
+/// An indirection followed. A shared thunk's update writes its value and then, with release, the
+/// info that says it is there, and whoever read that info reads the value next: x86-64 keeps two
+/// loads in order, and aarch64 needs telling.
+let code_ind! !p !sp !self !b !c !d = {
+    if prim.arch () == arch_aarch64 { prim.fence! (); };
+    enter! p sp (prim.load64! (self + word))
+};
 
 /// A thunk being evaluated is reached again. By the one evaluating it, it depends on
 /// itself; by another process, that one has only to finish.
@@ -3485,6 +3494,11 @@ let now_ns! !p = {
 // the poller built its list from every waiter on every call, which was quadratic in sockets.
 
 let fd_slots = 1048576;
+
+// `struct epoll_event` is packed on x86-64, twelve bytes with its data at 4; on aarch64 it is
+// sixteen, with its data at 8.
+let epoll_event_size! () = if prim.arch () == arch_aarch64 { 16 } else { 12 };
+let epoll_data_at! () = if prim.arch () == arch_aarch64 { 8 } else { 4 };
 let epoll_in = 1;
 let epoll_out = 4;
 let epoll_err = 8;
@@ -3614,8 +3628,7 @@ let fd_slot! !fd = prim.load64! (world_at! w_fds) + fd * slot_words * word;
 let epoll_register! !p !fd !slot = if prim.load64! (slot + 3 * word) != 0 { true } else {
     let ev = prim.load64! (p + ctx_timebuf);
     prim.store32! ev (epoll_in | epoll_out | epoll_rdhup | epoll_et);
-    prim.store32! (ev + 4) fd;
-    prim.store32! (ev + 8) 0;
+    prim.store64! (ev + epoll_data_at! ()) fd;
     let ep = prim.load64! (world_at! w_epfd);
     let ok = prim.sext32 (prim.c4! "epoll_ctl" ep 1 fd ev) == 0 || errno! () == 17;
     if ok {
@@ -3746,10 +3759,10 @@ let expire! !p !pcb !now = {
 // to it (`interrupt_poll!`); a new descriptor needs no telling, as `epoll` sees it at once.
 
 let wake_events! !p !buf !i !n = if i >= n { 0 } else {
-    let fd = prim.load32! (buf + i * 12 + 4);
+    let fd = prim.load32! (buf + i * epoll_event_size! () + epoll_data_at! ());
     if fd == prim.load64! (world_at! w_wakefd) {
         prim.c3! "read" fd (prim.load64! (p + ctx_timebuf)) 8;
-    } else { fd_event! p fd (prim.load32! (buf + i * 12)); };
+    } else { fd_event! p fd (prim.load32! (buf + i * epoll_event_size! ())); };
     wake_events! p buf (i + 1) n
 };
 
@@ -3762,7 +3775,7 @@ let service_waiters! !p !ms = {
     let now = now_ns! p;
     let until_timer = if at < 0 { 0 - 1 } else if at <= now { 0 } else { (at - now) / 1000000 + 1 };
     let wait = if ms == 0 { 0 } else if until_timer < 0 { ms } else if ms < 0 { until_timer } else if until_timer < ms { until_timer } else { ms };
-    let buf = poll_buffer! p (epoll_batch * 12);
+    let buf = poll_buffer! p (epoll_batch * epoll_event_size! ());
     let ep = prim.load64! (world_at! w_epfd);
     let n = if wait != 0 {
         prim.store64! (world_at! w_polling) 1;
@@ -4382,8 +4395,7 @@ let world_init! !p = {
     prim.store64! (world_at! w_fds) (map_memory! (fd_slots * slot_words * word));
     let ev = prim.load64! (p + ctx_timebuf);
     prim.store32! ev epoll_in;
-    prim.store32! (ev + 4) (prim.load64! (world_at! w_wakefd));
-    prim.store32! (ev + 8) 0;
+    prim.store64! (ev + epoll_data_at! ()) (prim.load64! (world_at! w_wakefd));
     prim.c4! "epoll_ctl" (prim.load64! (world_at! w_epfd)) 1 (prim.load64! (world_at! w_wakefd)) ev;
     prim.store64! (world_at! w_worker_ctx) (prim.c2! "calloc" max_workers word);
     prim.c2! "pthread_key_create" (world_at! w_cb_key) 0;
@@ -4775,7 +4787,9 @@ let set_nonblocking! !fd = prim.c3! "fcntl" fd 4 (prim.sext32 (prim.c2! "fcntl" 
 let io_stdin! !p !unit = tag_fix 0;
 
 /// A stat's fields at this system's offsets.
-let stat_mode! !buf = prim.load32! (buf + stat_mode_at);
+// `struct stat`: the mode is at 24 on x86-64 and at 16 on aarch64's generic layout; the size and
+// the modification time are where they are on both.
+let stat_mode! !buf = prim.load32! (buf + (if prim.arch () == arch_aarch64 { 16 } else { stat_mode_at }));
 let stat_size! !buf = prim.load64! (buf + stat_size_at);
 let stat_mtime_ns! !buf = prim.load64! (buf + stat_mtime_at) * 1000000000 + prim.load64! (buf + stat_mtime_at + word);
 let stat_mode_at = 24;
@@ -5109,7 +5123,7 @@ let dir_list! !p !path = if not (is_string! path) { fail! p atom_type_error "lis
 let os_monotonic! !p !unit = tag_fix (now_ns! p / 1000000);
 let os_pid! !p !unit = tag_fix (prim.sext32 (prim.c0! "getpid"));
 let os_platform! !p !unit = prim.atom "linux";
-let os_arch! !p !unit = prim.atom "x86_64";
+let os_arch! !p !unit = if prim.arch () == arch_aarch64 { prim.atom "aarch64" } else { prim.atom "x86_64" };
 let os_exit! !p !code = if is_fix code {
     release_owned! p (tag_fix (prim.load64! (current! p + pcb_id)));
     prim.c1! "exit" (untag_fix code)
@@ -8469,16 +8483,28 @@ let callback_stub! !spec = {
     prim.store64! (rec_ + 2 * word) kinds;
     prim.store64! (rec_ + 3 * word) (untag_fix (prim.load64! (spec + 4 * word)));
     let code = prim.c6! "mmap" 0 4096 7 34 (0 - 1) 0;
-    // movabs r10, record; movabs r11, common; jmp r11
-    prim.store8! code 73;
-    prim.store8! (code + 1) 186;
-    prim.store64! (code + 2) rec_;
-    prim.store8! (code + 10) 73;
-    prim.store8! (code + 11) 187;
-    prim.store64! (code + 12) (prim.info "cb_common");
-    prim.store8! (code + 20) 65;
-    prim.store8! (code + 21) 255;
-    prim.store8! (code + 22) 227;
+    if prim.arch () == arch_aarch64 {
+        // ldr x16, =record; ldr x17, =common; br x17; nop; then the two addresses.
+        prim.store32! code 1476395152;
+        prim.store32! (code + 4) 1476395185;
+        prim.store32! (code + 8) 3592356384;
+        prim.store32! (code + 12) 3573751839;
+        prim.store64! (code + 16) rec_;
+        prim.store64! (code + 24) (prim.info "cb_common");
+        // Written as data, run as code: aarch64 keeps no promise between the two caches.
+        prim.c1! "dream_flush_code" code;
+    } else {
+        // movabs r10, record; movabs r11, common; jmp r11
+        prim.store8! code 73;
+        prim.store8! (code + 1) 186;
+        prim.store64! (code + 2) rec_;
+        prim.store8! (code + 10) 73;
+        prim.store8! (code + 11) 187;
+        prim.store64! (code + 12) (prim.info "cb_common");
+        prim.store8! (code + 20) 65;
+        prim.store8! (code + 21) 255;
+        prim.store8! (code + 22) 227;
+    };
     code
 };
 
@@ -8486,8 +8512,10 @@ let callback_stub! !spec = {
 let cb_argument! !p !k !regs !state = {
     let ni = state & 255;
     let nd = state >> 8;
-    if k == 10 { new_float! p (prim.from_f32 (prim.load64! (regs + (6 + nd) * word))) }
-    else if k == 11 { new_float! p (prim.load64! (regs + (6 + nd) * word)) }
+    // The saved registers: the integer ones, six on x86-64 and eight on aarch64, then eight doubles.
+    let doubles = if prim.arch () == arch_aarch64 { 8 } else { 6 };
+    if k == 10 { new_float! p (prim.from_f32 (prim.load64! (regs + (doubles + nd) * word))) }
+    else if k == 11 { new_float! p (prim.load64! (regs + (doubles + nd) * word)) }
     else { ffi_answer! p k (prim.load64! (regs + ni * word)) }
 };
 
