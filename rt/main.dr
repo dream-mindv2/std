@@ -429,6 +429,16 @@ let w_short_cur = 480;
 let w_short_hp = 488;
 /// A callback was called from a thread that may not run it (`cb_enter!`).
 let w_cb_refused = 496;
+// The atoms made while the program runs (`vm_intern_atom!`), after the ones it was compiled with:
+// a table of their names mapped at its largest and touched as it fills, as the handle table is,
+// so that a reader on another worker never sees it move, and how many it holds.
+let w_atoms_more = 504;
+let w_atoms_more_n = 512;
+// For a record whose declaration the compiler did not see -- dre makes records of the types of the
+// image it runs -- what `atom_display` and `atom_types` say of the others: how it is written and
+// what `type_of` calls it, by its atom, worked out from the atom's name when the first is made.
+let w_atoms_shown = 520;
+let w_atoms_type = 528;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -1599,7 +1609,9 @@ let type_of! !p !v =
         else if kind == kind_tensor { prim.atom "tensor" }
         else if kind == kind_module { prim.atom "module" }
         else if kind == kind_record {
-            atom_word (prim.load64! (prim.info "atom_types" + word * (prim.load64! (v + 2 * word) >> 8)))
+            let i = prim.load64! (v + 2 * word) >> 8;
+            let learned = learned_shape! i w_atoms_type;
+            if learned != 0 { atom_word learned } else { atom_word (prim.load64! (prim.info "atom_types" + word * i)) }
         }
         else if kind == kind_closure { if prim.load64! (prim.load64! v + info_impure) != 0 { atom_impure_fn } else { atom_pure_fn } }
         else if kind == kind_pap { type_of! p (prim.load64! (v + 2 * word)) }
@@ -1613,7 +1625,11 @@ let type_of! !p !v =
         else { atom_word 7 }
     };
 
-let atom_name! !p !v = prim.load64! (prim.info "atoms" + word * (v >> 8));
+let atom_name! !p !v = {
+    let i = v >> 8;
+    let n = prim.load64! (prim.info "atom_count");
+    if i < n { prim.load64! (prim.info "atoms" + word * i) } else { prim.load64! (prim.load64! (world_at! w_atoms_more) + word * (i - n)) }
+};
 
 let size! !p !v = if is_string! v { tag_fix (string_len! v) }
     else if is_kind! v kind_array { prim.load64! (v + word) }
@@ -2739,13 +2755,77 @@ let record_fields! !p !v = {
     a
 };
 let record_of! !p !id !variant !a = {
+    note_record_shape! p id (variant == true_word);
     let n = untag_fix (prim.load64! (a + word));
     let r = new_record! p id n;
     copy_words! (a + 2 * word) (r + 3 * word) n;
     r
 };
 let record_size! !p !v = prim.load64! (v + word);
-let record_display! !p !id = prim.load64! (prim.info "atom_display" + word * (id >> 8));
+let record_display! !p !id = {
+    let shown = learned_shape! (id >> 8) w_atoms_shown;
+    if shown != 0 { shown } else { prim.load64! (prim.info "atom_display" + word * (id >> 8)) }
+};
+
+/// What was learned of the record with atom number `i`, in the table at `field`, or 0.
+let learned_shape! !i !field = {
+    let table = prim.load_acq! (world_at! field);
+    if table == 0 || i >= prim.load64! (prim.info "atom_count") + atoms_more_cap { 0 } else { prim.load_acq! (table + i * word) }
+};
+
+/// A record of a type the compiler did not know made for the first time: its written name and its
+/// type's name, as the VM derives them (`record_type_name` in dream/src/interp.cpp). `app.Point` is a
+/// `Point`, and the variant `app.Shape.circle` a `Shape` written `Shape.circle`.
+let note_record_shape! !p !id !variant = {
+    let i = id >> 8;
+    let known = i < prim.load64! (prim.info "atom_count") && prim.load64! (prim.info "atom_types" + word * i) != i;
+    if known || learned_shape! i w_atoms_shown != 0 { 0 } else {
+        let name = atom_name! p id;
+        let n = string_len! name;
+        let end = if variant { last_dot! (string_bytes name) n } else { n };
+        let dot = last_dot! (string_bytes name) end;
+        let start = if dot < end { dot + 1 } else { 0 };
+        let type_name = byte_slice! p name start (if end < 0 { n } else { end });
+        let shown = if variant { concat2! p type_name (byte_slice! p name end n) } else { type_name };
+        let type_atom = vm_intern_atom! p type_name;
+        let kept = keep_forever! p shown;
+        let l = prim.load64! (world_at! w_lock);
+        lock! l;
+        if prim.load64! (world_at! w_atoms_shown) == 0 {
+            let cap = prim.load64! (prim.info "atom_count") + atoms_more_cap;
+            prim.store64! (world_at! w_atoms_type) (map_memory! (cap * word));
+            prim.store_rel! (world_at! w_atoms_shown) (map_memory! (cap * word));
+        };
+        prim.store64! (prim.load64! (world_at! w_atoms_type) + i * word) (type_atom >> 8);
+        prim.store_rel! (prim.load64! (world_at! w_atoms_shown) + i * word) kept;
+        unlock! l;
+        0
+    }
+};
+
+/// The position of the last `.` before `end`, or `end` if there is none.
+let last_dot! !at !end = last_dot_from! at (end - 1) end;
+let last_dot_from! !at !i !end = if i < 0 { end } else if prim.load8! (at + i) == 46 { i } else { last_dot_from! at (i - 1) end };
+
+/// Bytes `from` to `to` of a string, as a new one.
+let byte_slice! !p !s !from !to = {
+    let out = new_string! p (to - from);
+    prim.c3! "memcpy" (string_bytes out) (string_bytes s + from) (to - from);
+    out
+};
+
+/// `v` where every process can read it, and a root of the census for the rest of the run.
+let keep_forever! !p !v = {
+    let kept = promote! p v;
+    let sl = prim.load64! (world_at! w_shared_lock);
+    lock! sl;
+    let cell = prim.c1! "malloc" (2 * word);
+    prim.store64! cell (prim.load64! (world_at! w_cb_roots));
+    prim.store64! (cell + word) kept;
+    prim.store64! (world_at! w_cb_roots) cell;
+    unlock! sl;
+    kept
+};
 
 /// `_match_at`: unforced, for an array or a record's fields.
 let match_at! !p !v !i = {
@@ -6210,7 +6290,42 @@ let escape_string! !p !v = {
 };
 
 let to_existing_atom! !p !v = if not (is_string! v) { type_fail! p "to_existing_atom needs a string" } else { atom_named_from! p v };
-let atom_named_from! !p !v = atom_named! p v 0 (prim.load64! (prim.info "atom_count"));
+let atom_named_from! !p !v = {
+    let fixed = atom_named! p v 0 (prim.load64! (prim.info "atom_count"));
+    if fixed != unit_word { fixed } else { atom_made! p v 0 (prim.load_acq! (world_at! w_atoms_more_n)) }
+};
+
+/// One of the atoms made while running, by name, or unit.
+let atom_made! !p !v !i !n =
+    if i >= n { unit_word }
+    else if string_eq! v (prim.load64! (prim.load64! (world_at! w_atoms_more) + i * word)) { (prim.load64! (prim.info "atom_count") + i) * 256 + 26 }
+    else { atom_made! p v (i + 1) n };
+
+let atoms_more_cap = 1048576;
+
+/// `vm.intern_atom! name`: the atom of that name, made if there is none, which is what loading
+/// an image does with its atoms (dre). Its name is promoted where every process can read it and
+/// kept a root of the census, as an atom is never forgotten.
+let vm_intern_atom! !p !name = if not (is_string! name) { type_fail! p "intern_atom! needs a name" } else {
+    let found = atom_named_from! p name;
+    if found != unit_word { found } else {
+        // Kept before the lock is taken, because a promotion may start a census.
+        let kept = keep_forever! p name;
+        let l = prim.load64! (world_at! w_lock);
+        lock! l;
+        let again = atom_made! p name 0 (prim.load64! (world_at! w_atoms_more_n));
+        let answer = if again != unit_word { again } else {
+            if prim.load64! (world_at! w_atoms_more) == 0 { prim.store64! (world_at! w_atoms_more) (map_memory! (atoms_more_cap * word)); };
+            let n = prim.load64! (world_at! w_atoms_more_n);
+            if n >= atoms_more_cap { fatal! "dream: too many atoms\n"; };
+            prim.store64! (prim.load64! (world_at! w_atoms_more) + n * word) kept;
+            prim.store_rel! (world_at! w_atoms_more_n) (n + 1);
+            (prim.load64! (prim.info "atom_count") + n) * 256 + 26
+        };
+        unlock! l;
+        answer
+    }
+};
 
 let atom_named! !p !v !i !n =
     if i >= n { unit_word }

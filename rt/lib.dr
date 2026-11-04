@@ -312,6 +312,13 @@ let raise_any! v = native.raise_or_wrap v;
 
 let cons_of x xs = x :: xs;
 
+// What a pattern is compiled to, as functions: the compiler writes each of these in place where
+// it is called, and a program that runs images (dre) holds them as values.
+let is_cons_of v = match v { _ :: _ => true, _ => false };
+let is_empty_of v = match v { [] => true, _ => false };
+let head_of v = match v { x :: _ => x, _ => lib_raise (native.error_new :type_error "match_head needs a list cell") };
+let tail_of v = match v { _ :: rest => rest, _ => lib_raise (native.error_new :type_error "match_tail needs a list cell") };
+
 let send_value! pid message = if settle message { native.send_forced pid message } else { () };
 
 let kill_value! pid reason = if settle reason { native.kill_forced pid reason } else { () };
