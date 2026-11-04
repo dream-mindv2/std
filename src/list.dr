@@ -103,7 +103,7 @@ let nth n xs = xs.[n else ()];
 ///
 /// let main! = {
 ///     // A process for each even number, every one started before any is joined.
-///     let running = list.forced (list.flat_map (fn n -> if n % 2 == 0 { [spawn! $( square n )] } else { [] })
+///     let running = list.forced (list.flat_map (fn! n -> if n % 2 == 0 { [spawn! $( square n )] } else { [] })
 ///                                              [1, 2, 3, 4]);
 ///     console.print! (proc.wait_all! running)
 /// };
@@ -1065,7 +1065,7 @@ when test {
         test.case "is_sorted"           $( test.eq! [true, true, true, false] [is_sorted [], is_sorted [1], is_sorted [1, 1, 2], is_sorted [2, 1]] ),
         test.case "each! runs in order" $( {
             let me = self! ();
-            each! (fn x -> send! me (x * 10)) [1, 2, 3]
+            each! (fn! x -> send! me (x * 10)) [1, 2, 3]
             let a = recv! ();
             let b = recv! ();
             let c = recv! ();
@@ -1073,7 +1073,7 @@ when test {
         } ),
         test.case "each_index! counts from zero" $( {
             let me = self! ();
-            each_index! (fn i x -> send! me [i, x]) [:a, :b]
+            each_index! (fn! i x -> send! me [i, x]) [:a, :b]
             let a = recv! ();
             let b = recv! ();
             test.eq! [[0, :a], [1, :b]] [a, b]

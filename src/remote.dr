@@ -56,7 +56,7 @@
 //
 //         let sup = supervisor.start! :one_for_one
 //                       [registry.child! reg (store.child! "store" %{})];
-//         remote.serve_via! 0 (registry.finder! reg "store")
+//         remote.serve_via! 0 (registry.finder reg "store")
 //
 //     What that does not remove is the window. Between the instant a server
 //     dies and the instant its replacement has registered, the name still
@@ -256,7 +256,7 @@ let serve_on_via! listener find! = spawn! $( accept_loop! listener find! );
 /// Listen on `port` and serve whatever `find!` answers there.
 ///
 /// This is the form for a server that is supervised, and `std.registry` is
-/// what usually answers: `serve_via! 0 (registry.finder! reg "store")` goes on
+/// what usually answers: `serve_via! 0 (registry.finder reg "store")` goes on
 /// serving "store" across every restart of it, because the name is resolved
 /// when a request arrives rather than when the listener started.
 let serve_via! : :integer -> (:unit -> :any) -> :any;
@@ -398,19 +398,19 @@ when test {
     /// -- accepting it sent the next call into that gap about one run in
     /// twenty-four, as "nothing is serving this listener now".
     priv let settle! reg name was =
-        test.eventually! (fn () -> registry.whereis! reg name) (fn p -> p != was && p != ())
+        test.eventually! (fn! () -> registry.whereis! reg name) (fn p -> p != was && p != ())
                          test.patience;
 
     let tests = [
         test.case "a call goes out and an answer comes back"
-            $( test.eq! :ok (with_store! (fn port -> {
+            $( test.eq! :ok (with_store! (fn! port -> {
                    let c = here! port;
                    let r = call! c [:put, "a", 1];
                    close! c
                    r
                })) ),
         test.case "a message past the limit is refused before it is read"
-            $( test.true! (with_store! (fn port -> {
+            $( test.true! (with_store! (fn! port -> {
                    // A header saying a gigabyte follows, and nothing after it:
                    // the answer comes at once, not after a gigabyte is held.
                    let sock = net.connect! "127.0.0.1" port;
@@ -420,7 +420,7 @@ when test {
                    match answer { Result.ok(Result.error(why)) => str.contains_str "past the limit" why, _ => false }
                })) ),
         test.case "the state is still there for the next call"
-            $( test.eq! 1 (with_store! (fn port -> {
+            $( test.eq! 1 (with_store! (fn! port -> {
                    let c = here! port;
                    call! c [:put, "a", 1]
                    let r = call! c [:get, "a"];
@@ -428,7 +428,7 @@ when test {
                    r
                })) ),
         test.case "a cast arrives, and in order"
-            $( test.eq! ["a", "b"] (with_store! (fn port -> {
+            $( test.eq! ["a", "b"] (with_store! (fn! port -> {
                    let c = here! port;
                    call! c [:put, "a", 1]
                    cast! c [:put, "b", 2]
@@ -437,7 +437,7 @@ when test {
                    r
                })) ),
         test.case "two connections reach the same server"
-            $( test.eq! [:ok, 1] (with_store! (fn port -> {
+            $( test.eq! [:ok, 1] (with_store! (fn! port -> {
                    let one = here! port;
                    let two = here! port;
                    let put = call! one [:put, "shared", 1];
@@ -447,7 +447,7 @@ when test {
                    [put, got]
                })) ),
         test.case "a connection made after the first one closed still works"
-            $( test.eq! 1 (with_store! (fn port -> {
+            $( test.eq! 1 (with_store! (fn! port -> {
                    let one = here! port;
                    call! one [:put, "a", 1]
                    close! one
@@ -461,14 +461,14 @@ when test {
         // must not be spelled the same: this arrives as a perfectly good reply
         // whose value happens to say no.
         test.case "a request the server refuses is still a reply"
-            $( test.eq! (Result.ok (err :unknown)) (with_store! (fn port -> {
+            $( test.eq! (Result.ok (err :unknown)) (with_store! (fn! port -> {
                    let c = here! port;
                    let r = try_call! c :nonsense;
                    close! c
                    r
                })) ),
         test.case "and reaches call! as the value it is"
-            $( test.eq! (err :unknown) (with_store! (fn port -> {
+            $( test.eq! (err :unknown) (with_store! (fn! port -> {
                    let c = here! port;
                    let r = call! c :nonsense;
                    close! c
@@ -478,7 +478,7 @@ when test {
         // Every kind survives the trip, because the codec under this is the one
         // that keeps them apart. This is the difference from a JSON service.
         test.case "an atom comes back an atom"
-            $( test.eq! :atom (with_store! (fn port -> {
+            $( test.eq! :atom (with_store! (fn! port -> {
                    let c = here! port;
                    call! c [:put, "k", :ok]
                    let r = type_of (call! c [:get, "k"]);
@@ -486,7 +486,7 @@ when test {
                    r
                })) ),
         test.case "a nested structure survives"
-            $( test.eq! %{ :xs => [1, 2.5, "three"] } (with_store! (fn port -> {
+            $( test.eq! %{ :xs => [1, 2.5, "three"] } (with_store! (fn! port -> {
                    let c = here! port;
                    call! c [:put, "k", %{ :xs => [1, 2.5, "three"] }]
                    let r = call! c [:get, "k"];
@@ -499,7 +499,7 @@ when test {
 
         // The transport's own failure, as a value rather than a raise.
         test.case "calling a connection that is closed is an error, not an answer"
-            $( test.true! (with_store! (fn port -> {
+            $( test.true! (with_store! (fn! port -> {
                    let c = here! port;
                    close! c
                    Result.is_error (try! { try_call! c :keys } catch e { err e })
@@ -517,7 +517,7 @@ when test {
                    let reg = registry.start! ();
                    let sup = supervisor.start! :one_for_one
                                  [registry.child! reg (store.child! "store" %{})];
-                   let l = serve_via! 0 (registry.finder! reg "store");
+                   let l = serve_via! 0 (registry.finder reg "store");
                    let first_pid = settle! reg "store" ();
                    let c = here! (port_of! l);
                    let first = call! c [:put, "a", 1];
@@ -545,7 +545,7 @@ when test {
         test.case "a listener serving a name nobody holds answers, rather than waiting"
             $( {
                    let reg = registry.start! ();
-                   let l = serve_via! 0 (registry.finder! reg "nobody");
+                   let l = serve_via! 0 (registry.finder reg "nobody");
                    let c = here! (port_of! l);
                    let r = strict! (try_call! c :keys);
                    close! c

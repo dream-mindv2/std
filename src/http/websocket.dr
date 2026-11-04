@@ -351,7 +351,7 @@ when test {
 
     /// Every process a case started has ended: the runner's and the case's own
     /// are the two that remain.
-    let settled! () = test.eq! 2 (test.eventually! (fn () -> vm.processes! ()) (fn n -> n <= 2) test.patience);
+    let settled! () = test.eq! 2 (test.eventually! (fn! () -> vm.processes! ()) (fn n -> n <= 2) test.patience);
 
     let echo! socket = match recv! socket {
         [:text, t] => { send_text! socket ("echo " + t); echo! socket },

@@ -362,7 +362,7 @@ as it goes:
 
 ```dream no-run
 let commands! events = %{
-    "watch" => backend.command! :string :bool (fn path -> {
+    "watch" => backend.command! :string :bool (fn! path -> {
         spawn! $( watch! events path )
         true
     }),

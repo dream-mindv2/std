@@ -465,7 +465,7 @@ let here : Place = :here;
 /// other end. So everything a program wants done with a library's resources can
 /// go to the server as one message, and come back as one answer:
 ///
-///     foreign.run! db_server (fn () -> {
+///     foreign.run! db_server (fn! () -> {
 ///         let [status, db] = sqlite.open! "notes.db";
 ///         sqlite.exec! db "create table t (x)"
 ///     })
@@ -487,7 +487,7 @@ let stop! pid = server.stop! pid;
 /// gave out died with it, and using one now raises rather than reaching memory
 /// that has been freed.
 let child! : :string -> :any;
-let child! name = server.child! name ();
+let child! name = server.child name ();
 
 /// A server answers `Result.ok value` or `Result.error e`, so that a call which
 /// raised can be raised again in the process that asked -- where it is that

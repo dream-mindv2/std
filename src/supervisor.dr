@@ -275,7 +275,7 @@ let stop_child! s name =
 
 /// Stop the named children and return the updated supervisor state.
 let stop_all! : State -> [:string] -> State;
-let stop_all! s names = fold (fn acc n -> stop_child! acc n) s names |> strict!;
+let stop_all! s names = fold (fn! acc n -> stop_child! acc n) s names |> strict!;
 
 // --- the loop -------------------------------------------------------------------
 
@@ -291,7 +291,7 @@ let over_limit s times =
 /// Anything that must not miss a death registers before the work starts.
 let tell_watchers! : State -> :string -> :any -> [:any];
 let tell_watchers! s name outcome =
-    map (fn w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
+    map (fn! w -> send! w [:down, name, outcome]) (s_watchers s) |> strict!;
 
 /// One `[:down, name, outcome]`.
 let handle_down! : State -> :string -> :any -> ([:go, State] | [:stop, :any]);
@@ -315,7 +315,7 @@ let handle_down! s name outcome = {
             // stop before any of them is started again.
             let others = filter (fn n -> n != name) group;
             let cleared = stop_all! (with_restarts times gone) others;
-            let next = fold (fn acc n -> start_named! acc n) cleared group;
+            let next = fold (fn! acc n -> start_named! acc n) cleared group;
             // Forcing here, in a statement, and not inside the answer below.
             // Starting a child is an effect held in a lazy position -- the
             // state's `:running` values are the spawns themselves -- and an
@@ -366,7 +366,7 @@ let handle! s m =
 
 /// Enter the supervisor's message-handling loop.
 let serve! : State -> :any;
-let serve! s = proc.serve! s (fn st m -> handle! st m);
+let serve! s = proc.serve! s (fn! st m -> handle! st m);
 
 /// Start a supervisor and its children. Answers the supervisor's process.
 ///
@@ -376,7 +376,7 @@ let start_with! : Strategy -> [Child] -> Limits -> :process;
 let start_with! strategy children lim = {
     let s = state strategy children lim;
     spawn! $( {
-        let started = fold (fn acc n -> start_named! acc n) s (names_of s) |> strict!;
+        let started = fold (fn! acc n -> start_named! acc n) s (names_of s) |> strict!;
         serve! started
     } )
 };
@@ -448,7 +448,7 @@ when test {
     /// A worker that counts what it is sent and answers on request. It fails on
     /// `:crash`, which is how the tests make a child die on purpose.
     let counter! () =
-        proc.serve! 0 (fn n m ->
+        proc.serve! 0 (fn! n m ->
             if proc.is_shutdown m { [:stop, n] }
             else if m == :crash { raise! :crashed }
             else if proc.is_call m {
@@ -483,7 +483,7 @@ when test {
     /// reading of it are two moments, sent by two different processes, and
     /// nothing orders them, so it asks until they agree, for as long as
     /// `test.eventually!` allows.
-    let settle! sup want = test.eventually! (fn () -> which! sup) (fn names -> names == want) test.patience;
+    let settle! sup want = test.eventually! (fn! () -> which! sup) (fn names -> names == want) test.patience;
 
     let tests = [
         test.case "a supervisor starts its children"

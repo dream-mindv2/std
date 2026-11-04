@@ -388,7 +388,7 @@ let capture! : :unit -> [Logger, (:unit -> [:map])];
 let capture! () = {
     let pid = agent.start! [];
     let lg = new |> Logger.set_minimum :trace |> Logger.set_sink [:agent, pid];
-    [lg, fn () -> list.reverse (agent.value! pid)]
+    [lg, fn! () -> list.reverse (agent.value! pid)]
 };
 
 /// Stop the process a capturing logger keeps its events in. Anything else is
@@ -460,7 +460,7 @@ when test {
         } ),
         test.case "a function sink gets the line" $( {
             let got = agent.start! [];
-            let lg = new |> to (fn line -> agent.update! got (fn xs -> line :: xs));
+            let lg = new |> to (fn! line -> agent.update! got (fn xs -> line :: xs));
             at! lg :info "hello" %{}
             test.true! (str.ends_with "INFO  hello\n" (list.head (agent.value! got)))
             agent.stop! got

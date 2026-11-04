@@ -584,7 +584,7 @@ priv let queue! c id piece end = match (Conn.streams c).[id else ()] {
 
 /// Send what is waiting, stream by stream, as the windows allow.
 priv let flush! : :map -> :map;
-priv let flush! c = fold (fn cc id -> flush_stream! cc id) c (map.keys (Conn.streams c));
+priv let flush! c = fold (fn! cc id -> flush_stream! cc id) c (map.keys (Conn.streams c));
 
 /// Send buffered stream data up to the available flow-control window.
 priv let flush_stream! : :map -> :integer -> :map;
@@ -697,9 +697,9 @@ when test {
             let refused! f = try! { strict! (f ()); :taken } catch e { :refused };
             let big = str.repeat 70000 "a";
             test.eq! [:refused, :refused, :refused]
-                [refused! (fn u -> on_frame! c 9 4 1 "x"),
-                 refused! (fn u -> on_frame! c 1 0 1 big),
-                 refused! (fn u -> {
+                [refused! (fn! u -> on_frame! c 9 4 1 "x"),
+                 refused! (fn! u -> on_frame! c 1 0 1 big),
+                 refused! (fn! u -> {
                      let opened = on_frame! c 1 0 1 "";
                      on_frame! opened 9 0 1 big
                  })]

@@ -700,10 +700,10 @@ when test {
     /// A driver whose page is this test: everything the loop sends the page
     /// comes back to `me` as `[:what, value]`.
     let recording! me = Driver.new ()
-        |> Driver.set_open (fn options -> { send! me [:opened, Window.title options]; Result.ok () })
-        |> Driver.set_render (fn tree -> send! me [:render, tree])
-        |> Driver.set_subscribe (fn subs -> send! me [:subscribe, subs])
-        |> Driver.set_close (fn u -> send! me [:closed, ()]);
+        |> Driver.set_open (fn! options -> { send! me [:opened, Window.title options]; Result.ok () })
+        |> Driver.set_render (fn! tree -> send! me [:render, tree])
+        |> Driver.set_subscribe (fn! subs -> send! me [:subscribe, subs])
+        |> Driver.set_close (fn! u -> send! me [:closed, ()]);
 
     let counter = App.new () |> title "Counter" |> App.set_init 0
         |> App.set_update (fn msg model -> match msg { Msg.add => model + 1, Msg.named(t) => model + len t })
@@ -716,7 +716,7 @@ when test {
     let drive! app inputs = {
         let me = self! ();
         let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
-        list.each! (fn i -> deliver! ui i) inputs
+        list.each! (fn! i -> deliver! ui i) inputs
         let rec collect! acc = match recv! () {
             [:done, result] => [result, list.reverse acc],
             m => collect! (list.cons m acc),
@@ -787,7 +787,7 @@ when test {
         }),
         test.case "a message from any process is a message for update!" $({
             let me = self! ();
-            let app = counter |> App.set_start (fn model -> { send! (self! ()) Msg.add; model });
+            let app = counter |> App.set_start (fn! model -> { send! (self! ()) Msg.add; model });
             let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
             proc_wait! me
             deliver! ui Input.close
@@ -797,7 +797,7 @@ when test {
         test.case "an expected reply becomes its message once" $({
             // As a driver's effect does it: expect first, then the request, whose
             // answer -- here at once, and then a stray second one -- comes after.
-            let app = counter |> App.set_start (fn model -> {
+            let app = counter |> App.set_start (fn! model -> {
                 expect! 7 (Handler.reading Msg.named)
                 deliver! (self! ()) (Input.reply 7 "four")
                 deliver! (self! ()) (Input.reply 7 "again")
@@ -816,8 +816,8 @@ when test {
         }),
         test.case "after_render! runs once the view it waits for is sent" $({
             let me = self! ();
-            let app = counter |> App.set_update (fn msg model -> {
-                after_render! (fn u -> send! me [:after, model + 1])
+            let app = counter |> App.set_update (fn! msg model -> {
+                after_render! (fn! u -> send! me [:after, model + 1])
                 model + 1
             });
             let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
@@ -831,13 +831,13 @@ when test {
             deliver! ui Input.close
         }),
         test.case "quit! ends the loop from update!" $({
-            let app = counter |> App.set_update (fn msg model -> { quit! (); model + 10 });
+            let app = counter |> App.set_update (fn! msg model -> { quit! (); model + 10 });
             let [result, sent] = drive! app [Input.dom [0, "add"] "click" ()];
             test.eq! [Result.ok 10, [:closed, ()]] [result, list.last sent]
         }),
         test.case "a failure in update! still closes the driver" $({
             let me = self! ();
-            let app = counter |> App.set_update (fn msg model -> raise! "update failed");
+            let app = counter |> App.set_update (fn! msg model -> raise! "update failed");
             let ui = spawn! $( {
                 let r = try! { run_with! (recording! me) app } catch e { :failed };
                 send! me [:done, r]; ()

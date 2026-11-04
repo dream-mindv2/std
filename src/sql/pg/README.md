@@ -24,7 +24,7 @@ let main! = {
     let min_id = 10;
     let users = db.query_as! User.type conn
         (expand sql.query "SELECT id, name, email FROM users WHERE id > {min_id} ORDER BY id");
-    strict! (list.map (fn u -> console.print! (User.name u)) users)
+    strict! (list.map (fn! u -> console.print! (User.name u)) users)
     db.close! conn
 };
 ```
@@ -45,7 +45,7 @@ program.
 import std.sql;
 import std.sql.pg.driver;
 
-let main! = sql.using! (driver.open! "postgres://ada@localhost/app") (fn conn -> {
+let main! = sql.using! (driver.open! "postgres://ada@localhost/app") (fn! conn -> {
     let min_id = 10;
     sql.query! conn (expand sql.query
         "SELECT id, name FROM users WHERE id > {min_id} ORDER BY id")
@@ -199,7 +199,7 @@ The body is a function of the connection: a lambda, or an impure function
 whose last parameter is the connection, applied to the rest.
 
 ```dream
-db.transaction! conn (fn c -> db.exec! c "DELETE FROM sessions")
+db.transaction! conn (fn! c -> db.exec! c "DELETE FROM sessions")
 
 let transfer! from to amount conn = {
     db.exec! conn (expand sql.query "UPDATE account SET balance = balance - {amount} WHERE id = {from}")

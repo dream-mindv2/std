@@ -245,31 +245,17 @@ let start! args = spawn! $( run! args );
 
 /// This server as a `std.supervisor` child, ready to be restarted.
 ///
-/// A function of unit rather than a thunk, because a thunk remembers its answer
-/// and a restart has to run it again -- which is the supervisor's rule and is
-/// why it asks for one.
-///
-/// **Why this is spelled with a `!` when it performs no effect.** There is no
-/// impure lambda: `fn u -> run! args` is a pure function naming an impure one,
-/// which the purity checker refuses, and `fn u -> $( run! args )` would answer
-/// a thunk where the supervisor is going to `spawn!` one already -- the server
-/// would never run. So the closure over `args` has to be a partial application
-/// of a named impure function, and merely *naming* one is what a pure function
-/// may not do. `std.supervisor` takes the other side of this same trade and
-/// says so where `child_with` is declared: it spells its parameter without the
-/// `!` so that describing a child stays pure for everyone who already holds a
-/// starter. Nothing here performs an effect until the supervisor starts it.
-priv let started! : :any -> :unit -> :any;
-priv let started! args u = run! args;
-
-/// Describe a supervised server child with the supplied name and startup arguments.
-let child! : :string -> :any -> supervisor.Child;
-let child! name args = supervisor.child name (started! args);
+/// Its start is an `fn!` of unit rather than a thunk, because a thunk remembers
+/// its answer and a restart has to run it again -- which is the supervisor's rule
+/// and is why it asks for one. Describing the child performs no effect, so this
+/// is pure; the supervisor that starts it is where the effect is.
+let child : :string -> :any -> supervisor.Child;
+let child name args = supervisor.child name (fn! u -> run! args);
 
 /// The same, with when it should be restarted: `:permanent`, `:transient` or
 /// `:temporary`.
-let child_with! : :string -> :any -> supervisor.Restart -> supervisor.Child;
-let child_with! name args restart = supervisor.child_with name (started! args) restart;
+let child_with : :string -> :any -> supervisor.Restart -> supervisor.Child;
+let child_with name args restart = supervisor.child_with name (fn! u -> run! args) restart;
 
 // --- talking to one ------------------------------------------------------------------
 

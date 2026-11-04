@@ -12,7 +12,7 @@ let open! target = driver.open! target;
 /// as `Result.error e` (an `:sql_error`, `:connection_lost` when nothing
 /// answered; see `sql.attempt!`) rather than raised.
 let try_open! : :any -> Result sql.Connection :error;
-let try_open! target = sql.attempt! (fn () -> open! target);
+let try_open! target = sql.attempt! (fn! () -> open! target);
 
 /// Adapt a low-level PostgreSQL connection. Closing either closes both.
 let wrap! : db.Conn -> sql.Connection;

@@ -671,7 +671,7 @@ let temp_dir! () = match os.platform () {
 /// before it exists, or `none` without home. Relative paths are made absolute
 /// and quoted tildes are expanded. Does not create it.
 let dream_dir! : :unit -> Option :string;
-let dream_dir! () = match list.find (fn dir -> not (io.exists! (join dir "toolchain.toml"))) (install.dirs! ()) {
+let dream_dir! () = match list.find (fn! dir -> not (io.exists! (join dir "toolchain.toml"))) (install.dirs! ()) {
     Option.none => under_home! ".mindv2",
     Option.some(dir) => {
         let expanded = slashes (expand_home! dir);
@@ -761,8 +761,8 @@ let programs_on_path! program = {
     let windows = os.platform () == :windows;
     let dirs = str.split (if windows { ";" } else { ":" }) (match os.env! "PATH" { () => "", p => p });
     let names = if windows && not (str.ends_with ".exe" program) { [program + ".exe", program] } else { [program] };
-    list.flat_map (fn d -> list.filter (fn f -> match io.stat! f { [_, _, :file] => true, _ => false })
-                                       (list.map (fn n -> join (expand_home! d) n) names))
+    list.flat_map (fn d -> list.filter (fn! f -> match io.stat! f { [_, _, :file] => true, _ => false })
+                                       (list.map (fn! n -> join (expand_home! d) n) names))
                   (list.filter (fn d -> not (str.is_empty d)) dirs)
 };
 

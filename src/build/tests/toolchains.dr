@@ -70,15 +70,15 @@ let build_gnu! root tc = {
     io.mkdir_all! (root + "/" + out + "/obj")
     io.mkdir_all! (root + "/" + out + "/lib")
     io.mkdir_all! (root + "/" + out + "/bin")
-    let objects! t = list.map (fn src -> {
+    let objects! t = list.map (fn! src -> {
         let obj = out + "/obj/" + cc.object_name tc (list.head src);
         run! root (gnu.compile tc t src obj (obj + ".d"))
         obj
     }) (cc.sources t) |> strict!;
     let lib = out + "/lib/" + cc.file_name tc :shared "demo";
-    list.map (fn c -> run! root c) (gnu.link tc library (objects! library) [] lib) |> strict!
+    list.map (fn! c -> run! root c) (gnu.link tc library (objects! library) [] lib) |> strict!
     let exe = out + "/bin/" + cc.file_name tc :executable "demo";
-    list.map (fn c -> run! root c) (gnu.link tc program (objects! program) [lib] exe) |> strict!
+    list.map (fn! c -> run! root c) (gnu.link tc program (objects! program) [lib] exe) |> strict!
     // Named in full rather than relative to the directory it runs in, so that
     // what runs is the program just built whatever the search rules.
     str.trim (run! root [root + "/" + exe])
@@ -112,11 +112,11 @@ let main! = {
     sources! root
     // One statement each: an effect in a list literal is suspended until the
     // list is looked at, and then in whatever order it is looked at.
-    let gcc_failed = attempt! "gcc" (installed! "g++") (fn () -> build_gnu! root (cc.gcc (os.platform ())));
+    let gcc_failed = attempt! "gcc" (installed! "g++") (fn! () -> build_gnu! root (cc.gcc (os.platform ())));
     strict! gcc_failed
-    let clang_failed = attempt! "clang" (installed! "clang++") (fn () -> build_gnu! root (cc.clang (os.platform ())));
+    let clang_failed = attempt! "clang" (installed! "clang++") (fn! () -> build_gnu! root (cc.clang (os.platform ())));
     strict! clang_failed
-    let cmake_failed = attempt! "cmake" (installed! "cmake") (fn () -> build_cmake! root);
+    let cmake_failed = attempt! "cmake" (installed! "cmake") (fn! () -> build_cmake! root);
     strict! cmake_failed
     io.remove_all! root
     os.exit! (if gcc_failed || clang_failed || cmake_failed { 1 } else { 0 })

@@ -1105,7 +1105,7 @@ when test {
             stop! s
             test.eq! :timeout (error.kind (Option.or_unit (Result.reason got)))
             // The server gives up on the handler too, once `idle` has passed.
-            test.eq! 2 (test.eventually! (fn () -> vm.processes! ()) (fn n -> n <= 2) test.patience)
+            test.eq! 2 (test.eventually! (fn! () -> vm.processes! ()) (fn n -> n <= 2) test.patience)
         } ),
         test.case "a streamed response arrives whole, chunked" $( {
             let s = serve! 0 (router |> get "/" (fn req -> http.stream (list.map (fn n -> to_string n + ",") (list.range 0 1000))));

@@ -51,7 +51,7 @@ import std.vm;
 /// The `strict!` is the whole function: without it the spawns are thunks and
 /// the work is serialized behind whoever forces them.
 let start_all! : [:any] -> [Process];
-let start_all! thunks = strict! (map (fn t -> spawn! t) thunks);
+let start_all! thunks = strict! (map (fn! t -> spawn! t) thunks);
 
 /// Start `start! x` for each `x`, in parallel.
 ///
@@ -68,7 +68,7 @@ let start_each! start! xs = start_all! (map (fn x -> $( start! x )) xs);
 /// Order is the order of the list, not the order they finish: a caller that
 /// wants results as they arrive wants a mailbox, not this.
 let wait_all! : [Process] -> [:any];
-let wait_all! ps = map (fn p -> join! p) ps |> strict!;
+let wait_all! ps = map (fn! p -> join! p) ps |> strict!;
 
 /// What a process came to, as a value: `[:ok, v]` or `[:error, e]`, where `e`
 /// is the error itself -- ask `std.error` for its kind or payload.
@@ -89,7 +89,7 @@ let outcome! p = try! {
 
 /// Wait for all processes, returning each success or error outcome in input order.
 let outcomes! : [Process] -> [Outcome :any];
-let outcomes! ps = map (fn p -> outcome! p) ps |> strict!;
+let outcomes! ps = map (fn! p -> outcome! p) ps |> strict!;
 
 /// Run these in parallel and answer their values, in order.
 ///
@@ -141,7 +141,7 @@ let map_reporting! n done! f xs = {
     let me = self! ();
     let ref = vm.unique! ();
     let results = pool! me ref done! f items (if n < 1 { 1 } else { n }) 0 0 (%{});
-    strict! (map (fn i -> match results.[i] {
+    strict! (map (fn! i -> match results.[i] {
         Result.ok(v) => v,
         Result.error(e) => error.rethrow! e,
     }) (list.range 0 total))
@@ -401,7 +401,7 @@ when test {
     /// to stop. Every test below drives one of these, because a process that
     /// only ever answers is the only kind a test can wait for.
     let adder! () =
-        serve! 0 (fn total m ->
+        serve! 0 (fn! total m ->
             if is_shutdown m { [:stop, total] }
             else if is_call m {
                 reply! m (total + call_body m)
@@ -415,13 +415,13 @@ when test {
         test.case "map! is a map"
             $( test.eq! [2, 4, 6] (map! double [1, 2, 3]) ),
         test.case "map_limit! answers in order however they finish"
-            $( test.eq! [30, 20, 10, 0] (map_limit! 2 (fn ms -> { sleep! ms; ms }) [30, 20, 10, 0]) ),
+            $( test.eq! [30, 20, 10, 0] (map_limit! 2 (fn! ms -> { sleep! ms; ms }) [30, 20, 10, 0]) ),
         // Six sleeps of 40 ms, two at a time, cannot finish in under three
         // rounds; one each would be one round.
         test.case "map_limit! runs no more than it is allowed"
             $( {
                 let t0 = vm.wall_ms! ();
-                map_limit! 2 (fn ms -> sleep! ms) [40, 40, 40, 40, 40, 40]
+                map_limit! 2 (fn! ms -> sleep! ms) [40, 40, 40, 40, 40, 40]
                 test.true! (vm.wall_ms! () - t0 >= 115)
             } ),
         test.case "map_limit! of nothing"   $( test.eq! [] (map_limit! 4 double []) ),
@@ -431,13 +431,13 @@ when test {
             $( test.eq! [[2, [4]]] (map_limit! 1 (fn x -> [double x, [double (double x)]]) [1]) ),
         test.case "map_limit! raises the first failure"
             $( {
-                let got = outcome! (spawn! $( map_limit! 3 (fn x -> if x == 2 { raise! :bad } else { x }) [1, 2, 3] ));
+                let got = outcome! (spawn! $( map_limit! 3 (fn! x -> if x == 2 { raise! :bad } else { x }) [1, 2, 3] ));
                 test.eq! :bad (match got { Result.error(e) => error.payload e, _ => () })
             } ),
         test.case "map_reporting! counts every finish, in the caller"
             $( {
                 let me = self! ();
-                map_reporting! 2 (fn k -> send! me [:tick, k]) double [1, 2, 3]
+                map_reporting! 2 (fn! k -> send! me [:tick, k]) double [1, 2, 3]
                 let a = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
                 let b = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
                 let c = recv_where! (fn m -> match m { [:tick, _] => true, _ => false });
@@ -453,7 +453,7 @@ when test {
             $( test.eq! :boom (match outcome! (spawn! $( raise! :boom )) { Result.error(e) => error.payload e, _ => () }) ),
         test.case "try_map! keeps going past a failure"
             $( {
-                let got = try_map! (fn x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
+                let got = try_map! (fn! x -> if x == 1 { 1 } else { raise! :bad }) [1, 2];
                 test.eq! [ok 1, err :bad]
                          [list.nth 0 got,
                           match list.nth 1 got { Result.error(e) => Result.error (error.payload e), other => other }]

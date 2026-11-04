@@ -657,8 +657,8 @@ when test {
         } ),
         test.case "lists average seven"          $( test.near! 1.0 7.0 (num.to_float (list.sum (list.map list.length (list.take 400 (values (list_of bool) rng)))) / 400.0) ),
 
-        test.case "secure ints are in range"     $( test.true! (list.all (fn n -> n >= 1 && n <= 6) (list.map (fn _ -> int! 1 6) (list.range 0 200))) ),
-        test.case "secure ints reach both ends"  $( test.eq! [0, 1] (list.sort (list.unique (list.map (fn _ -> int! 0 1) (list.range 0 64)))) ),
+        test.case "secure ints are in range"     $( test.true! (list.all (fn n -> n >= 1 && n <= 6) (list.map (fn! _ -> int! 1 6) (list.range 0 200))) ),
+        test.case "secure ints reach both ends"  $( test.eq! [0, 1] (list.sort (list.unique (list.map (fn! _ -> int! 0 1) (list.range 0 64)))) ),
         test.case "secure floats"                $( { let f = float! (); test.true! (f >= 0.0 && f < 1.0) } ),
         test.case "tokens are URL-safe"          $( {
             let t = token! 32;

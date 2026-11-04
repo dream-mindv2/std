@@ -116,7 +116,7 @@ let serve! : %{:string => Command} -> :unit;
 let serve! commands = serve_with! (fn events -> commands);
 
 /// The same, with the commands made from the `Events` they may emit through:
-/// `serve_with! (fn events -> %{ "watch" => backend.command! :string :bool (watch! events) })`.
+/// `serve_with! (fn! events -> %{ "watch" => backend.command! :string :bool (watch! events) })`.
 let serve_with! : (Events -> %{:string => Command}) -> :unit;
 let serve_with! make = {
     let input = io.stdin! ();

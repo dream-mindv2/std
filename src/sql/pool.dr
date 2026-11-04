@@ -151,7 +151,7 @@ mod keeper {
     let terminate! reason state = {
         let failure = error.new :sql_error %{ :code => :pool_closed, :message => "the pool is stopping", :sql => "" };
         strict! failure
-        strict! (map (fn [work!, from] -> reply_to! from (err failure)) (trunk.to_list (State.waiting state)))
+        strict! (map (fn! [work!, from] -> reply_to! from (err failure)) (trunk.to_list (State.waiting state)))
         strict! (map worker.stop! (State.workers state))
     };
 }
@@ -183,16 +183,16 @@ let stop! pool = { keeper.stop! pool; () };
 
 /// Run a statement using a connection borrowed from the pool.
 let run! : :process -> sql.Runnable -> sql.Outcome;
-let run! pool query = with! pool (fn c -> sql.run! c query);
+let run! pool query = with! pool (fn! c -> sql.run! c query);
 /// Query rows using a connection borrowed from the pool.
 let query! : :process -> sql.Runnable -> [sql.Row];
-let query! pool query = with! pool (fn c -> sql.query! c query);
+let query! pool query = with! pool (fn! c -> sql.query! c query);
 /// Execute a statement for its effects using a borrowed connection.
 let exec! : :process -> sql.Runnable -> :map;
-let exec! pool query = with! pool (fn c -> sql.exec! c query);
+let exec! pool query = with! pool (fn! c -> sql.exec! c query);
 /// Return a query's first scalar value using a borrowed connection.
 let scalar! : :process -> sql.Runnable -> :any;
-let scalar! pool query = with! pool (fn c -> sql.scalar! c query);
+let scalar! pool query = with! pool (fn! c -> sql.scalar! c query);
 /// Run a callback in a transaction on one checked-out connection.
 let transaction! : :process -> (sql.Connection -> a) -> a;
-let transaction! pool work! = with! pool (fn c -> sql.transaction! c work!);
+let transaction! pool work! = with! pool (fn! c -> sql.transaction! c work!);

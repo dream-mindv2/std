@@ -1717,7 +1717,7 @@ let column! c x = map (fn row -> list.first_or () row) (run! c x).[:rows];
 ///
 ///     sql.exec_many! db (list.map (fn u -> sql.insert_into "users" |> sql.values u) users)
 let exec_many! : Connection -> [Runnable] -> :integer;
-let exec_many! c xs = run_groups! c (group_runs (map (fn x -> prepare! c x) xs)) 0;
+let exec_many! c xs = run_groups! c (group_runs (map (fn! x -> prepare! c x) xs)) 0;
 
 /// `[[text, [params, ..]], ..]`, a run of statements of one text to a group.
 priv let group_runs : [:map] -> [[:string, [:any]]];
@@ -1897,43 +1897,43 @@ let attempt! work! = try! {
 
 /// `exec!`, its refusal answered.
 let try_exec! : Connection -> Runnable -> Result %{ :atom => :any } :error;
-let try_exec! c x = attempt! (fn () -> exec! c x);
+let try_exec! c x = attempt! (fn! () -> exec! c x);
 
 /// `query!`, its refusal answered.
 let try_query! : Connection -> Runnable -> Result [Row] :error;
-let try_query! c x = attempt! (fn () -> query! c x);
+let try_query! c x = attempt! (fn! () -> query! c x);
 
 /// `first!`, its refusal answered: no rows is `Result.ok Option.none`, which
 /// is an answer, not a refusal.
 let try_first! : Connection -> Runnable -> Result (Option Row) :error;
-let try_first! c x = attempt! (fn () -> first! c x);
+let try_first! c x = attempt! (fn! () -> first! c x);
 
 /// `one!`, its refusal answered -- and finding none or several is one, code
 /// `:not_one`, as `one!` raises it.
 let try_one! : Connection -> Runnable -> Result Row :error;
-let try_one! c x = attempt! (fn () -> one! c x);
+let try_one! c x = attempt! (fn! () -> one! c x);
 
 /// `scalar!`, its refusal answered.
 let try_scalar! : Connection -> Runnable -> Result :any :error;
-let try_scalar! c x = attempt! (fn () -> scalar! c x);
+let try_scalar! c x = attempt! (fn! () -> scalar! c x);
 
 /// `column!`, its refusal answered.
 let try_column! : Connection -> Runnable -> Result [:any] :error;
-let try_column! c x = attempt! (fn () -> column! c x);
+let try_column! c x = attempt! (fn! () -> column! c x);
 
 /// `exec_many!`, its refusal answered. The statements before the refused one
 /// have run; inside `try_transaction!` they are undone with it.
 let try_exec_many! : Connection -> [Runnable] -> Result :integer :error;
-let try_exec_many! c xs = attempt! (fn () -> exec_many! c xs);
+let try_exec_many! c xs = attempt! (fn! () -> exec_many! c xs);
 
 /// `script!`, its refusal answered.
 let try_script! : Connection -> Script -> Result :unit :error;
-let try_script! c text = attempt! (fn () -> script! c text);
+let try_script! c text = attempt! (fn! () -> script! c text);
 
 /// `transaction!`, a refusal anywhere in it -- in `work`, or the commit
 /// itself -- answered once the transaction is rolled back.
 let try_transaction! : Connection -> (Connection -> a) -> Result a :error;
-let try_transaction! c work = attempt! (fn () -> transaction! c work);
+let try_transaction! c work = attempt! (fn! () -> transaction! c work);
 
 // --- streaming ----------------------------------------------------------------
 //
@@ -1950,7 +1950,7 @@ let fold! c x batch f init = stream! c x batch (fn acc cols rows -> fold f acc (
 /// Run `handle!` on each row of `x`, `batch` at a time, and answer how many
 /// rows there were.
 let each! : Connection -> Runnable -> :integer -> (Row -> :any) -> :integer;
-let each! c x batch handle! = stream! c x batch (fn n cols rows -> handle_rows! handle! n (rows_of_batch cols rows)) 0;
+let each! c x batch handle! = stream! c x batch (fn! n cols rows -> handle_rows! handle! n (rows_of_batch cols rows)) 0;
 
 /// Deliver returned rows to a row-handling function.
 priv let handle_rows! : (Row -> :any) -> :integer -> [Row] -> :integer;
@@ -2126,12 +2126,12 @@ let copy_in! c table columns rows = {
     if list.is_empty columns || len (list.unique columns) != len columns {
         fail! "bulk insertion needs distinct column names" :parameters ""
     } else { () }
-    strict! (map (fn row -> {
+    strict! (map (fn! row -> {
         if len row != len columns { fail! "bulk row width does not match its columns" :parameters "" } else { () }
         validate_params! c row ""
     }) rows)
     if list.is_empty rows { 0 } else {
-        transaction! c (fn tx -> match tx.[:copy_in else ()] {
+        transaction! c (fn! tx -> match tx.[:copy_in else ()] {
             () => exec_many! tx (map (fn row -> insert_into table |> values_in columns [map param row]) rows),
             f => { let copy_rows! = f; copy_rows! tx.[:state] table columns rows },
         })
@@ -2168,7 +2168,7 @@ let subscribe! open! channels !target = {
     strict! c
     try! {
         require! c :next_notification
-        strict! (map (fn channel -> listen! c channel) channels)
+        strict! (map (fn! channel -> listen! c channel) channels)
     } catch e { try! { close! c } catch ignored { () }; raise! e }
     let process = notification_process! c target;
     %{ :connection => c, :process => process }
@@ -2222,7 +2222,7 @@ priv let apply_migrations! : Connection -> [Migration] -> [:integer] -> [:intege
 priv let rec apply_migrations! c pending !done = match pending {
     [] => list.reverse done,
     [[id, name, statements], ..rest] => {
-        transaction! c (fn tx -> {
+        transaction! c (fn! tx -> {
             let each = if is_sql statements || type_of statements != :list { [statements] } else { statements };
             exec_all! tx each
             exec! tx (insert_into "dream_migrations" |> values %{ "id" => id, "name" => name })

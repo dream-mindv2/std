@@ -48,10 +48,10 @@ let run! app = run_with! (driver! ()) app;
 let driver! : :unit -> Driver;
 let driver! u = Driver.new ()
     |> Driver.set_open open!
-    |> Driver.set_render (fn patch -> bridge.send! ("{\"type\":\"render\",\"patch\":" + patch + "}"))
-    |> Driver.set_subscribe (fn subs -> bridge.send! ("{\"type\":\"subscribe\",\"subs\":" + subs + "}"))
-    |> Driver.set_styles (fn text -> if text != "" { post! %{ "type" => "styles", "css" => text } } else { () })
-    |> Driver.set_close (fn u -> post! %{ "type" => "close" });
+    |> Driver.set_render (fn! patch -> bridge.send! ("{\"type\":\"render\",\"patch\":" + patch + "}"))
+    |> Driver.set_subscribe (fn! subs -> bridge.send! ("{\"type\":\"subscribe\",\"subs\":" + subs + "}"))
+    |> Driver.set_styles (fn! text -> if text != "" { post! %{ "type" => "styles", "css" => text } } else { () })
+    |> Driver.set_close (fn! u -> post! %{ "type" => "close" });
 
 /// The window's title and size, then a process that reads the page and hands
 /// each event to this one. The bridge has one reader, so the order the page
@@ -205,25 +205,25 @@ let set_title! title = tell! "title" %{ "title" => title };
 
 /// Give the keyboard to the node with this key.
 let focus! : :string -> :unit;
-let focus! key = after_render! (fn u -> tell! "focus" %{ "key" => key });
+let focus! key = after_render! (fn! u -> tell! "focus" %{ "key" => key });
 /// Take focus away from the node with this key, once the render this update makes is shown.
 let blur! : :string -> :unit;
-let blur! key = after_render! (fn u -> tell! "blur" %{ "key" => key });
+let blur! key = after_render! (fn! u -> tell! "blur" %{ "key" => key });
 /// Scroll the node with this key into view.
 let scroll_to! : :string -> :unit;
-let scroll_to! key = after_render! (fn u -> tell! "scroll" %{ "key" => key });
+let scroll_to! key = after_render! (fn! u -> tell! "scroll" %{ "key" => key });
 /// The node's box on the page: `%{"x", "y", "width", "height"}` in CSS pixels.
 let measure! : :string -> (Result :any :string -> :any) -> :unit;
 let measure! key f = {
     let id = vm.unique! ();
     expect! id (Handler.reading f)
-    after_render! (fn u -> post! %{ "type" => "request", "id" => id, "service" => "measure", "args" => %{ "key" => key } })
+    after_render! (fn! u -> post! %{ "type" => "request", "id" => id, "service" => "measure", "args" => %{ "key" => key } })
 };
 
 /// Scroll the node with this key as far down as it goes: a log, a chat, a
 /// terminal's scrollback following what arrives.
 let scroll_to_end! : :string -> :unit;
-let scroll_to_end! key = after_render! (fn u -> tell! "scroll_end" %{ "key" => key });
+let scroll_to_end! key = after_render! (fn! u -> tell! "scroll_end" %{ "key" => key });
 
 /// Put text on the clipboard. Browsers allow it only while handling a click
 /// or a key, so call this from the `update!` for one.

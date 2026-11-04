@@ -19,7 +19,7 @@
 //                   [registry.child! reg (store.child! "store" %{})];
 //
 //     registry.call! reg "store" [:put, "a", 1]           // here
-//     remote.serve_via! 0 (registry.finder! reg "store")  // and over a socket
+//     remote.serve_via! 0 (registry.finder reg "store")  // and over a socket
 //
 // **It is a small server, and it watches what it names.** One table that
 // several processes read and change, with the read-modify-write happening in
@@ -110,7 +110,7 @@ mod table {
     /// and one left in a lazy list would be asked for by nobody.
     let watch_new! names watched = {
         let fresh = list.unique (filter (fn p -> not (list.contains p watched)) (map.values names));
-        strict! (map (fn p -> proc.monitor! p) fresh)
+        strict! (map (fn! p -> proc.monitor! p) fresh)
         list.append fresh watched
     };
 }
@@ -194,13 +194,10 @@ let all! reg = server.call! reg :value;
 
 /// `whereis!` as a function of unit, for something that will ask again later.
 ///
-/// This is what `remote.serve_via!` takes, and it is a partial application of
-/// a named impure function rather than the lambda it looks like it should be:
-/// `fn u -> whereis! reg name` is a *pure* function naming an impure one,
-/// which the purity checker refuses. `std.server` takes the same route for the
-/// same reason, and says so where `child!` is declared.
-let finder! : server.Handle -> :any -> :unit -> :any;
-let finder! reg name u = whereis! reg name;
+/// This is what `remote.serve_via!` takes. Making one performs nothing, so it
+/// is pure: the `fn!` it answers is where the asking happens.
+let finder : server.Handle -> :any -> (:unit -> :any);
+let finder reg name = fn! u -> whereis! reg name;
 
 // --- talking to a name -------------------------------------------------------
 //
@@ -317,7 +314,7 @@ when test {
     /// by a count of asks, which a loaded machine used up before the restart.
     /// The name passes through `()` on the way: the registry drops it when the
     /// old process's death reaches it, and the new one registers after that.
-    priv let settle! reg name was = test.eventually! (fn () -> whereis! reg name) (fn p -> p != was && p != ()) test.patience;
+    priv let settle! reg name was = test.eventually! (fn! () -> whereis! reg name) (fn p -> p != was && p != ()) test.patience;
 
     /// A registry, a body run against it, and the registry stopped again.
     ///
@@ -333,7 +330,7 @@ when test {
 
     let tests = [
         test.case "a name answers the process registered under it"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    let found = whereis! reg "c";
@@ -341,16 +338,16 @@ when test {
                    found == p
                })) ),
         test.case "a name goes when its process ends"
-            $( test.eq! () (with_registry! (fn reg -> {
+            $( test.eq! () (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    counter.stop! p
-                   test.eventually! (fn () -> whereis! reg "c") (fn q -> q == ()) test.patience
+                   test.eventually! (fn! () -> whereis! reg "c") (fn q -> q == ()) test.patience
                })) ),
         test.case "a name nothing holds is ()"
-            $( test.eq! () (with_registry! (fn reg -> whereis! reg "nobody")) ),
+            $( test.eq! () (with_registry! (fn! reg -> whereis! reg "nobody")) ),
         test.case "has! says so without naming the process"
-            $( test.eq! [true, false] (with_registry! (fn reg -> {
+            $( test.eq! [true, false] (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    let answer = [has! reg "c", has! reg "other"];
@@ -362,14 +359,14 @@ when test {
         // whole module is for -- and the one a thunk sent to another process
         // gets wrong. See `register!`.
         test.case "a process registers itself, not the registry"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let me = self! ();
                    register! reg "me" (self! ())
                    whereis! reg "me" == me && whereis! reg "me" != reg
                })) ),
 
         test.case "register! replaces, and answers what it replaced"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let one = counter.start! 0;
                    let two = counter.start! 0;
                    register! reg "c" one
@@ -380,7 +377,7 @@ when test {
                    old == one && now == two
                })) ),
         test.case "and answers () when it replaced nothing"
-            $( test.eq! () (with_registry! (fn reg -> {
+            $( test.eq! () (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    let old = register! reg "c" p;
                    counter.stop! p
@@ -388,14 +385,14 @@ when test {
                })) ),
 
         test.case "claim! takes a free name"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    let got = claim! reg "c" p;
                    counter.stop! p
                    got == (ok p)
                })) ),
         test.case "claim! refuses a taken one, and names the holder"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let one = counter.start! 0;
                    let two = counter.start! 0;
                    claim! reg "c" one
@@ -407,7 +404,7 @@ when test {
                })) ),
 
         test.case "unregister! forgets the name and answers the pid"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    let gone = unregister! reg "c";
@@ -416,7 +413,7 @@ when test {
                    gone == p && after == ()
                })) ),
         test.case "forget! drops every name one process holds"
-            $( test.eq! ["other"] (with_registry! (fn reg -> {
+            $( test.eq! ["other"] (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    let q = counter.start! 0;
                    register! reg "a" p
@@ -430,7 +427,7 @@ when test {
                })) ),
 
         test.case "names! lists them in order"
-            $( test.eq! ["a", "b"] (with_registry! (fn reg -> {
+            $( test.eq! ["a", "b"] (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "b" p
                    register! reg "a" p
@@ -439,7 +436,7 @@ when test {
                    ns
                })) ),
         test.case "all! is the table itself"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    let table = all! reg;
@@ -450,7 +447,7 @@ when test {
         // --- calling by name ---------------------------------------------------
 
         test.case "a call by name reaches the server"
-            $( test.eq! 5 (with_registry! (fn reg -> {
+            $( test.eq! 5 (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    let got = call! reg "c" [:add, 5];
@@ -458,7 +455,7 @@ when test {
                    got
                })) ),
         test.case "a cast by name arrives"
-            $( test.eq! 3 (with_registry! (fn reg -> {
+            $( test.eq! 3 (with_registry! (fn! reg -> {
                    let p = counter.start! 0;
                    register! reg "c" p
                    cast! reg "c" [:add, 3]
@@ -467,10 +464,10 @@ when test {
                    got
                })) ),
         test.case "a call to a name nobody holds raises rather than answering"
-            $( test.eq! :not_registered (with_registry! (fn reg ->
+            $( test.eq! :not_registered (with_registry! (fn! reg ->
                    error.kind (caught! $( call! reg "nobody" :value )) )) ),
         test.case "a cast to one is a message into a void"
-            $( test.eq! () (with_registry! (fn reg -> cast! reg "nobody" :anything)) ),
+            $( test.eq! () (with_registry! (fn! reg -> cast! reg "nobody" :anything)) ),
 
         // --- the whole point ------------------------------------------------------
         //
@@ -480,7 +477,7 @@ when test {
         // the pid of a process that has finished.
 
         test.case "a supervised child registers itself"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
                    let p = settle! reg "c" ();
@@ -488,7 +485,7 @@ when test {
                    p != ()
                })) ),
         test.case "and a restarted one registers again, under the same name"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
                    let before = settle! reg "c" ();
@@ -500,7 +497,7 @@ when test {
                    before != () && after != () && after != before
                })) ),
         test.case "and the name still answers afterwards"
-            $( test.eq! 7 (with_registry! (fn reg -> {
+            $( test.eq! 7 (with_registry! (fn! reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
                    let before = settle! reg "c" ();
@@ -511,7 +508,7 @@ when test {
                    got
                })) ),
         test.case "a registered child keeps the name it was given"
-            $( test.eq! ["c"] (with_registry! (fn reg -> {
+            $( test.eq! ["c"] (with_registry! (fn! reg -> {
                    let sup = supervisor.start! :one_for_one
                                  [child! reg (counter.child! "c" 0)];
                    settle! reg "c" ()
@@ -527,10 +524,10 @@ when test {
         // The finder is a function of unit, so it answers again rather than
         // remembering -- which is the property `remote.serve_via!` needs.
         test.case "a finder answers whoever holds the name now"
-            $( test.true! (with_registry! (fn reg -> {
+            $( test.true! (with_registry! (fn! reg -> {
                    let one = counter.start! 0;
                    let two = counter.start! 0;
-                   let find! = finder! reg "c";
+                   let find! = finder reg "c";
                    register! reg "c" one
                    let first = find! ();
                    register! reg "c" two

@@ -250,7 +250,7 @@ let from_env! u = {
     let vars = [["PGHOST", "host"], ["PGPORT", "port"], ["PGUSER", "user"], ["PGPASSWORD", "password"],
                 ["PGDATABASE", "dbname"], ["PGAPPNAME", "application_name"]];
     let pairs = strict! (filter (fn [k, v] -> v != ())
-                                     (map (fn [var, k] -> [k, os.env! var]) vars));
+                                     (map (fn! [var, k] -> [k, os.env! var]) vars));
     match fold (fn acc [k, v] -> match acc { Result.ok(c) => apply c k v, failed => failed }) (Result.ok base) pairs {
         Result.ok(c) => c,
         Result.error(why) => errors.fail! :bad_config why,

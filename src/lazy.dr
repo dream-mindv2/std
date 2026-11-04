@@ -51,3 +51,9 @@ when test {
             $( test.raises! $( forced (list.head [test.boom]) ) ),
     ];
 }
+
+/// `then`, once `first` has been forced as far as its outermost constructor: how a pure
+/// function orders one computation before another, as a strict parameter does. An impure one
+/// writes the two as statements.
+let after : a -> b -> b;
+let after !first then = then;

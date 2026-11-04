@@ -664,7 +664,7 @@ priv let stream! : Conn -> sql.Query -> :integer -> (a -> [:map] -> a) -> a -> a
 priv let stream! conn q batch step! init = {
     let [text, vs] = sql.render q;
     fold_text! conn text vs batch
-        (fn acc columns tuples -> step! acc (map (row_of columns) tuples)) init
+        (fn! acc columns tuples -> step! acc (map (row_of columns) tuples)) init
 };
 
 /// Stream rendered SQL through a portal. The callback receives column metadata
@@ -1006,7 +1006,7 @@ let rec next_notification! conn = match receive! conn {
 let subscribe! : :any -> [:string] -> :process -> :map;
 let subscribe! target channels !to = {
     let conn = connect! target;
-    strict! (map (fn ch -> listen! conn ch) channels)
+    strict! (map (fn! ch -> listen! conn ch) channels)
     // Bound before the map is built: a map's values are lazy, and a spawn
     // left in one would not happen until something read it.
     let process = forwarder! conn to;

@@ -95,7 +95,7 @@ mod keeper {
     /// Close the idle connections. Those checked out belong to their callers
     /// until they come back, and there is nowhere for them to come back to.
     let terminate! : :any -> :any -> :any;
-    let terminate! reason state = strict! (map (fn c -> db.close! c) (State.idle state));
+    let terminate! reason state = strict! (map (fn! c -> db.close! c) (State.idle state));
 
     /// The name the pool's process is reported under.
     let server_name : :any -> :string;
@@ -127,7 +127,7 @@ let stats! pool = keeper.call! pool :stats;
 let drain! : :process -> :integer;
 let drain! pool = {
     let idle : [:map] = keeper.call! pool :drain;
-    strict! (map (fn c -> db.close! c) idle)
+    strict! (map (fn! c -> db.close! c) idle)
     len idle
 };
 

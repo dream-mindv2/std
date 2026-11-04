@@ -10,7 +10,7 @@ import std.sql.pg;
 mapping Item { id : :integer, body : :string }
 
 let values! : :any -> :unit;
-let values! target = sql.using! (driver.open! target) (fn conn -> {
+let values! target = sql.using! (driver.open! target) (fn! conn -> {
     sql.script! conn "CREATE TEMP TABLE shared_items (id bigint PRIMARY KEY, body text DEFAULT 'default', payload bytea);"
     sql.exec! conn (sql.insert_into "shared_items" |> sql.values %{ :id => 1, :body => (), :payload => sql.blob (str.of_bytes [0, 255, 65]) })
     sql.exec! conn (sql.insert_into "shared_items" |> sql.values %{ :id => 2, :body => sql.null })
@@ -30,7 +30,7 @@ let values! target = sql.using! (driver.open! target) (fn conn -> {
 });
 
 let many! : :any -> :unit;
-let many! target = sql.using! (driver.open! target) (fn conn -> {
+let many! target = sql.using! (driver.open! target) (fn! conn -> {
     sql.exec! conn "CREATE TEMP TABLE shared_many (id bigint PRIMARY KEY, payload bytea)"
     test.eq! 3 (sql.exec_many! conn (list.map (fn id -> sql.insert_into "shared_many" |> sql.values %{ :id => id, :payload => sql.blob "bytes" }) [1, 2, 3]))
     test.eq! 0 (sql.exec_many! conn [])
@@ -45,19 +45,19 @@ let many! target = sql.using! (driver.open! target) (fn conn -> {
 });
 
 let streaming! : :any -> :unit;
-let streaming! target = sql.using! (driver.open! target) (fn conn -> {
+let streaming! target = sql.using! (driver.open! target) (fn! conn -> {
     test.eq! 500500 (sql.fold! conn "SELECT generate_series(1, 1000) AS id" 37 (fn acc row -> acc + Item.id row) 0)
     test.eq! 0 (sql.fold! conn "SELECT 1 AS id WHERE false" 4 (fn acc row -> acc + 1) 0)
     test.eq! 3 (sql.each! conn "SELECT 'a'::bytea AS payload FROM generate_series(1,3)" 1
-        (fn row -> test.eq! (sql.blob "a") row.[:payload]))
+        (fn! row -> test.eq! (sql.blob "a") row.[:payload]))
     let e = try! {
         sql.fold! conn "SELECT generate_series(1,100) AS id" 3
-            (fn acc row -> raise! (error.new :callback_failed row.[:id])) 0
+            (fn! acc row -> raise! (error.new :callback_failed row.[:id])) 0
     } catch e { e };
     test.eq! :callback_failed (error.kind e)
     test.eq! 42 (sql.scalar! conn "SELECT 42")
     // Also fail in the final, unsuspended batch.
-    let final = try! { sql.each! conn "SELECT 1 AS id" 10 (fn row -> raise! (error.new :last_batch ())) } catch e { e };
+    let final = try! { sql.each! conn "SELECT 1 AS id" 10 (fn! row -> raise! (error.new :last_batch ())) } catch e { e };
     test.eq! :last_batch (error.kind final)
     test.eq! 43 (sql.scalar! conn "SELECT 43")
     let failed = try! { sql.fold! conn "SELECT 1 / 0 AS id" 2 (fn acc row -> acc + 1) 0 } catch e { e };
@@ -67,11 +67,11 @@ let streaming! target = sql.using! (driver.open! target) (fn conn -> {
 });
 
 let transactions! : :any -> :unit;
-let transactions! target = sql.using! (driver.open! target) (fn conn -> {
+let transactions! target = sql.using! (driver.open! target) (fn! conn -> {
     sql.exec! conn "CREATE TEMP TABLE shared_tx (id bigint PRIMARY KEY)"
-    sql.transaction! conn (fn tx -> {
+    sql.transaction! conn (fn! tx -> {
         sql.exec! tx "INSERT INTO shared_tx VALUES (1)"
-        let e = try! { sql.transaction! tx (fn nested -> {
+        let e = try! { sql.transaction! tx (fn! nested -> {
             sql.exec! nested "INSERT INTO shared_tx VALUES (2)"
             sql.exec! nested "INSERT INTO shared_tx VALUES (1)"
         }) } catch e { e };
@@ -82,11 +82,11 @@ let transactions! target = sql.using! (driver.open! target) (fn conn -> {
     })
     test.eq! [1, 3] (sql.column! conn "SELECT id FROM shared_tx ORDER BY id")
     test.eq! ["serializable", "on"] (sql.transaction_with! conn %{ :isolation => :serializable, :read_only => true }
-        (fn tx -> list.head (sql.run! tx "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')").[:rows]))
+        (fn! tx -> list.head (sql.run! tx "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')").[:rows]))
     // Sequences survive rollback, making a real server serialization failure
     // deterministic: the second attempt observes the next sequence value.
     sql.script! conn "CREATE TEMP SEQUENCE shared_attempt; CREATE FUNCTION pg_temp.shared_retry() RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE n bigint; BEGIN n := nextval('shared_attempt'); IF n = 1 THEN RAISE EXCEPTION 'retry' USING ERRCODE = '40001'; END IF; RETURN n; END $$;"
-    test.eq! 2 (sql.serializable! conn 3 (fn tx -> sql.scalar! tx "SELECT pg_temp.shared_retry()"))
+    test.eq! 2 (sql.serializable! conn 3 (fn! tx -> sql.scalar! tx "SELECT pg_temp.shared_retry()"))
     test.eq! 45 (sql.scalar! conn "SELECT 45")
     ()
 });
@@ -119,7 +119,7 @@ let optional! target = {
     let note = sql.next_notification! c;
     test.eq! ["standard_events", "hello"] [note.[:channel], note.[:payload]]
     sql.unlisten! c "standard_events"
-    let sub = sql.subscribe! (fn () -> pg.open! target) ["standard_events"] (self! ());
+    let sub = sql.subscribe! (fn! () -> pg.open! target) ["standard_events"] (self! ());
     sql.notify! other "standard_events" "forwarded"
     let message = recv! ();
     test.eq! [:sql_notification, "forwarded"] [message.[0], message.[1].[:payload]]

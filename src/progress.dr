@@ -211,7 +211,7 @@ when test {
         test.case "join_all! answers in order"
             $( test.eq! [1, 2, 3] (join_all! "parts" [spawn! $( 1 ), spawn! $( 2 ), spawn! $( 3 )]) ),
         test.case "join_heaviest_first! answers in the items' order"
-            $( test.eq! [10, 30, 20] (join_heaviest_first! "parts" (fn n -> n) (fn n -> spawn! $( n * 10 )) [1, 3, 2]) ),
+            $( test.eq! [10, 30, 20] (join_heaviest_first! "parts" (fn n -> n) (fn! n -> spawn! $( n * 10 )) [1, 3, 2]) ),
         test.case "join_all! of nothing" $( test.eq! [] (join_all! "parts" []) ),
         test.case "an unlabelled bar"  $( test.eq! "[===========>            ] 1/2" (line (Bar.set_total 2 (Bar.new ())) 1 "" 80) ),
     ];

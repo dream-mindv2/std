@@ -66,8 +66,8 @@ let main! = {
         check! (io.mode! name == 384)
         check! (io.mode! closed == 384)
     }
-    let children = list.forced (map (fn _ -> spawn! $( file.temp_file_in! dir "parallel-" )) (list.range 0 64));
-    let names = list.forced (map (fn process -> join! process) children);
+    let children = list.forced (map (fn! _ -> spawn! $( file.temp_file_in! dir "parallel-" )) (list.range 0 64));
+    let names = list.forced (map (fn! process -> join! process) children);
     check! (len (list.unique names) == 64)
     check! (list.all file.is_file! names)
     check! (try! { io.temp_file! (path.join dir "missing") "x"; false } catch _ { true })
@@ -134,8 +134,8 @@ let main! = {
     let other = required! (file.ensure_program_data_dir! "another-tool");
     check! (other != program && file.is_dir! other)
     check! (file.read! (path.join other "saved.txt") == Option.none)
-    let children = list.forced (map (fn _ -> spawn! $( required! (file.ensure_program_data_dir! "concurrent") )) (list.range 0 16));
-    let paths = list.forced (map (fn process -> join! process) children);
+    let children = list.forced (map (fn! _ -> spawn! $( required! (file.ensure_program_data_dir! "concurrent") )) (list.range 0 16));
+    let paths = list.forced (map (fn! process -> join! process) children);
     check! (len (list.unique paths) == 1)
     check! (file.is_dir! (list.head paths))
     check! (list.all rejected! ["", ".", "..", "../escape", "/absolute", "a/b", "a\\b", "C:x", "bad\0name", ".. ", "name."])

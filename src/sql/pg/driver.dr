@@ -121,7 +121,7 @@ priv let script! conn text = try! { db.script! conn text; () } catch e { fail! t
 priv let fold! : db.Conn -> :string -> [:any] -> :integer -> (a -> [:string] -> [[:any]] -> a) -> a -> a;
 priv let fold! conn text params batch step! init = try! {
     db.fold_text! conn text (map parameter params) batch
-        (fn acc cols rows -> step! acc (map wire.Column.name cols) (tuples cols rows)) init
+        (fn! acc cols rows -> step! acc (map wire.Column.name cols) (tuples cols rows)) init
 } catch e { fail! text e };
 
 /// Close the underlying PostgreSQL connection.
