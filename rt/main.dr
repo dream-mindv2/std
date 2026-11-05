@@ -1228,6 +1228,7 @@ let collect! !p !sp = {
     prim.store64! (pcb + pcb_sp) sp;
     scan_stack! p sp (stack_top! pcb);
     evacuate_at! p (pcb + pcb_resume);
+    evacuate_at! p (pcb + pcb_kept);
     scan_mail! p (prim.load64! (pcb + pcb_mail_head));
     scan! p start;
     free_chunks! p old;
@@ -3272,6 +3273,8 @@ let pcb_lock = 248;
 let pcb_pinned = 256;
 /// The census round it is to report to, or 0.
 let pcb_census_due = 264;
+/// What `vm.per_process` has answered it, or 0: a list in its heap, a key and its value in turn.
+let pcb_kept = 272;
 let pcb_size = 312;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
@@ -4238,6 +4241,7 @@ let finish! !p !v !failed !d !e !f = {
     prim.store64! (pcb + pcb_mail_count) 0;
     stack_done! p (prim.load64! (pcb + pcb_stack)) (prim.load64! (pcb + pcb_stack_size));
     prim.store64! (pcb + pcb_stack) 0;
+    prim.store64! (pcb + pcb_kept) 0;
     // The first process's heap is where what failed unseen is reported from, at the end.
     if is_root { save_heap! p pcb; } else { free_heap! p; };
     prim.store64! (pcb + pcb_worker) 0;
@@ -4778,6 +4782,36 @@ let kill_forced! !p !pid !reason = {
 };
 
 let unique_value! !p !unit = tag_fix (prim.xadd64! (world_at! w_unique) 1 + 1);
+
+/// `vm.per_process key init`: the value this process keeps under `key`, or `init`, as it
+/// stands, kept from now on. dream/src/builtins.cpp says what it is for. The compiler hands
+/// `init` over unforced and enters what this answers.
+let per_process! !p !key !init = {
+    let pcb = current! p;
+    let kept = prim.load64! (pcb + pcb_kept);
+    let found = kept_under! (if kept == 0 { nil_word } else { kept }) key;
+    if found != 0 { prim.load64! (found + word) }
+    else {
+        let tail = prim.load64! (pcb + pcb_kept);
+        prim.store64! (pcb + pcb_kept) (new_cons! p key (new_cons! p init (if tail == 0 { nil_word } else { tail })));
+        init
+    }
+};
+
+/// `vm.raised_at e places`: a copy of the error carrying `places` as where it was raised, which
+/// a raise then keeps (`locate!`); dream/src/builtins.cpp says what it is for. A place here is
+/// already the list `error.trace!` reads, so they are stored as they come.
+let raised_at! !p !e !places = if is_object e && kind_of! e == kind_error {
+    let o = alloc! p (4 * word);
+    copy_words! e o 4;
+    prim.store64! (o + 3 * word) places;
+    o
+} else { e };
+
+/// The cell holding the value kept under `key`, or 0.
+let kept_under! !l !key = if l == nil_word { 0 }
+    else if prim.load64! (l + word) == key { prim.load64! (l + 2 * word) }
+    else { kept_under! (prim.load64! (prim.load64! (l + 2 * word) + 2 * word)) key };
 
 let start_ticking! !p = if prim.load64! (world_at! w_ticking) == 0 {
     prim.store64! (world_at! w_ticking) 1;
