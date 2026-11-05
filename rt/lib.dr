@@ -1928,7 +1928,7 @@ let ffi_out_results! outs parents = match outs {
 /// A function of `n` arguments, collected one at a time: what `apply` makes of any number.
 let ffi_curried! binding !n got =
     if n == 0 { ffi_invoke! binding (rev_onto got []) }
-    else { fn x -> ffi_curried! binding (n - 1) (x :: got) };
+    else { fn! x -> ffi_curried! binding (n - 1) (x :: got) };
 
 let ffi_bind_in! lib label symbol args ret = {
     if type_of symbol != :string || symbol == "" { ffi_fail "a foreign function needs a name" }
@@ -1940,7 +1940,7 @@ let ffi_bind_in! lib label symbol args ret = {
         else {
             let binding = [f, symbol, types, result];
             let visible = ffi_needed types;
-            if visible == 0 { fn u -> ffi_invoke! binding [] }
+            if visible == 0 { fn! u -> ffi_invoke! binding [] }
             else { ffi_curried! binding visible [] }
         }
     }

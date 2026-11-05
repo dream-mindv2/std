@@ -439,6 +439,8 @@ let w_atoms_more_n = 512;
 // what `type_of` calls it, by its atom, worked out from the atom's name when the first is made.
 let w_atoms_shown = 520;
 let w_atoms_type = 528;
+/// The processes there were when the census round going now began: only those can be reaped by it.
+let w_census_n = 536;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -905,23 +907,37 @@ let census_begin! !p = {
         prim.store64! (world_at! w_shared_since) 0;
         prim.store64! (world_at! w_finished_since) 0;
         prim.c3! "memset" (prim.load64! (world_at! w_pids_seen)) 0 (table_cap / 8);
-        let n = prim.load64! (world_at! w_next_id);
-        // Counted first, and one more than there are, so that no report can end the round while
-        // this is still asking for them.
-        prim.store64! (world_at! w_census_waiting) (due_all! p 1 n round 1);
+        // One more than there will be, held by this until it has asked them all, so that no report
+        // can end the round while this is still counting.
+        prim.store64! (world_at! w_census_waiting) 1;
+        // On before the processes are counted, and fenced, so that one this does not count was
+        // made after the round began: its work was copied with the round on, and the copy marked
+        // every pid it carried (`spawn!` says the rest).
         prim.store_rel! (world_at! w_census) round;
+        prim.fence! ();
+        let n = prim.load64! (world_at! w_next_id);
+        prim.store64! (world_at! w_census_n) n;
+        due_all! p 1 n round;
         unlock! l;
         ask_all! p 1 n round;
         census_reported! p round
     }
 };
 
-let due_all! !p !id !n !round !count = if id >= n { count } else {
+/// Every process not finished, due to report. Its record held: a process finishes under the same
+/// lock and then looks whether it was due (`census_gone!`), so either it is seen finished here or
+/// it sees that it was due. Counted before it is due, since it may report the moment it is.
+let due_all! !p !id !n !round = if id >= n { 0 } else {
     let pcb = table_at! p id;
-    if pcb != 0 && prim.load64! (pcb + pcb_state) != state_done {
-        prim.store64! (pcb + pcb_census_due) round;
-        due_all! p (id + 1) n round (count + 1)
-    } else { due_all! p (id + 1) n round count }
+    if pcb != 0 {
+        pcb_lock! pcb;
+        if prim.load64! (pcb + pcb_state) != state_done {
+            prim.xadd64! (world_at! w_census_waiting) 1;
+            prim.store64! (pcb + pcb_census_due) round;
+        };
+        pcb_unlock! pcb;
+    };
+    due_all! p (id + 1) n round
 };
 
 /// Every process due: the parked collected here, the others asked to collect.
@@ -989,7 +1005,11 @@ let census_finish! !p !round = {
     mark_foreign! p (prim.load64! (world_at! w_foreign_head));
     mark_callbacks! p (prim.load64! (world_at! w_cb_roots));
     mark_drain! p;
-    let reaped = reap! p 2 n 0;
+    // Only what was there when the round began. A process started since was never due, and its
+    // pid is made where it is spawned, not copied there, so nothing marked it: the parent that
+    // reported early in the round and spawned a thousand children after holds pids no report
+    // saw, and a child that finished quickly was reaped while the parent still had to join it.
+    let reaped = reap! p 2 (prim.load64! (world_at! w_census_n)) 0;
     let l = prim.load64! (world_at! w_shared_lock);
     lock! l;
     let kept = sweep! p 0 (block_index (prim.load64! (world_at! w_shared_top))) round 0;
@@ -1318,6 +1338,13 @@ let frame_shared_update! !p !sp !v !b !c !d = {
     prim.store64! (s + word) (promote_as! p v (shared_mode_of! s));
     // The value before the info that says it is there, for a reader on another core.
     prim.store_rel! s (prim.info "ind");
+    // A census that marked the thunk while it was a hole traced the suspension, not this value,
+    // and does not trace a marked object again, so during a round the value is marked here. The
+    // fence orders the store above before the load of the round's flag, against a census starting
+    // on another core: either it reads the thunk after the store and traces the value, or this
+    // reads that it has begun.
+    prim.fence! ();
+    if census_on! () { census_mark! p (prim.load64! (s + word)); mark_drain! p; };
     wake_shared_waiters! p s;
     return! p (sp + 2 * word) v
 };
@@ -4506,6 +4533,15 @@ let spawn! !p !work = {
     // thousand processes at once touches a page for each of them otherwise.
     let copied = copy_out! p work xc_message;
     let segs = prim.load64! (p + ctx_xc_first);
+    // A census that began after its record was in the table counts it, and one that began before
+    // marks what the copy carries. One that began in between did neither if the copy above began
+    // before it did: so, the record stored and fenced (`new_pcb!`), a round on now is one that may
+    // not have counted this, and what the copy carries is marked here.
+    prim.fence! ();
+    if census_on! () && prim.load64! (pcb + pcb_census_due) == 0 {
+        if segs == 0 { census_mark! p copied; } else { census_segments! p segs; };
+        mark_drain! p;
+    };
     let left = prim.load64! (p + ctx_xc_limit) - prim.load64! (p + ctx_xc_to);
     if segs != 0 && left >= 256 {
         prim.store64! (pcb + pcb_chunks) segs;

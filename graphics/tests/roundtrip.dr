@@ -8,9 +8,9 @@ import std.graphics.html;
 union Msg { echoed(answer : Result :any :string) }
 
 let main! = browser.run! (ui.App.new () |> ui.App.set_init ()
-    |> ui.App.set_start (fn model -> { browser.invoke! "echo" 9007199254740993 Msg.echoed; model })
+    |> ui.App.set_start (fn! model -> { browser.invoke! "echo" 9007199254740993 Msg.echoed; model })
     |> ui.App.set_view (fn model -> html.p [] [html.text "Testing the native backend…"])
-    |> ui.App.set_update (fn msg model -> match msg {
+    |> ui.App.set_update (fn! msg model -> match msg {
         Msg.echoed(Result.ok(9007199254740993)) => { ui.quit! (); model },
         Msg.echoed(other) => raise! ("graphics backend roundtrip failed: " + to_string other),
     }));
