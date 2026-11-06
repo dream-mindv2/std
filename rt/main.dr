@@ -102,7 +102,14 @@ let ctx_cell_end = 592;
 /// was kept under: one after it may have freed it (`copy_out!`).
 let ctx_shared_cur = 600;
 let ctx_short_cur = 624;
-let ctx_size = 648;
+/// Whether this worker is running a process on the process's own stack, and where the
+/// scheduler's own stack stood when it switched to it (`dispatch!`).
+let ctx_on_process = 648;
+let ctx_sched_sp = 656;
+/// Native stacks finished processes gave back here, kept for new ones, and how many.
+let ctx_nstacks = 664;
+let ctx_nstack_count = 672;
+let ctx_size = 680;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -3413,6 +3420,12 @@ let pcb_pinned = 256;
 let pcb_census_due = 264;
 /// What `vm.per_process` has answered it, or 0: a list in its heap, a key and its value in turn.
 let pcb_kept = 272;
+/// Its native stack, or 0 before it first runs: the machine's stack while it does
+/// (dreams/docs/aot-direct.md, "Stacks").
+let pcb_nstack = 280;
+/// 1 while a worker is on that stack: a process made runnable as it parks is still running there
+/// until it reaches the scheduler and switches off, and another worker taking it waits for that.
+let pcb_on_stack = 288;
 let pcb_size = 312;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
@@ -4073,11 +4086,81 @@ let maybe_service! !p = {
 
 /// Run whoever is next. A process with a kill waiting does not resume: it starts
 /// unwinding, and only its cleanups run.
+// A process runs on a native stack of its own, the scheduler on the worker's: `dispatch!` switches
+// to the process's and runs it there (`run_process!`), and whatever the process does that gives
+// the worker back comes to `schedule!`, which switches back first, so that the switch in
+// `dispatch!` returns and the scheduler goes on where it was. Nothing on a process's stack is
+// needed once it has given the worker back -- what it is waiting to do is a frame on the stack the
+// runtime keeps (`pcb_sp`) -- so a process is run again from the top of its native stack. The
+// stack is the machine's own, reserved large and touched as needed, where code that calls rather
+// than jumps keeps what it is in the middle of (dreams/docs/aot-direct.md).
+
+/// How much of the address space a process's native stack may take.
+let native_stack_bytes = 67108864;
+
+let kept_native_stacks = 64;
+
+/// `pcb`'s native stack's top, made the first time it runs.
+let native_stack_top! !p !pcb = {
+    let had = prim.load64! (pcb + pcb_nstack);
+    let kept = prim.load64! (p + ctx_nstacks);
+    let base = if had != 0 { had } else if kept != 0 {
+        // One a finished process left here: its pages are touched already, and taking it costs no
+        // call to the kernel, where a fresh one was two and a fault for each page it touched.
+        prim.store64! (p + ctx_nstacks) (prim.load64! (kept + native_stack_bytes - word));
+        prim.store64! (p + ctx_nstack_count) (prim.load64! (p + ctx_nstack_count) - 1);
+        prim.store64! (pcb + pcb_nstack) kept;
+        kept
+    } else {
+        // Reserved, not committed: PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE.
+        let m = prim.c6! "mmap" 0 native_stack_bytes 3 16418 (0 - 1) 0;
+        if m == 0 - 1 { fatal! "dream: no address space for a process's stack\n"; };
+        // The lowest page a guard: a recursion past the reservation stops there.
+        prim.c3! "mprotect" m 4096 0;
+        prim.store64! (pcb + pcb_nstack) m;
+        m
+    };
+    base + native_stack_bytes
+};
+
+/// A finished process's native stack given back: kept for the next process started here, as
+/// many as `kept_native_stacks`, and the rest to the kernel.
+let native_stack_done! !p !pcb = {
+    let base = prim.load64! (pcb + pcb_nstack);
+    if base != 0 && prim.load64! (pcb + pcb_state) == state_done {
+        if prim.load64! (p + ctx_nstack_count) < kept_native_stacks {
+            prim.store64! (base + native_stack_bytes - word) (prim.load64! (p + ctx_nstacks));
+            prim.store64! (p + ctx_nstacks) base;
+            prim.store64! (p + ctx_nstack_count) (prim.load64! (p + ctx_nstack_count) + 1);
+        } else { prim.c2! "munmap" base native_stack_bytes; };
+        prim.store64! (pcb + pcb_nstack) 0;
+    };
+    0
+};
+
+/// Until whoever ran `pcb` last is off its stack.
+let off_its_stack! !pcb !n = if prim.load_acq! (pcb + pcb_on_stack) == 0 { 0 } else {
+    if n > 4096 { prim.c0! "sched_yield"; } else { prim.pause! (); };
+    off_its_stack! pcb (n + 1)
+};
+
 let dispatch! !p !pcb !b !c !d !e = {
     make_current! p pcb;
     load_heap! p pcb;
     // Due to report to a census: at its first function entry.
     if prim.load64! (pcb + pcb_census_due) != 0 { prim.store64! (p + ctx_guard) (0 - 1); };
+    prim.store64! (p + ctx_on_process) 1;
+    off_its_stack! pcb 0;
+    prim.store64! (pcb + pcb_on_stack) 1;
+    prim.run_on! (native_stack_top! p pcb) p pcb (p + ctx_sched_sp);
+    // Back on the scheduler's stack: the process has given the worker back.
+    native_stack_done! p pcb;
+    prim.store_rel! (pcb + pcb_on_stack) 0;
+    schedule! p 0 0 0 0 0
+};
+
+/// What `dispatch!` runs on the process's own stack: the process, from where it was.
+let run_process! !p !pcb !b !c !d !e = {
     let sp = prim.load64! (pcb + pcb_sp);
     let reason = prim.load64! (pcb + pcb_kill);
     if reason != 0 && prim.load64! (pcb + pcb_killing) == 0 {
@@ -4088,7 +4171,12 @@ let dispatch! !p !pcb !b !c !d !e = {
     }
 };
 
-let schedule! !p !a !b !c !d !e = {
+let schedule! !p !a !b !c !d !e = if prim.load64! (p + ctx_on_process) != 0 {
+    // From a process, on its stack: back to the scheduler's first, where `dispatch!` goes on.
+    prim.store64! (p + ctx_on_process) 0;
+    prim.return_to! (prim.load64! (p + ctx_sched_sp));
+    0
+} else {
     if waiting_on_system! () { maybe_service! p; };
     let next = run_pop! p;
     if next != 0 { more_to_share! p; dispatch! p next 0 0 0 0 }
