@@ -326,10 +326,14 @@ let rec zip xs ys =
         _list_cons [xs.[0], ys.[0]] (zip (_list_tail xs) (_list_tail ys))
     };
 
-/// Flatten a list of lists by joining them in order.
+/// Flatten a list of lists by joining them in order. The last list is the end of the answer as
+/// it is, not a copy: `concat [new, old]` is how a list is grown at the front, and copying
+/// `old` each time made that a copy of everything so far.
 let concat : [[a]] -> [a];
 let rec concat xss =
-    if _list_is_empty xss { [] } else { append (xss.[0]) (concat (_list_tail xss)) };
+    if _list_is_empty xss { [] }
+    else if _list_is_empty (_list_tail xss) { xss.[0] }
+    else { append (xss.[0]) (concat (_list_tail xss)) };
 
 /// Apply `f` to each element and concatenate the lists it returns.
 let flat_map : (a -> [b]) -> [a] -> [b];
