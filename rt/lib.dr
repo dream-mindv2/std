@@ -483,7 +483,7 @@ let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env
 /// `vm.share!`: a value forced all the way down and moved where every process can read it,
 /// so that handing it to one copies a pointer. It is promoted into the shared region and kept
 /// a root of the census for the rest of the run, as the VM's shared area keeps what it is given.
-let share! v = if native.quick_shareable v || share_check v { native.keep_forever v } else { v };
+let share! v = if native.quick_shareable v || (share_check v && native.quick_shareable v) { native.keep_forever v } else { v };
 
 /// Forced, as the VM forces what it shares. A function is shared as it is, as the VM shares
 /// one: what it captured was a value when it was made, or the program that made it is the

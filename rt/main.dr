@@ -458,6 +458,8 @@ let w_promoting = 544;
 let w_sweep_wanted = 552;
 /// Sweeps so far: a block a context kept from before the last one may be gone.
 let w_sweeps = 560;
+/// How much address space a process's native stack is reserved with: 0 until the first.
+let w_stack_reserved = 568;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -2830,21 +2832,41 @@ let quick_shareable! !p !v = as_word (all_evaluated! v 0);
 // info that says so (`@i_cons_s` and the rest, with the same kind and layout), and is not walked
 // again: a value never changes once it is made, the mark travels with every copy the collector
 // and promotion make, and without it a value shared n levels deep was walked 2^n times -- the
-// VM keeps the same mark in its header (`AUX_DEEP_FORCED`). A trunk changes in place and is
-// never marked. Only a walk for `settle` marks or trusts a mark, since to `vm.share!` a
-// function's captures matter and the mark says nothing of them.
+// VM keeps the same mark in its header (`AUX_DEEP_FORCED`). A trunk is remade, never changed
+// (`trunk_push!`), so it is marked too, once all of the map under it is evaluated: a window on
+// a map may leave some of it out, and asking all of it only ever says no too often. Only a walk
+// for `settle` marks or trusts a mark, since to `vm.share!` a function's captures matter and
+// the mark says nothing of them.
 
-/// Whether `info` is one of the marked twins.
+/// Whether `info` is one of the marked twins: settled, or shareable, which says more.
 let settled_info! !info = info == prim.info "cons_s" || info == prim.info "array_s" || info == prim.info "record_s"
-    || info == prim.info "map_s" || info == prim.info "map_leaf_s";
+    || info == prim.info "map_s" || info == prim.info "map_leaf_s" || info == prim.info "trunk_s" || shareable_info! info;
 
-/// `v` given its marked twin, when it has one.
-let mark_settled! !v !kind = {
-    if kind == kind_cons { prim.store64! v (prim.info "cons_s"); }
-    else if kind == kind_array { prim.store64! v (prim.info "array_s"); }
-    else if kind == kind_record { prim.store64! v (prim.info "record_s"); }
-    else if kind == kind_map { prim.store64! v (prim.info "map_s"); }
-    else if kind == kind_leaf { prim.store64! v (prim.info "map_leaf_s"); };
+/// Whether `info` says shareable: evaluated all the way down, and every closure under it has its
+/// captures evaluated, which is everything `vm.share!` asks (rt/lib.dr, `share_check`).
+let shareable_info! !info = info == prim.info "cons_x" || info == prim.info "array_x" || info == prim.info "record_x"
+    || info == prim.info "map_x" || info == prim.info "trunk_x";
+
+/// Whether a walk with `functions` may stop at an object with `info`.
+let walked_info! !info !functions = if functions == 1 { settled_info! info } else { shareable_info! info };
+
+/// `v` given its marked twin for a walk with `functions`, when it has one. Settled does not take
+/// the place of shareable.
+let mark_settled! !v !kind !functions = {
+    if functions == 0 {
+        if kind == kind_cons { prim.store64! v (prim.info "cons_x"); }
+        else if kind == kind_array { prim.store64! v (prim.info "array_x"); }
+        else if kind == kind_record { prim.store64! v (prim.info "record_x"); }
+        else if kind == kind_map { prim.store64! v (prim.info "map_x"); }
+        else if kind == kind_trunk { prim.store64! v (prim.info "trunk_x"); };
+    } else if not (shareable_info! (prim.load64! v)) {
+        if kind == kind_cons { prim.store64! v (prim.info "cons_s"); }
+        else if kind == kind_array { prim.store64! v (prim.info "array_s"); }
+        else if kind == kind_record { prim.store64! v (prim.info "record_s"); }
+        else if kind == kind_map { prim.store64! v (prim.info "map_s"); }
+        else if kind == kind_leaf { prim.store64! v (prim.info "map_leaf_s"); }
+        else if kind == kind_trunk { prim.store64! v (prim.info "trunk_s"); };
+    };
     1
 };
 
@@ -2852,33 +2874,59 @@ let mark_settled! !v !kind = {
 let marked_settled! !p !v = as_word (is_object v && settled_info! (prim.load64! v));
 
 let all_evaluated! !v !functions = if not (is_object v) { 1 }
-    else if functions == 1 && settled_info! (prim.load64! v) { 1 }
+    else if walked_info! (prim.load64! v) functions { 1 }
     else {
     let kind = kind_of! v;
     if kind == kind_ind { all_evaluated! (prim.load64! (v + word)) functions }
     else if kind == kind_thunk || kind == kind_hole { 0 }
     else if kind == kind_cons {
-        if all_evaluated! (prim.load64! (v + word)) functions == 0 { 0 }
-        else if all_evaluated! (prim.load64! (v + 2 * word)) functions == 0 { 0 }
-        else if functions == 1 { mark_settled! v kind } else { 1 }
+        // A spine is a loop, checked and then marked: walked cell by cell the way the rest is,
+        // a long list was as many frames on the machine's stack.
+        if spine_evaluated! v functions == 0 { 0 } else { mark_spine! v functions }
     }
     else if kind == kind_array {
         if all_in! (v + 2 * word) (untag_fix (prim.load64! (v + word))) functions == 0 { 0 }
-        else if functions == 1 { mark_settled! v kind } else { 1 }
+        else { mark_settled! v kind functions }
     }
     else if kind == kind_record {
         if all_in! (v + 3 * word) (untag_fix (prim.load64! (v + word))) functions == 0 { 0 }
-        else if functions == 1 { mark_settled! v kind } else { 1 }
+        else { mark_settled! v kind functions }
     }
     else if kind == kind_map || kind == kind_leaf {
         if map_evaluated! v functions == 0 { 0 }
-        else if functions == 1 && kind == kind_map { mark_settled! v kind } else { 1 }
+        else if kind == kind_map { mark_settled! v kind functions } else { 1 }
     }
     else if kind == kind_error { all_evaluated! (prim.load64! (v + 2 * word)) functions }
-    else if kind == kind_closure || kind == kind_pap { functions }
-    else if kind == kind_trunk { 0 }
+    // To a share, a closure is done when what it captured is evaluated, as `share_check` asks.
+    else if kind == kind_closure {
+        if functions == 1 || settled_words! v 1 (prim.load64! (prim.load64! v + info_size)) { 1 } else { 0 }
+    }
+    else if kind == kind_pap { 1 }
+    else if kind == kind_trunk {
+        if map_evaluated! (trunk_map! v) functions == 0 { 0 } else { mark_settled! v kind functions }
+    }
     else { 1 }
 };
+
+/// Whether every head along the spine from cell `c` is evaluated all the way down, and whatever
+/// ends it.
+let spine_evaluated! !c !functions =
+    if all_evaluated! (prim.load64! (c + word)) functions == 0 { 0 } else {
+        let t = followed! (prim.load64! (c + 2 * word));
+        if is_object t && kind_of! t == kind_cons && not (walked_info! (prim.load64! t) functions) {
+            spine_evaluated! t functions
+        } else { all_evaluated! t functions }
+    };
+
+/// Every cell of the spine from `c` marked, to the first that is already or the end.
+let mark_spine! !c !functions = {
+    mark_settled! c kind_cons functions;
+    let t = followed! (prim.load64! (c + 2 * word));
+    if is_object t && kind_of! t == kind_cons && not (walked_info! (prim.load64! t) functions) { mark_spine! t functions } else { 1 }
+};
+
+/// `v` past any indirections.
+let followed! !v = if is_object v && kind_of! v == kind_ind { followed! (prim.load64! (v + word)) } else { v };
 
 let all_in! !at !n !functions = if n <= 0 { 1 }
     else if all_evaluated! (prim.load64! at) functions == 0 { 0 }
@@ -3426,6 +3474,8 @@ let pcb_nstack = 280;
 /// 1 while a worker is on that stack: a process made runnable as it parks is still running there
 /// until it reaches the scheduler and switches off, and another worker taking it waits for that.
 let pcb_on_stack = 288;
+/// How much address space that stack was given.
+let pcb_nstack_size = 296;
 let pcb_size = 312;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
@@ -4095,8 +4145,25 @@ let maybe_service! !p = {
 // stack is the machine's own, reserved large and touched as needed, where code that calls rather
 // than jumps keeps what it is in the middle of (dreams/docs/aot-direct.md).
 
-/// How much of the address space a process's native stack may take.
-let native_stack_bytes = 67108864;
+/// How much of the address space a process's native stack is given: as much as this, or less
+/// where a limit on the address space (`ulimit -v`) will not give that much to every process
+/// alive at once -- reserved is not committed, but it counts all the same.
+//
+// Eight megabytes, a thread's own, while code jumps rather than calls, and nothing on the stack lives past the call it
+// was made in: reserved at 64 MB each, a compile's few hundred processes and the stacks kept for
+// reuse took more address space than `ulimit -v 16000000` left beside their heaps. Direct style,
+// whose recursion is the stack's, is what wants it larger (dreams/docs/aot-direct.md, "Risks").
+let native_stack_bytes = 8388608;
+let least_native_stack = 262144;
+
+/// A stack of `bytes` reserved, or of less if the system will not give it: `[base, bytes]`.
+let reserved_stack! !bytes = {
+    // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE.
+    let m = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
+    if m != 0 - 1 { prim.store64! (world_at! w_stack_reserved) bytes; m }
+    else if bytes > least_native_stack { reserved_stack! (bytes / 8) }
+    else { fatal! "dream: no address space for a process's stack (is `ulimit -v` set low?)\n"; 0 }
+};
 
 let kept_native_stacks = 64;
 
@@ -4107,32 +4174,44 @@ let native_stack_top! !p !pcb = {
     let base = if had != 0 { had } else if kept != 0 {
         // One a finished process left here: its pages are touched already, and taking it costs no
         // call to the kernel, where a fresh one was two and a fault for each page it touched.
-        prim.store64! (p + ctx_nstacks) (prim.load64! (kept + native_stack_bytes - word));
+        let size = prim.load64! kept;
+        prim.store64! (p + ctx_nstacks) (prim.load64! (kept + size - word));
+        prim.c3! "mprotect" kept 4096 0;
         prim.store64! (p + ctx_nstack_count) (prim.load64! (p + ctx_nstack_count) - 1);
         prim.store64! (pcb + pcb_nstack) kept;
+        prim.store64! (pcb + pcb_nstack_size) size;
         kept
     } else {
-        // Reserved, not committed: PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE.
-        let m = prim.c6! "mmap" 0 native_stack_bytes 3 16418 (0 - 1) 0;
-        if m == 0 - 1 { fatal! "dream: no address space for a process's stack\n"; };
-        // The lowest page a guard: a recursion past the reservation stops there.
+        // Reserved, not committed. Once one could not be had at full size, the rest are asked
+        // for at the size that could.
+        let want = prim.load64! (world_at! w_stack_reserved);
+        let m = reserved_stack! (if want == 0 { native_stack_bytes } else { want });
+        // The lowest page a guard: a recursion past the reservation stops there. Below it, in
+        // the guard page's place while it is kept for reuse, is nothing: the size is kept at its
+        // base, which is the guard, once it is made readable again (`native_stack_done!`).
         prim.c3! "mprotect" m 4096 0;
         prim.store64! (pcb + pcb_nstack) m;
+        prim.store64! (pcb + pcb_nstack_size) (prim.load64! (world_at! w_stack_reserved));
         m
     };
-    base + native_stack_bytes
+    base + prim.load64! (pcb + pcb_nstack_size)
 };
 
 /// A finished process's native stack given back: kept for the next process started here, as
 /// many as `kept_native_stacks`, and the rest to the kernel.
 let native_stack_done! !p !pcb = {
     let base = prim.load64! (pcb + pcb_nstack);
+    let size = prim.load64! (pcb + pcb_nstack_size);
     if base != 0 && prim.load64! (pcb + pcb_state) == state_done {
         if prim.load64! (p + ctx_nstack_count) < kept_native_stacks {
-            prim.store64! (base + native_stack_bytes - word) (prim.load64! (p + ctx_nstacks));
+            // Kept with its size where its guard page was and its link at its top; the guard is
+            // made again when it is next given out.
+            prim.c3! "mprotect" base 4096 3;
+            prim.store64! base size;
+            prim.store64! (base + size - word) (prim.load64! (p + ctx_nstacks));
             prim.store64! (p + ctx_nstacks) base;
             prim.store64! (p + ctx_nstack_count) (prim.load64! (p + ctx_nstack_count) + 1);
-        } else { prim.c2! "munmap" base native_stack_bytes; };
+        } else { prim.c2! "munmap" base size; };
         prim.store64! (pcb + pcb_nstack) 0;
     };
     0
