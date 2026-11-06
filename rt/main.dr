@@ -98,7 +98,11 @@ let ctx_quick = 576;
 /// Where cells are carved from next, and where that slab ends (`cell_get!`).
 let ctx_cell_cursor = 584;
 let ctx_cell_end = 592;
-let ctx_size = 600;
+/// For each kind of promotion, the block this context's go on filling, where, and the sweep it
+/// was kept under: one after it may have freed it (`copy_out!`).
+let ctx_shared_cur = 600;
+let ctx_short_cur = 624;
+let ctx_size = 648;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -441,6 +445,12 @@ let w_atoms_shown = 520;
 let w_atoms_type = 528;
 /// The processes there were when the census round going now began: only those can be reaped by it.
 let w_census_n = 536;
+/// Promotions under way: copies into the shared region not yet finished, which a sweep waits for.
+let w_promoting = 544;
+/// A sweep waiting for them, which no promotion starts behind.
+let w_sweep_wanted = 552;
+/// Sweeps so far: a block a context kept from before the last one may be gone.
+let w_sweeps = 560;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -543,7 +553,10 @@ let first_segment = 512;
 let xc_more! !p !bytes =
     if prim.load64! (p + ctx_xc_mode) != xc_message {
         let need = bytes + seg_header;
+        let l = prim.load64! (world_at! w_shared_lock);
+        lock! l;
         let blk = take_blocks! ((need + shared_block - 1) / shared_block) (prim.load64! (p + ctx_xc_mode));
+        unlock! l;
         let last = prim.load64! (p + ctx_xc_last);
         prim.store64! (last + 2 * word) (prim.load64! (p + ctx_xc_to));
         prim.store64! last blk;
@@ -694,17 +707,23 @@ let copy_out! !p !v !mode =
         let cur_at = world_at! (if mode == xc_short { w_short_cur } else { w_shared_cur });
         let hp_at = world_at! (if mode == xc_short { w_short_hp } else { w_shared_hp });
         if mode != xc_message {
-            // Into the block promotion is filling, which is new in this epoch now.
-            if prim.load64! cur_at == 0 {
-                let blk = take_blocks! 1 mode;
-                prim.store64! cur_at blk;
-                prim.store64! hp_at (blk + seg_header);
-            };
-            let cur = prim.load64! cur_at;
+            // Into the block this context's promotions are filling, its own and new in this epoch
+            // now, or if it has none from since the last sweep, a block of the region's.
+            let l = prim.load64! (world_at! w_shared_lock);
+            lock_to_promote! l;
+            prim.store64! (world_at! w_promoting) (prim.load64! (world_at! w_promoting) + 1);
+            let mine = p + (if mode == xc_short { ctx_short_cur } else { ctx_shared_cur });
+            let own = if prim.load64! (mine + 2 * word) == prim.load64! (world_at! w_sweeps) { prim.load64! mine } else { 0 };
+            let had = if own != 0 { 0 } else { prim.load64! cur_at };
+            let cur = if own != 0 { own } else if had == 0 { take_blocks! 1 mode } else { had };
+            let from = if own != 0 { prim.load64! (mine + word) } else if had == 0 { cur + seg_header } else { prim.load64! hp_at };
+            if own == 0 && had != 0 { prim.store64! cur_at 0; };
+            prim.store64! mine 0;
             touch_block! cur;
+            unlock! l;
             prim.store64! (p + ctx_xc_first) cur;
             prim.store64! (p + ctx_xc_last) cur;
-            prim.store64! (p + ctx_xc_to) (prim.load64! hp_at);
+            prim.store64! (p + ctx_xc_to) from;
             prim.store64! (p + ctx_xc_limit) (cur + prim.load64! (cur + word));
         } else {
             prim.store64! (p + ctx_xc_to) 0;
@@ -716,9 +735,16 @@ let copy_out! !p !v !mode =
             xc_scan_segments! p (prim.load64! (p + ctx_xc_first)) start;
             let last = prim.load64! (p + ctx_xc_last);
             prim.store64! (last + 2 * word) (prim.load64! (p + ctx_xc_to));
-            prim.store64! cur_at last;
-            prim.store64! hp_at (prim.load64! (p + ctx_xc_to));
+            let l = prim.load64! (world_at! w_shared_lock);
+            lock! l;
+            // Kept for this context's next promotion to go on filling.
+            let mine = p + (if mode == xc_short { ctx_short_cur } else { ctx_shared_cur });
+            prim.store64! mine last;
+            prim.store64! (mine + word) (prim.load64! (p + ctx_xc_to));
+            prim.store64! (mine + 2 * word) (prim.load64! (world_at! w_sweeps));
             prim.store64! (world_at! w_shared_since) (prim.load64! (world_at! w_shared_since) + prim.load64! (p + ctx_xc_bytes));
+            prim.store64! (world_at! w_promoting) (prim.load64! (world_at! w_promoting) - 1);
+            unlock! l;
             prim.store64! (p + ctx_xc_first) 0;
             prim.store64! (p + ctx_xc_bytes) 0;
         } else {
@@ -731,8 +757,9 @@ let copy_out! !p !v !mode =
         out
     };
 
-/// `v` where every process may read it, for as long as anything does. One promotion at a time
-/// writes the region.
+/// `v` where every process may read it, for as long as anything does. Promotions copy at once,
+/// each into blocks of its own (`copy_out!`): one at a time, a part of a compile answering a large
+/// value held every other process's answer behind it, and a compile ran on one core.
 let promote! !p !v = promote_as! p v xc_shared;
 
 /// The promotion mode of the block holding `s`; anything static -- a CAF -- lives for the run.
@@ -745,10 +772,7 @@ let shared_mode_of! !s = if prim.ult s static_limit { xc_shared } else {
 let promote_short! !p !v = promote_as! p v xc_short;
 
 let promote_as! !p !v !mode = if not (is_heap_object! v) { v } else {
-    let l = prim.load64! (world_at! w_shared_lock);
-    lock! l;
     let out = copy_out! p v mode;
-    unlock! l;
     census_maybe! p;
     out
 };
@@ -1011,7 +1035,7 @@ let census_finish! !p !round = {
     // saw, and a child that finished quickly was reaped while the parent still had to join it.
     let reaped = reap! p 2 (prim.load64! (world_at! w_census_n)) 0;
     let l = prim.load64! (world_at! w_shared_lock);
-    lock! l;
+    lock_unpromoting! l;
     let kept = sweep! p 0 (block_index (prim.load64! (world_at! w_shared_top))) round 0;
     prim.store64! (world_at! w_shared_live) kept;
     unlock! l;
@@ -1067,6 +1091,33 @@ let census_trace_line! !p !round !reaped !kept = {
 };
 
 let pid_seen! !id = prim.load64! (prim.load64! (world_at! w_pids_seen) + (id / 64) * word) & (1 << (id & 63)) != 0;
+
+/// The shared lock, held when no promotion is under way: a block one is filling may have been
+/// taken before the round began, and is neither marked nor written in it as a sweep reads it.
+/// None starts while this holds the lock, and none waits on the census, so it is soon.
+let lock_unpromoting! !l = {
+    lock! l;
+    if prim.load64! (world_at! w_promoting) != 0 {
+        prim.store64! (world_at! w_sweep_wanted) 1;
+        unlock! l;
+        prim.c0! "sched_yield";
+        lock_unpromoting! l
+    } else {
+        prim.store64! (world_at! w_sweep_wanted) 0;
+        prim.store64! (world_at! w_sweeps) (prim.load64! (world_at! w_sweeps) + 1);
+        0
+    }
+};
+
+/// The shared lock, to start a promotion: not while a sweep waits to begin.
+let lock_to_promote! !l = {
+    lock! l;
+    if prim.load64! (world_at! w_sweep_wanted) != 0 {
+        unlock! l;
+        prim.c0! "sched_yield";
+        lock_to_promote! l
+    } else { 0 }
+};
 
 /// Blocks nothing marked and nothing wrote to in this round, freed: answers the bytes kept.
 let sweep! !p !i !n !round !kept = if i >= n { kept } else {
