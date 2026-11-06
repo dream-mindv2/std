@@ -460,6 +460,9 @@ let w_sweep_wanted = 552;
 let w_sweeps = 560;
 /// How much address space a process's native stack is reserved with: 0 until the first.
 let w_stack_reserved = 568;
+/// `DREAM_TIMELINE`'s file, plus one, or 0; and when the run began.
+let w_timeline = 576;
+let w_timeline_t0 = 584;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -1570,6 +1573,7 @@ let init! () = {
     prim.store64! (p + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
     prim.store64! (p + ctx_timebuf) (prim.c2! "calloc" 2 word);
     world_init! p;
+    timeline_open! ();
     note_context! p;
     init_handles! p;
     // A peer that has gone is an error from the write, not the end of the program.
@@ -2870,6 +2874,9 @@ let mark_settled! !v !kind !functions = {
     1
 };
 
+/// Whether `v` carries the shareable mark: where `share_check` stops (rt/lib.dr).
+let marked_shareable! !p !v = as_word (is_object v && shareable_info! (prim.load64! v));
+
 /// Whether `v` carries the mark: what `settle_walk` asks before it walks (rt/lib.dr).
 let marked_settled! !p !v = as_word (is_object v && settled_info! (prim.load64! v));
 
@@ -2892,10 +2899,7 @@ let all_evaluated! !v !functions = if not (is_object v) { 1 }
         if all_in! (v + 3 * word) (untag_fix (prim.load64! (v + word))) functions == 0 { 0 }
         else { mark_settled! v kind functions }
     }
-    else if kind == kind_map || kind == kind_leaf {
-        if map_evaluated! v functions == 0 { 0 }
-        else if kind == kind_map { mark_settled! v kind functions } else { 1 }
-    }
+    else if kind == kind_map || kind == kind_leaf { map_evaluated! v functions }
     else if kind == kind_error { all_evaluated! (prim.load64! (v + 2 * word)) functions }
     // To a share, a closure is done when what it captured is evaluated, as `share_check` asks.
     else if kind == kind_closure {
@@ -2932,8 +2936,13 @@ let all_in! !at !n !functions = if n <= 0 { 1 }
     else if all_evaluated! (prim.load64! at) functions == 0 { 0 }
     else { all_in! (at + word) (n - 1) functions };
 
-let map_evaluated! !v !functions = if kind_of! v == kind_leaf { leaf_evaluated! v functions }
-    else { map_children! v 0 (popcount (branch_bitmap! v)) functions };
+/// A map's branches are marked as they are found evaluated, not only the root: a map is copied
+/// along one path for each change, so a new version shares nearly every branch of the last, and
+/// marked only at its root, each version was walked again whole.
+let map_evaluated! !v !functions = if walked_info! (prim.load64! v) functions { 1 }
+    else if kind_of! v == kind_leaf { leaf_evaluated! v functions }
+    else if map_children! v 0 (popcount (branch_bitmap! v)) functions == 0 { 0 }
+    else { mark_settled! v kind_map functions };
 
 let map_children! !b !i !n !functions = if i >= n { 1 }
     else if map_evaluated! (prim.load64! (branch_slot b i)) functions == 0 { 0 }
@@ -3295,6 +3304,28 @@ let node_pairs! !p !node !i !tail = if i < 0 { tail } else {
 };
 
 let map_pairs! !p !m = if is_kind! m kind_map { node_pairs! p m (popcount (branch_bitmap! m) - 1) nil_word } else { type_fail! p "map_pairs needs a map" };
+
+/// `_unshared_parts`: the keys and values of `m`, one after another in a list, from every leaf
+/// not under a branch already marked shareable: what `share_check` walks of a map (rt/lib.dr).
+/// A map is copied along one path for each change, so a new version shares nearly every branch
+/// with the last one shared, and walking all of its pairs again made each share of a compiler's
+/// loader cost the whole loader -- half of a native compile's serial time.
+let unshared_parts! !p !m = if not (is_kind! m kind_map) { type_fail! p "unshared_parts needs a map" }
+    else if shareable_info! (prim.load64! m) { nil_word }
+    else { unshared_from! p m (popcount (branch_bitmap! m) - 1) nil_word };
+
+let unshared_from! !p !node !i !tail = if i < 0 { tail } else {
+    let child = prim.load64! (branch_slot node i);
+    let with_child = if not (is_object child) { tail }
+                     else if is_leaf! child { leaf_parts! p child tail }
+                     else if shareable_info! (prim.load64! child) { tail }
+                     else { unshared_from! p child (popcount (branch_bitmap! child) - 1) tail };
+    unshared_from! p node (i - 1) with_child
+};
+
+let leaf_parts! !p !l !tail = if l == nil_word { tail } else {
+    new_cons! p (prim.load64! (l + 2 * word)) (new_cons! p (prim.load64! (l + 3 * word)) (leaf_parts! p (prim.load64! (l + 4 * word)) tail))
+};
 
 let map_size! !p !m = tag_fix (branch_count! m);
 
@@ -3793,6 +3824,50 @@ let leave! !p !pcb = {
     0
 };
 
+// --- the timeline -----------------------------------------------------------------------
+//
+// `DREAM_TIMELINE=FILE`, as the VM writes it (dream/src/scheduler.cpp): each slice a process ran,
+// each spawn and each join that had to wait, a line each, which `dream/tools/timeline.py` follows
+// back from the root's exit to find what a run's wall clock is made of. A line is written as it
+// happens, to a file opened to append, so that workers' lines never interleave.
+
+let timeline_open! () = {
+    let path = prim.c1! "getenv" "DREAM_TIMELINE";
+    if path != 0 {
+        // O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644.
+        let fd = prim.c3! "open" path 1601 420;
+        if fd >= 0 { prim.store64! (world_at! w_timeline) (fd + 1); prim.store64! (world_at! w_timeline_t0) (clock_ns! ()); };
+    };
+    0
+};
+
+let timeline_on! () = prim.load64! (world_at! w_timeline) != 0;
+
+/// The monotonic clock in nanoseconds, with a buffer of its own.
+let clock_ns! () = {
+    let buf = prim.c1! "malloc" 16;
+    prim.c2! "clock_gettime" 1 buf;
+    let ns = prim.load64! buf * 1000000000 + prim.load64! (buf + word);
+    prim.c1! "free" buf;
+    ns
+};
+
+/// Microseconds since the run began.
+let timeline_now! () = (clock_ns! () - prim.load64! (world_at! w_timeline_t0)) / 1000;
+
+/// One line: `kind end worker 1 pid other t0 t1 -`, the kind and the end as `kind * 256 + end`.
+let timeline_line! !p !kind_end !pid !other !t0 !t1 = if timeline_on! () {
+    let buf = prim.c1! "malloc" 256;
+    prim.c6! "snprintf" buf 96 "%c %c %ld 1 " (kind_end / 256) (kind_end % 256) (prim.load64! (p + ctx_index));
+    let a = prim.c1! "strlen" buf;
+    prim.c5! "snprintf" (buf + a) 80 "%ld %ld " pid other;
+    let b = prim.c1! "strlen" buf;
+    prim.c5! "snprintf" (buf + b) 80 "%ld %ld -\n" t0 t1;
+    prim.c3! "write" (prim.load64! (world_at! w_timeline) - 1) buf (prim.c1! "strlen" buf);
+    prim.c1! "free" buf;
+    0
+} else { 0 };
+
 // --- time -------------------------------------------------------------------------------
 
 let now_ns! !p = {
@@ -4231,8 +4306,14 @@ let dispatch! !p !pcb !b !c !d !e = {
     prim.store64! (p + ctx_on_process) 1;
     off_its_stack! pcb 0;
     prim.store64! (pcb + pcb_on_stack) 1;
+    let started = if timeline_on! () { timeline_now! () } else { 0 };
     prim.run_on! (native_stack_top! p pcb) p pcb (p + ctx_sched_sp);
     // Back on the scheduler's stack: the process has given the worker back.
+    if timeline_on! () {
+        let state = prim.load64! (pcb + pcb_state);
+        timeline_line! p (115 * 256 + (if state == state_done { 104 } else if state == state_waiting { 112 } else { 121 }))
+            (prim.load64! (pcb + pcb_id)) 0 started (timeline_now! ());
+    };
     native_stack_done! p pcb;
     prim.store_rel! (pcb + pcb_on_stack) 0;
     schedule! p 0 0 0 0 0
@@ -4846,6 +4927,7 @@ let world_init! !p = {
 
 let spawn! !p !work = {
     let pcb = new_pcb! p;
+    let spawn_at = if timeline_on! () { timeline_now! () } else { 0 };
     // Its work, copied into what will be its heap, and room to begin in: what is left of the
     // segment the copy ended in, when there is any to speak of. A program that starts a hundred
     // thousand processes at once touches a page for each of them otherwise.
@@ -4882,6 +4964,7 @@ let spawn! !p !work = {
     prim.store64! (pcb + pcb_state) state_ready;
     start_workers! p;
     start_ticking! p;
+    timeline_line! p (99 * 256 + 45) (prim.load64! (current! p + pcb_id)) (prim.load64! (pcb + pcb_id)) spawn_at (if timeline_on! () { timeline_now! () } else { 0 });
     run_push! p pcb;
     new_pid! p (prim.load64! (pcb + pcb_id))
 };
@@ -4913,6 +4996,7 @@ let join_m! !p !sp !self_ !pid !c !d = {
         } else {
             prim.store64! (target + pcb_joiners) (id_push! p (prim.load64! (target + pcb_joiners)) (prim.load64! (current! p + pcb_id)));
             pcb_unlock! target;
+            timeline_line! p (106 * 256 + 45) (prim.load64! (current! p + pcb_id)) (prim.load64! (target + pcb_id)) (if timeline_on! () { timeline_now! () } else { 0 }) 0;
             park! p sp (prim.load64! (prim.info "m_join")) pid unit_word unit_word
         }
     }

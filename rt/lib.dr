@@ -488,12 +488,12 @@ let share! v = if native.quick_shareable v || (share_check v && native.quick_sha
 /// Forced, as the VM forces what it shares. A function is shared as it is, as the VM shares
 /// one: what it captured was a value when it was made, or the program that made it is the
 /// one that knows (dre's compiled program is made so).
-let share_check !v = match type_of v {
+let share_check !v = native.marked_shareable v || match type_of v {
     :pure_fn => shareable_function v,
     :impure_fn => shareable_function v,
     :list => share_list v,
     :array => share_items v 0 (native.size v),
-    :map => share_list (native.map_pairs v),
+    :map => share_list (native.unshared_parts v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
     :bool => true, :unit => true, :process => true, :error => true, :tensor => true, :module => true,
     :trunk => share_list (native.trunk_to_list v),
@@ -503,8 +503,9 @@ let share_check !v = match type_of v {
 let shareable_function f = if native.captures_settled f { true }
     else { lib_raise (native.error_new :type_error "cannot share a thunk: force it first") };
 
-/// As `settle` walks, for the same reason.
-let share_list !xs = if is_cons_of xs {
+/// As `settle` walks, for the same reason. A map is walked as the parts of it not already
+/// marked shareable (`unshared_parts`), and a marked cell ends a spine.
+let share_list !xs = if native.marked_shareable xs { true } else if is_cons_of xs {
     if share_check (native.list_head xs) { share_list (native.list_tail xs) } else { false }
 } else { true };
 
