@@ -74,10 +74,7 @@ let show_record r = {
 
 // --- lengths and forcing -------------------------------------------------------------
 
-let length_from xs !n = match xs {
-    [] => n,
-    [_, ..rest] => length_from rest (n + 1),
-};
+let length_from !xs !n = if is_cons_of xs { length_from (native.list_tail xs) (n + 1) } else { n };
 
 let length v = match type_of v {
     :list => length_from v 0,
@@ -87,32 +84,46 @@ let length v = match type_of v {
 /// All the way down.
 let deep! v = if settle v { v } else { v };
 
-let settle_list xs = match xs {
-    [] => true,
-    [x, ..rest] => { let done = settle x; done && settle_list rest },
-};
+// A value forced all the way down, which `strict!`, `lazy.settled` and `vm.share!` ask of whatever
+// they are given -- a compiler's whole loader, before each of its phases. Walked with nothing
+// suspended: a list's head and tail read from its cell, an array's or a record's elements by
+// their index. Taken apart by a pattern, every element was two thunks and an array was a list
+// first, and a native compile spent most of its time here and in collecting what that made.
 
-let settle v = match type_of v {
+let settle_list !xs = if is_cons_of xs {
+    if settle_walk (native.list_head xs) { settle_list (native.list_tail xs) } else { false }
+} else { true };
+
+let settle_items !a !i !n = if i >= n { true }
+    else if settle_walk (native.match_at a i) { settle_items a (i + 1) n } else { false };
+
+/// What the runtime is asked first, and the walk that forces only if it says no -- after which the
+/// runtime is asked again, and marks what the walk forced, so the next force of it is one test.
+let settle !v = native.quick_settled v || (settle_walk v && native.quick_settled v);
+
+let settle_walk !v = native.marked_settled v || match type_of v {
     :list => settle_list v,
-    :array => settle_list (native.array_to_list v),
+    :array => settle_items v 0 (native.size v),
     :map => settle_list (native.map_pairs v),
-    :error => settle (native.error_payload v),
+    :error => settle_walk (native.error_payload v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
     :bool => true, :unit => true, :pure_fn => true, :impure_fn => true, :process => true,
     :trunk => settle_list (native.trunk_to_list v),
     :tensor => true,
     :module => true,
-    _ => settle_list (native.array_to_list (native.record_fields v)),
+    _ => settle_items v 0 (native.record_size v),
 };
 
 let forced v = { let t = type_of v; true };
 
 // --- strings and arrays from lists ----------------------------------------------------
 
-let array_fill a xs !i = match xs {
-    [] => a,
-    [x, ..rest] => array_fill (native.array_store a i x) rest (i + 1),
-};
+// A list made an array, the spine walked through strict parameters and each element stored as the
+// cell holds it: taken apart by a pattern, each element was a thunk of reading it and so was the
+// rest, and `array.of_list`, which a compiler calls everywhere, was half of a native compile.
+let array_fill !a !xs !i = if is_cons_of xs {
+    array_fill (native.array_store_head a i xs) (native.list_tail xs) (i + 1)
+} else { a };
 
 let array_of_list xs = array_fill (native.array_new (length_from xs 0) ()) xs 0;
 
@@ -472,30 +483,33 @@ let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env
 /// `vm.share!`: a value forced all the way down and moved where every process can read it,
 /// so that handing it to one copies a pointer. It is promoted into the shared region and kept
 /// a root of the census for the rest of the run, as the VM's shared area keeps what it is given.
-let share! v = if share_check v { native.keep_forever v } else { v };
+let share! v = if native.quick_shareable v || share_check v { native.keep_forever v } else { v };
 
 /// Forced, as the VM forces what it shares. A function is shared as it is, as the VM shares
 /// one: what it captured was a value when it was made, or the program that made it is the
 /// one that knows (dre's compiled program is made so).
-let share_check v = match type_of v {
+let share_check !v = match type_of v {
     :pure_fn => shareable_function v,
     :impure_fn => shareable_function v,
     :list => share_list v,
-    :array => share_list (native.array_to_list v),
+    :array => share_items v 0 (native.size v),
     :map => share_list (native.map_pairs v),
     :integer => true, :float => true, :string => true, :atom => true, :char => true,
     :bool => true, :unit => true, :process => true, :error => true, :tensor => true, :module => true,
     :trunk => share_list (native.trunk_to_list v),
-    _ => share_list (native.array_to_list (native.record_fields v)),
+    _ => share_items v 0 (native.record_size v),
 };
 
 let shareable_function f = if native.captures_settled f { true }
     else { lib_raise (native.error_new :type_error "cannot share a thunk: force it first") };
 
-let share_list xs = match xs {
-    [] => true,
-    [x, ..rest] => { let done = share_check x; done && share_list rest },
-};
+/// As `settle` walks, for the same reason.
+let share_list !xs = if is_cons_of xs {
+    if share_check (native.list_head xs) { share_list (native.list_tail xs) } else { false }
+} else { true };
+
+let share_items !a !i !n = if i >= n { true }
+    else if share_check (native.match_at a i) { share_items a (i + 1) n } else { false };
 
 // --- trunks: what looks at elements ---------------------------------------------------------
 

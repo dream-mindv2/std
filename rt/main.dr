@@ -2809,6 +2809,93 @@ let array_store! !p !a !i !v = {
     a
 };
 
+// Whether a value is evaluated all the way down, by a walk that forces nothing and makes nothing:
+// what `strict!`, `lazy.settled` and `vm.share!` ask first (rt/lib.dr, `settle`), since what they
+// are given has most often been forced already -- a compiler shares its whole loader before each
+// phase -- and walking it in the library was a call or two for every cell. False as soon as a
+// suspension is met, and the library walks it, forcing as it goes. `functions` says whether a
+// function counts as done: to `vm.share!` it does not, since what one captured is asked after.
+
+let quick_settled! !p !v = as_word (all_evaluated! v 1);
+let quick_shareable! !p !v = as_word (all_evaluated! v 0);
+
+// A cell, an array, a record or a map found evaluated all the way down is given the twin of its
+// info that says so (`@i_cons_s` and the rest, with the same kind and layout), and is not walked
+// again: a value never changes once it is made, the mark travels with every copy the collector
+// and promotion make, and without it a value shared n levels deep was walked 2^n times -- the
+// VM keeps the same mark in its header (`AUX_DEEP_FORCED`). A trunk changes in place and is
+// never marked. Only a walk for `settle` marks or trusts a mark, since to `vm.share!` a
+// function's captures matter and the mark says nothing of them.
+
+/// Whether `info` is one of the marked twins.
+let settled_info! !info = info == prim.info "cons_s" || info == prim.info "array_s" || info == prim.info "record_s"
+    || info == prim.info "map_s" || info == prim.info "map_leaf_s";
+
+/// `v` given its marked twin, when it has one.
+let mark_settled! !v !kind = {
+    if kind == kind_cons { prim.store64! v (prim.info "cons_s"); }
+    else if kind == kind_array { prim.store64! v (prim.info "array_s"); }
+    else if kind == kind_record { prim.store64! v (prim.info "record_s"); }
+    else if kind == kind_map { prim.store64! v (prim.info "map_s"); }
+    else if kind == kind_leaf { prim.store64! v (prim.info "map_leaf_s"); };
+    1
+};
+
+/// Whether `v` carries the mark: what `settle_walk` asks before it walks (rt/lib.dr).
+let marked_settled! !p !v = as_word (is_object v && settled_info! (prim.load64! v));
+
+let all_evaluated! !v !functions = if not (is_object v) { 1 }
+    else if functions == 1 && settled_info! (prim.load64! v) { 1 }
+    else {
+    let kind = kind_of! v;
+    if kind == kind_ind { all_evaluated! (prim.load64! (v + word)) functions }
+    else if kind == kind_thunk || kind == kind_hole { 0 }
+    else if kind == kind_cons {
+        if all_evaluated! (prim.load64! (v + word)) functions == 0 { 0 }
+        else if all_evaluated! (prim.load64! (v + 2 * word)) functions == 0 { 0 }
+        else if functions == 1 { mark_settled! v kind } else { 1 }
+    }
+    else if kind == kind_array {
+        if all_in! (v + 2 * word) (untag_fix (prim.load64! (v + word))) functions == 0 { 0 }
+        else if functions == 1 { mark_settled! v kind } else { 1 }
+    }
+    else if kind == kind_record {
+        if all_in! (v + 3 * word) (untag_fix (prim.load64! (v + word))) functions == 0 { 0 }
+        else if functions == 1 { mark_settled! v kind } else { 1 }
+    }
+    else if kind == kind_map || kind == kind_leaf {
+        if map_evaluated! v functions == 0 { 0 }
+        else if functions == 1 && kind == kind_map { mark_settled! v kind } else { 1 }
+    }
+    else if kind == kind_error { all_evaluated! (prim.load64! (v + 2 * word)) functions }
+    else if kind == kind_closure || kind == kind_pap { functions }
+    else if kind == kind_trunk { 0 }
+    else { 1 }
+};
+
+let all_in! !at !n !functions = if n <= 0 { 1 }
+    else if all_evaluated! (prim.load64! at) functions == 0 { 0 }
+    else { all_in! (at + word) (n - 1) functions };
+
+let map_evaluated! !v !functions = if kind_of! v == kind_leaf { leaf_evaluated! v functions }
+    else { map_children! v 0 (popcount (branch_bitmap! v)) functions };
+
+let map_children! !b !i !n !functions = if i >= n { 1 }
+    else if map_evaluated! (prim.load64! (branch_slot b i)) functions == 0 { 0 }
+    else { map_children! b (i + 1) n functions };
+
+let leaf_evaluated! !l !functions = if l == nil_word { 1 }
+    else if all_evaluated! (prim.load64! (l + 2 * word)) functions == 0 { 0 }
+    else if all_evaluated! (prim.load64! (l + 3 * word)) functions == 0 { 0 }
+    else { leaf_evaluated! (prim.load64! (l + 4 * word)) functions };
+
+/// `a` with its `i`th element the head of the cell `xs`, as the cell holds it: what
+/// `array.of_list` stores, with no suspension made of reading it (rt/lib.dr, `array_fill`).
+let array_store_head! !p !a !i !xs = {
+    prim.store64! (a + (2 + untag_fix i) * word) (prim.load64! (xs + word));
+    a
+};
+
 let list_of_words! !p !at !n !tail = if n == 0 { tail } else {
     list_of_words! p at (n - 1) (new_cons! p (prim.load64! (at + (n - 1) * word)) tail)
 };
@@ -4004,10 +4091,10 @@ let dispatch! !p !pcb !b !c !d !e = {
 let schedule! !p !a !b !c !d !e = {
     if waiting_on_system! () { maybe_service! p; };
     let next = run_pop! p;
-    if next != 0 { dispatch! p next 0 0 0 0 }
+    if next != 0 { more_to_share! p; dispatch! p next 0 0 0 0 }
     else {
         let stolen = steal! p;
-        if stolen != 0 { dispatch! p stolen 0 0 0 0 }
+        if stolen != 0 { more_to_share! p; dispatch! p stolen 0 0 0 0 }
         else {
             // A while spent looking before sleeping, since what wakes a sleeper is a system call
             // on both sides, and work often turns up in the time that takes.
@@ -4024,6 +4111,15 @@ let schedule! !p !a !b !c !d !e = {
         }
     }
 };
+
+/// About to run a process with more waiting behind it here: a worker asleep is woken to take some,
+/// unless one is already looking. A push wakes one at most, and a worker woken took half of a queue
+/// and ran it while the rest slept, so a compile that started forty processes at once ran them on
+/// two cores of twenty-four. Each worker that starts one with more behind it wakes the next, and
+/// the wake goes on for as long as there is work for another.
+let more_to_share! !p =
+    if prim.load64! (p + ctx_run_head) != 0 && prim.load_acq! (world_at! w_idle) != 0
+       && prim.load_acq! (world_at! w_spinning) == 0 { nudge! p } else { 0 };
 
 let spin_rounds = 2000;
 let max_spinning = 2;

@@ -769,7 +769,34 @@ let rec unique_from seen xs =
 /// };
 /// ```
 let unique : [a] -> [a];
-let unique xs = unique_from [] xs;
+let unique xs = unique_kinds %{} [] [] xs;
+
+// `unique` asked each element of everything kept so far, which over a million was 10^12 tests: the
+// AOT's linker took the unique symbols of a compiler's relocations, and did not finish. A value of a
+// kind a map compares as `==` does -- an integer, a string, an atom, a character, a boolean, unit --
+// is remembered in a map; anything else in a list, as before. A float is equal to the integer of its
+// value, and a map's key is not, so the floats are a list of their own, which an integer is asked of
+// while there are any, and an integral float is asked of the map.
+
+/// `unique`, with the flat values kept so far in `seen`, the floats in `floats` and anything else in
+/// `others`.
+priv let unique_kinds : %{ a => :bool } -> [a] -> [a] -> [a] -> [a];
+priv let rec unique_kinds seen floats others xs =
+    if _list_is_empty xs { [] }
+    else {
+        let x = xs.[0];
+        let rest = _list_tail xs;
+        match type_of x {
+            k if k == :integer || k == :string || k == :atom || k == :char || k == :bool || k == :unit =>
+                if _map_has seen x || (k == :integer && not (_list_is_empty floats) && contains x floats) { unique_kinds seen floats others rest }
+                else { _list_cons x (unique_kinds (seen.[x => true]) floats others rest) },
+            :float =>
+                if contains x floats || (_to_int x == x && _map_has seen (_to_int x)) { unique_kinds seen floats others rest }
+                else { _list_cons x (unique_kinds seen (_list_cons x floats) others rest) },
+            _ => if contains x others { unique_kinds seen floats others rest }
+                else { _list_cons x (unique_kinds seen floats (_list_cons x others) rest) },
+        }
+    };
 
 // --- ordering ---------------------------------------------------------------
 
