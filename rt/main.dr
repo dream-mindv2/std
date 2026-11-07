@@ -154,6 +154,10 @@ let kind_process = 14;
 let kind_trunk = 15;
 let kind_tensor = 16;
 let kind_module = 17;
+/// A record whose fields are all floats, holding their bits rather than the floats: what a
+/// record of `:float` fields is made as when it can be (`record_raw!`). It is a record to
+/// everything that asks, and a field read off it as a value is boxed again (`record_word!`).
+let kind_record_f = 18;
 
 // What a frame is, in its info's kind: nothing the unwinder need notice, or one of these.
 let frame_catch = 20;
@@ -743,7 +747,8 @@ let xc_evac_range! !p !at !stop = if prim.uge at stop { 0 } else {
     xc_evac_range! p (at + word) stop
 };
 
-let has_values !kind = kind != kind_float && kind != kind_string && kind != kind_hole && kind != kind_big && kind != kind_tensor;
+let has_values !kind = kind != kind_float && kind != kind_string && kind != kind_hole && kind != kind_big && kind != kind_tensor
+    && kind != kind_record_f;
 
 /// One object copied: its values copied in turn. Answers its size in bytes.
 let xc_scan_one! !p !at = {
@@ -1251,7 +1256,7 @@ let object_words! !o !info = {
         2 + (prim.load64! (o + word) + word) / word
     } else if kind == kind_array || kind == kind_pap || kind == kind_map || kind == kind_tensor {
         2 + untag_fix (prim.load64! (o + word))
-    } else if kind == kind_record || kind == kind_big {
+    } else if kind == kind_record || kind == kind_big || kind == kind_record_f {
         3 + untag_fix (prim.load64! (o + word))
     } else if kind == kind_hole || kind == kind_ind {
         2
@@ -2036,7 +2041,7 @@ let type_of! !p !v =
         else if kind == kind_trunk { prim.atom "trunk" }
         else if kind == kind_tensor { prim.atom "tensor" }
         else if kind == kind_module { prim.atom "module" }
-        else if kind == kind_record {
+        else if kind == kind_record || kind == kind_record_f {
             let i = prim.load64! (v + 2 * word) >> 8;
             let learned = learned_shape! i w_atoms_type;
             if learned != 0 { atom_word learned } else { atom_word (prim.load64! (prim.info "atom_types" + word * i)) }
@@ -2136,7 +2141,7 @@ let describe! !p !v =
             if kind == kind_string { "a string" } else if kind == kind_float { "a float" }
             else if kind == kind_cons { "a list" } else if kind == kind_array { "a array" }
             else if kind == kind_map { "a map" } else if kind == kind_closure { "a function" }
-            else if kind == kind_pap { "a function" } else if kind == kind_record { "a record" }
+            else if kind == kind_pap { "a function" } else if kind == kind_record || kind == kind_record_f { "a record" }
             else if kind == kind_big { "a integer" } else if kind == kind_error { "a error" }
             else { "a value" })
     }
@@ -2738,7 +2743,7 @@ let type_rank! !v =
     else if is_string! v { 4 }
     else if is_kind! v kind_cons { 6 }
     else if is_kind! v kind_array { 7 }
-    else if is_kind! v kind_record { 8 }
+    else if is_record! v { 8 }
     else if is_kind! v kind_map { 9 }
     else { 10 };
 
@@ -3200,7 +3205,7 @@ let settled_info! !info = info == prim.info "cons_s" || info == prim.info "array
 /// Whether `info` says shareable: evaluated all the way down, and every closure under it has its
 /// captures evaluated, which is everything `vm.share!` asks (rt/lib.dr, `share_check`).
 let shareable_info! !info = info == prim.info "cons_x" || info == prim.info "array_x" || info == prim.info "record_x"
-    || info == prim.info "map_x" || info == prim.info "trunk_x";
+    || info == prim.info "map_x" || info == prim.info "trunk_x" || info == prim.info "record_f";
 
 /// Whether a walk with `functions` may stop at an object with `info`.
 let walked_info! !info !functions = if functions == 1 { settled_info! info } else { shareable_info! info };
@@ -3325,22 +3330,70 @@ let new_record! !p !id !n = {
     o
 };
 
-let is_record! !v = is_kind! v kind_record;
+let is_record! !v = is_object v && (kind_of! v == kind_record || kind_of! v == kind_record_f);
+
+/// Field `i` of record `v` as a value: a raw record's bits boxed as the float they are.
+let record_word! !p !v !i =
+    if kind_of! v == kind_record_f { new_float! p (prim.load64! (v + (3 + i) * word)) }
+    else { prim.load64! (v + (3 + i) * word) };
+
+/// A record just made remade in place as its floats' bits when every field is a float. Nothing
+/// else has seen it yet, so its info may change under it. Generated code does the same inline
+/// (`machine.raw_floats`).
+let record_raw! !p !r = {
+    let n = untag_fix (prim.load64! (r + word));
+    if n > 0 && all_floats! (r + 3 * word) n {
+        unbox_floats! (r + 3 * word) n;
+        prim.store64! r (prim.info "record_f");
+    };
+    r
+};
+
+let all_floats! !at !n = if n == 0 { true } else {
+    let v = prim.load64! at;
+    is_object v && prim.load64! v == prim.info "float" && all_floats! (at + word) (n - 1)
+};
+
+let unbox_floats! !at !n = if n == 0 { 0 } else {
+    prim.store64! at (prim.load64! (prim.load64! at + word));
+    unbox_floats! (at + word) (n - 1)
+};
 
 let record_is! !p !id !v = as_word (is_record! v && prim.load64! (v + 2 * word) == id);
 let record_id! !p !v = if is_record! v { prim.load64! (v + 2 * word) } else { unit_word };
 let record_fields! !p !v = {
     let n = untag_fix (prim.load64! (v + word));
     let a = new_array! p n;
-    copy_words! (v + 3 * word) (a + 2 * word) n;
+    if kind_of! v == kind_record_f { boxed_into! p v a 0 n } else { copy_words! (v + 3 * word) (a + 2 * word) n; };
     a
+};
+
+/// A raw record as an ordinary one, its fields boxed.
+let boxed_record! !p !v = {
+    let n = untag_fix (prim.load64! (v + word));
+    let r = new_record! p (prim.load64! (v + 2 * word)) n;
+    boxed_fields! p v r 0 n;
+    r
+};
+
+let boxed_fields! !p !v !r !i !n = if i == n { 0 } else {
+    prim.store64! (r + (3 + i) * word) (record_word! p v i);
+    boxed_fields! p v r (i + 1) n
+};
+
+/// A raw record's fields boxed into array `a`, each float made before `a` is written so that a
+/// collection between them finds `a` whole.
+let boxed_into! !p !v !a !i !n = if i == n { 0 } else {
+    let f = record_word! p v i;
+    prim.store64! (a + (2 + i) * word) f;
+    boxed_into! p v a (i + 1) n
 };
 let record_of! !p !id !variant !a = {
     note_record_shape! p id (variant == true_word);
     let n = untag_fix (prim.load64! (a + word));
     let r = new_record! p id n;
     copy_words! (a + 2 * word) (r + 3 * word) n;
-    r
+    record_raw! p r
 };
 let record_size! !p !v = prim.load64! (v + word);
 let record_display! !p !id = {
@@ -3425,7 +3478,7 @@ let match_at! !p !v !i = {
         if at >= 0 && at < untag_fix (prim.load64! (v + word)) { prim.load64! (v + (2 + at) * word) }
         else { fail! p atom_out_of_bounds "index out of bounds" }
     } else if is_record! v {
-        if at >= 0 && at < untag_fix (prim.load64! (v + word)) { prim.load64! (v + (3 + at) * word) }
+        if at >= 0 && at < untag_fix (prim.load64! (v + word)) { record_word! p v at }
         else { fail! p atom_out_of_bounds "index out of bounds" }
     } else if is_string! v { fail! p atom_type_error "a string is not indexed this way" }
     else { fail! p atom_type_error "a pattern read a position of something with none" }
@@ -3703,10 +3756,13 @@ let peek! !p !c !k =
     else if is_fix k && is_tensor! c {
         if untag_fix k >= 0 && untag_fix k < t_dim! c 0 { tensor_index! p c k } else { 0 }
     }
-    else if is_fix k && (is_kind! c kind_array || is_record! c) {
+    else if is_fix k && is_record! c {
         let i = untag_fix k;
-        let off = if is_record! c { 3 } else { 2 };
-        if i >= 0 && i < untag_fix (prim.load64! (c + word)) { prim.load64! (c + (off + i) * word) } else { 0 }
+        if i >= 0 && i < untag_fix (prim.load64! (c + word)) { record_word! p c i } else { 0 }
+    }
+    else if is_fix k && is_kind! c kind_array {
+        let i = untag_fix k;
+        if i >= 0 && i < untag_fix (prim.load64! (c + word)) { prim.load64! (c + (2 + i) * word) } else { 0 }
     }
     else { 0 };
 
@@ -3748,9 +3804,13 @@ let index_set! !p !c !k !v =
         if i < 0 || i >= n { fail! p atom_out_of_bounds "index out of bounds" }
         else {
             let off = if is_record! c { 3 } else { 2 };
+            let raw = kind_of! c == kind_record_f;
+            // A raw record stays one while what is set is a float; anything else makes it boxed.
+            let keeps = raw && is_object v && prim.load64! v == prim.info "float";
+            let from = if raw && not keeps { boxed_record! p c } else { c };
             let o = alloc! p ((off + n) * word);
-            copy_words! c o (off + n);
-            prim.store64! (o + (off + i) * word) v;
+            copy_words! from o (off + n);
+            prim.store64! (o + (off + i) * word) (if keeps { prim.load64! (v + word) } else { v });
             o
         }
     }
