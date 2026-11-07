@@ -34,6 +34,29 @@ let read! path = {
     }
 };
 
+/// The first `n` bytes of the file, fewer if it is shorter, or `none` when it cannot be
+/// opened: enough to tell what kind of file it is without reading all of it.
+let head! : :string -> :integer -> Option :string;
+let head! path n = {
+    let opened = try! { io.open! path :read } catch e { () };
+    match opened {
+        () => Option.none,
+        h => {
+            let text = read_some! h n [];
+            io.close! h
+            Option.some text
+        },
+    }
+};
+
+/// Up to `left` more bytes of `h`, as many reads as it takes.
+priv let read_some! : :any -> :integer -> [:string] -> :string;
+priv let rec read_some! h !left !acc = {
+    let chunk = if left <= 0 { "" } else { io.read! h left };
+    if len chunk == 0 { str.join_str "" (list.reverse acc) }
+    else { read_some! h (left - str.byte_length chunk) (list.cons chunk acc) }
+};
+
 /// Replace the file with `text`, making it if it is not there.
 ///
 /// ```dream
@@ -249,6 +272,15 @@ when test {
                 strict! got
                 remove_all! d
                 test.eq! [[Option.some "hello", Option.some "hello", Option.none], ()] [got, io.stat! d]
+            } ),
+        test.case "a file's head is its first bytes, or all of a shorter one"
+            $( {
+                let f = scratch! () + "-head";
+                write! f "DAGNCAAF and the rest"
+                let got = [head! f 8, head! f 100, head! f 0, head! (f + "-none") 8];
+                strict! got
+                remove_all! f
+                test.eq! [Option.some "DAGNCAAF", Option.some "DAGNCAAF and the rest", Option.some "", Option.none] got
             } ),
         test.case "appending adds to the end, and makes the file"
             $( {
