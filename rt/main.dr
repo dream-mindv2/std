@@ -3507,6 +3507,11 @@ let new_branch! !p !slots !count !bitmap = {
 
 let map_empty! !p = new_branch! p 0 0 0;
 
+/// `native.map_new ()`, for the library: `map_empty!` is what a map literal is made from and takes
+/// nothing, so called from Dream with `()` it answered the map and then had it applied to `()` --
+/// a native `wire.decode` of any map failed so.
+let map_new! !p !unit = map_empty! p;
+
 let new_leaf! !p !h !k !v !next = {
     let o = alloc! p (5 * word);
     prim.store64! o (prim.info "map_leaf");

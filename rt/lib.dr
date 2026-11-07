@@ -1302,7 +1302,7 @@ let wire_read s at = {
             8 => wire_read_seq s next (fn xs -> xs),
             9 => wire_read_seq s next (fn xs -> forced_lazy_array xs),
             14 => wire_read_seq s next (fn xs -> trunk_of xs),
-            10 => if fits 4 { wire_read_map s (next + 4) (le_at s next 4) (native.map_empty ()) } else { () },
+            10 => if fits 4 { wire_read_map s (next + 4) (le_at s next 4) (native.map_new ()) } else { () },
             11 => if fits 4 {
                 let n = le_at s next 4;
                 if next + 4 + n <= size { [signed_at s (next + 4) n, next + 4 + n] } else { () }
@@ -1315,6 +1315,139 @@ let wire_read s at = {
 };
 
 let forced_lazy_array xs = array_of_list xs;
+
+// --- the packed form ----------------------------------------------------------------------
+//
+// What `vm.wire_pack` writes (dream/src/pack.cpp, `Unpacker`): a first byte of 0xd2, then values
+// with lengths as varints, a value met twice written once (`DEF`) and named after (`REF`), and an
+// atom spelled the first time and numbered after. A native program wrote only the plain form and
+// read only that, so what the VM packed -- a compiler's unit cache, the AOT's -- it could not
+// read. The state threaded through is `[definitions, how many, atoms, how many]`.
+
+let packed_magic = 210;
+let packed_start = [%{}, 0, %{}, 0];
+
+let varint_at s !at !shift !acc = if at >= native.size s || shift > 63 { () } else {
+    let b = native.str_byte_any s at;
+    let acc1 = acc + (b % 128) * native.pow 2 shift;
+    if b < 128 { [acc1, at + 1] } else { varint_at s (at + 1) (shift + 7) acc1 }
+};
+
+let unzigzag n = if n % 2 == 0 { n / 2 } else { 0 - (n + 1) / 2 };
+
+let packed_atom s at st = {
+    let [defs, nd, atoms, na] = st;
+    match native.str_byte_any s at {
+        6 => match varint_at s (at + 1) 0 0 {
+            () => (),
+            [n, next] => match map_find atoms n { () => (), a => [a, next, st] },
+        },
+        _ => match varint_at s (at + 1) 0 0 {
+            () => (),
+            [n, next] => if next + n > native.size s { () } else {
+                match native.to_existing_atom (native.str_slice_any s next n) {
+                    () => (),
+                    a => [a, next + n, [defs, nd, native.map_put atoms na a, na + 1]],
+                }
+            },
+        },
+    }
+};
+
+let map_find m k = match native.match_key m k { [v] => v, _ => () };
+
+let packed_items s at !n acc st = if n == 0 { [rev_onto acc [], at, st] } else {
+    match packed_read s at st {
+        () => (),
+        [v, next, st1] => packed_items s next (n - 1) (v :: acc) st1,
+    }
+};
+
+let packed_counted s at st f = match varint_at s at 0 0 {
+    () => (),
+    [n, next] => match packed_items s next n [] st {
+        () => (),
+        [xs, after, st1] => [f xs, after, st1],
+    },
+};
+
+let packed_map s at !n m st = if n == 0 { [m, at, st] } else {
+    match packed_read s at st {
+        () => (),
+        [k, next, st1] => match packed_read s next st1 {
+            () => (),
+            [v, after, st2] => packed_map s after (n - 1) (native.map_put m k v) st2,
+        },
+    }
+};
+
+let packed_read s at st = if at >= native.size s { () } else {
+    let tag = native.str_byte_any s at;
+    let next = at + 1;
+    match tag {
+        0 => [(), next, st],
+        1 => [false, next, st],
+        2 => [true, next, st],
+        17 => [[], next, st],
+        6 => packed_atom s at st,
+        18 => packed_atom s at st,
+        15 => match packed_read s next st {
+            () => (),
+            [v, after, [defs, nd, atoms, na]] => [v, after, [native.map_put defs nd v, nd + 1, atoms, na]],
+        },
+        16 => match varint_at s next 0 0 {
+            () => (),
+            [n, after] => if n < st.[1] { [map_find st.[0] n, after, st] } else { () },
+        },
+        3 => match varint_at s next 0 0 { () => (), [n, after] => [unzigzag n, after, st] },
+        7 => match varint_at s next 0 0 { () => (), [n, after] => [native.char_of_code n, after, st] },
+        4 => if next + 8 <= native.size s { [native.float_of_bytes (native.str_slice_any s next 8), next + 8, st] } else { () },
+        5 => match varint_at s next 0 0 {
+            () => (),
+            [n, after] => if after + n <= native.size s { [native.str_slice_any s after n, after + n, st] } else { () },
+        },
+        11 => match varint_at s next 0 0 {
+            () => (),
+            [n, after] => if after + n <= native.size s { [signed_at s after n, after + n, st] } else { () },
+        },
+        8 => match varint_at s next 0 0 {
+            () => (),
+            [n, after] => match packed_items s after n [] st {
+                () => (),
+                [heads, rest_at, st1] => match packed_read s rest_at st1 {
+                    () => (),
+                    [tail, end, st2] => [rev_onto (rev_onto heads []) tail, end, st2],
+                },
+            },
+        },
+        9 => packed_counted s next st (fn xs -> forced_lazy_array xs),
+        14 => packed_counted s next st (fn xs -> trunk_of xs),
+        10 => match varint_at s next 0 0 { () => (), [n, after] => packed_map s after n (native.map_new ()) st },
+        13 => match packed_atom s next st {
+            () => (),
+            [id, after, st1] => if after >= native.size s { () } else {
+                let variant = native.str_byte_any s after % 2 == 1;
+                packed_counted s (after + 1) st1 (fn xs -> native.record_of id variant (forced_lazy_array xs))
+            },
+        },
+        12 => if next >= native.size s { () } else {
+            let rank = native.str_byte_any s next;
+            match packed_dims s (next + 1) rank [] {
+                () => (),
+                [dims, data_at] => {
+                    let bytes = list_product dims * 8;
+                    if data_at + bytes > native.size s { () }
+                    else { [native.tensor_of_bytes (forced_array dims) (native.str_slice_any s data_at bytes), data_at + bytes, st] }
+                },
+            }
+        },
+        _ => (),
+    }
+};
+
+let packed_dims s at !n acc = if n == 0 { [rev_onto acc [], at] } else {
+    match varint_at s at 0 0 { () => (), [d, next] => packed_dims s next (n - 1) (d :: acc) }
+};
 
 let wire_read_bytes s at f =
     if at + 4 > native.size s { () } else {
@@ -1381,7 +1514,13 @@ let wire_read_tensor s at =
 
 let wire_dims s at !n = if n == 0 { [] } else { le_at s at 4 :: wire_dims s (at + 4) (n - 1) };
 
-let wire_decode text = if type_of text != :string { lib_raise (native.error_new :type_error "wire_decode needs a string") } else {
+let wire_decode text = if type_of text != :string { lib_raise (native.error_new :type_error "wire_decode needs a string") }
+    else if native.size text > 0 && native.str_byte_any text 0 == packed_magic {
+        match packed_read text 1 packed_start {
+            () => Result.error "not a packed wire value",
+            [v, at, _] => if at == native.size text { Result.ok v } else { Result.error "trailing bytes after a wire value" },
+        }
+    } else {
     match wire_read text 0 {
         () => Result.error "not a wire value",
         [v, at] => if at == native.size text { Result.ok v } else { Result.error "trailing bytes after a wire value" },
@@ -1437,7 +1576,7 @@ let alpn_wire xs = match xs {
 
 let tls_config options server = {
     let m = match type_of options {
-        :unit => native.map_empty (),
+        :unit => native.map_new (),
         :map => options,
         _ => lib_raise (native.error_new :bad_argument "the options are a map, such as %{ :host => \"example.com\" }"),
     };
