@@ -112,7 +112,29 @@ let ctx_nstack_count = 672;
 /// The chunks a collection in progress keeps where they are, because a word on a stack points
 /// into them (`pin_range!`).
 let ctx_pinned = 680;
-let ctx_size = 688;
+/// The process this worker is running on its own stack, which `schedule!` switches off.
+let ctx_running = 688;
+/// A collection's candidates -- words on a stack inside a chunk -- and the objects they pin, each
+/// a growable array `[words, count, room]` (`pin_word!`, `mark_pinned!`).
+let ctx_cands = 696;
+let ctx_pins = 720;
+/// Bytes of chunks made since the last collection, in direct style (`more!`).
+let ctx_since = 744;
+/// A collection's chunks by address, `[words, count, room]`, to find each candidate's (`split_chunks!`).
+let ctx_chunkv = 752;
+/// Where to-space ends, the chunk of it being filled, and the bytes copied: in direct style
+/// to-space is a chain of small chunks, not one the size of the heap (`to_more!`).
+let ctx_to_limit = 776;
+let ctx_to_cur = 784;
+let ctx_copied = 792;
+/// In direct style, the bytes of chunks after which the next collection is asked for: the budget,
+/// or twice what the last one kept, as code that jumps has by sizing the chunk after it so.
+let ctx_gc_at = 800;
+/// 1 when `entry_d!` ran the function that called it to its end on a segment of its own, whose
+/// answer it gave; and the lowest a bridge may put a frame (`machine.frames_room`).
+let ctx_seg_ran = 808;
+let ctx_frames_floor = 816;
+let ctx_size = 824;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -139,6 +161,9 @@ let frame_thunk = 21;
 let frame_halt = 22;
 let frame_cleanup = 23;
 let frame_shared = 24;
+/// A bridge: where direct-style code called code that answers through frames, and where that
+/// answer, or an unwinding, comes back to it as a return (`frame_bridge!`).
+let frame_bridge = 25;
 
 let info_code = 0;
 let info_kind = 8;
@@ -148,6 +173,9 @@ let info_call = 32;
 let info_name = 40;
 let info_impure = 48;
 let info_place = 56;
+/// The direct-style entry, or 0: a thunk's body that answers its value, a function's that a call
+/// in direct style makes (dreams/docs/aot-direct.md).
+let info_direct = 64;
 
 let word = 8;
 /// Everything below this is the executable; the heap and stacks are `mmap`ed far
@@ -157,7 +185,7 @@ let word = 8;
 let static_limit = 4294967296;
 /// A chunk is `[next, size, end, 0]`, then objects, as a segment is: `end` is where they stop
 /// once allocation has gone on elsewhere (`new_chunk!`), so that a chunk can be walked object by
-/// object, which a pinned one is (`scan_pinned!`).
+/// object, which a pinned one is (`mark_pinned!`).
 let chunk_header = 32;
 let min_chunk = 8388608;
 /// A process's first allocation area. It doubles at each collection up to `max_budget`, so one
@@ -283,7 +311,9 @@ let spare_put! !p !c = {
 /// allocation: running out only asks for a collection at the next function entry.
 let new_chunk! !p !bytes = {
     let want = bytes + chunk_header;
-    let size = round_chunk! want (prim.load64! (current! p + pcb_budget));
+    let budget = prim.load64! (current! p + pcb_budget);
+    let size = round_chunk! want (if direct_frames! () && budget > direct_chunk { direct_chunk } else { budget });
+    prim.store64! (p + ctx_since) (prim.load64! (p + ctx_since) + size);
     ended_at! (prim.load64! (p + ctx_chunks)) (prim.load64! (p + ctx_hp));
     let chunk = chunk_get! p size;
     prim.store64! chunk (prim.load64! (p + ctx_chunks));
@@ -302,9 +332,19 @@ let ended_at! !c !hp = if c == 0 { 0 }
     else { ended_at! (prim.load64! c) hp };
 
 /// The slow path of a compiled allocation, and every allocation made here.
+// In direct style a collection walks each chunk a word on the stack points into, and the chunk
+// being allocated in is nearly always one: allocated in at the budget's size, up to 8 MB, that
+// walk was a quarter of `tree`, and a chunk with one object pinned is kept whole. The chunks are
+// sixteen kilobytes there instead, as a conservative collector's pages are, and a collection is
+// asked for once a budget's worth of them has been made.
+let direct_chunk = 16384;
+
 let more! !p !bytes = {
-    prim.store64! (p + ctx_want_gc) 1;
-    if prim.load64! (p + ctx_in_callback) == 0 { prim.store64! (p + ctx_guard) (0 - 1); };
+    if not (direct_frames! ()) || prim.load64! (p + ctx_since) >= prim.load64! (current! p + pcb_budget)
+       && prim.load64! (p + ctx_since) >= prim.load64! (p + ctx_gc_at) {
+        prim.store64! (p + ctx_want_gc) 1;
+        if prim.load64! (p + ctx_in_callback) == 0 { prim.store64! (p + ctx_guard) (0 - 1); };
+    };
     new_chunk! p bytes;
     alloc! p bytes
 };
@@ -479,6 +519,14 @@ let w_timeline_t0 = 584;
 /// 1 when a collection reads the process's own frames for pins too, as it reads a native stack:
 /// `DREAM_GC_PIN_TEST`, which tries the pinning where code that jumps never needs it.
 let w_pin_test = 592;
+/// Machine stacks in direct style are cut from arenas, many to a mapping (`arena_stack!`): where
+/// the next one is, where the arena ends, how big each is now, and the lock over the three.
+let w_arena_next = 600;
+let w_arena_end = 608;
+let w_arena_stack = 616;
+let w_arena_lock = 624;
+/// 1 when each collection says what it found, as the VM's `DREAM_GC_TRACE` does.
+let w_gc_trace = 632;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -1226,8 +1274,8 @@ let evacuate! !p !v =
     else {
         let info = prim.load64! v;
         if info & 1 == 1 { info - 1 }
-        // Kept where it is, and a root already (`scan_pinned!`).
-        else if prim.load64! (p + ctx_pinned) != 0 && in_chunks! (prim.load64! (p + ctx_pinned)) v { v }
+        // Pinned: kept where it is, and a root already (`scan_pins!`).
+        else if info & 2 == 2 { v }
         // Copying through an indirection is how the collector removes it. Nothing
         // has to be written in it: whoever else reads it arrives at the same target,
         // by then forwarded, or an immediate.
@@ -1235,9 +1283,11 @@ let evacuate! !p !v =
         else {
             if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p v info; };
             let n = object_words! v info;
-            let to = prim.load64! (p + ctx_to);
+            let at = prim.load64! (p + ctx_to);
+            let to = if prim.ugt (at + n * word) (prim.load64! (p + ctx_to_limit)) { to_more! p (n * word) } else { at };
             copy_words! v to n;
             prim.store64! (p + ctx_to) (to + n * word);
+            prim.store64! (p + ctx_copied) (prim.load64! (p + ctx_copied) + n * word);
             prim.store64! v (to + 1);
             to
         }
@@ -1250,16 +1300,39 @@ let evacuate_range! !p !at !stop = if prim.uge at stop { 0 } else {
     evacuate_range! p (at + word) stop
 };
 
-let scan! !p !at =
-    if prim.uge at (prim.load64! (p + ctx_to)) { 0 }
-    else {
+/// To-space scanned from `at` in chunk `c`, as far as copying goes, chunk after chunk.
+let scan! !p !c !at = {
+    let cur = prim.load64! (p + ctx_to_cur);
+    let stop = if c == cur { prim.load64! (p + ctx_to) } else { prim.load64! (c + 2 * word) };
+    if prim.ult at stop {
         let info = prim.load64! at;
         let n = object_words! at info;
         if has_values (prim.load64! (info + info_kind)) {
             evacuate_range! p (at + word) (at + n * word);
         };
-        scan! p (at + n * word)
-    };
+        scan! p c (at + n * word)
+    }
+    else if c == cur { 0 }
+    else { let next = prim.load64! c; scan! p next (next + chunk_header) }
+};
+
+/// A chunk of to-space after the one filled, where the copy goes on: in direct style a word on
+/// the stack into to-space keeps the chunk it falls in at the next collection, which was all of
+/// it when to-space was one chunk.
+let to_more! !p !bytes = {
+    let cur = prim.load64! (p + ctx_to_cur);
+    prim.store64! (cur + 2 * word) (prim.load64! (p + ctx_to));
+    let size = round_chunk! (bytes + chunk_header) direct_chunk;
+    let c = chunk_get! p size;
+    prim.store64! c 0;
+    prim.store64! (c + word) size;
+    prim.store64! (c + 2 * word) 0;
+    prim.store64! cur c;
+    prim.store64! (p + ctx_to_cur) c;
+    prim.store64! (p + ctx_to) (c + chunk_header);
+    prim.store64! (p + ctx_to_limit) (c + size);
+    c + chunk_header
+};
 
 let frame_words! !at !info = {
     let size = prim.load64! (info + info_size);
@@ -1284,60 +1357,155 @@ let scan_mail! !p !entry = if entry == 0 { 0 } else {
     scan_mail! p (prim.load64! entry)
 };
 
-// A word on a stack that points into a chunk pins it: the chunk is kept where it is, every
-// object in it is a root, and the rest of the heap is copied as ever. A native stack is read
-// this way because what LLVM keeps there is not described (dreams/docs/aot-direct.md, "The
-// collector finds roots on a stack conservatively"); the heap stays precise. Only a word that
-// could be an object -- aligned, and above the shared region -- is looked up, and a wrong guess
-// keeps a chunk one collection longer.
+// A word on a stack that points into an object pins it: the object is kept where it is and is a
+// root, and the rest of the heap is copied as ever. A native stack is read this way because what
+// LLVM keeps there is not described (dreams/docs/aot-direct.md, "The collector finds roots on a
+// stack conservatively"); the heap stays precise. Only a word that could be an object -- aligned,
+// and above the shared region -- is looked up, and a wrong guess keeps an object one collection
+// longer.
+//
+// It was the chunk a word fell in that was pinned at first, every object in it a root. In direct
+// style that was every collection's allocation chunk, since a word on the stack points into
+// what was just made, and so nothing made since the last collection could die: `tree` spent
+// three quarters of its time collecting. Now a chunk a word falls in is walked once, object by
+// object, and only the objects a word points into are marked, by bit 2 of the info, which an
+// info's alignment leaves free; the rest are copied out as from any chunk. A chunk with one
+// object pinned is kept, the gaps between its pinned objects made fillers once everything is
+// copied, so it can be walked again (`settle_pins!`).
 
-/// Whether `v` is inside one of the chunks of the list from `c`.
-let in_chunks! !c !v = if c == 0 { false }
-    else if prim.ule c v && prim.ult v (c + prim.load64! (c + word)) { true }
-    else { in_chunks! (prim.load64! c) v };
-
-/// The chunk that `v` is inside taken off the list whose link is at `link` and put on the pinned
-/// list, if it is on the first.
-let pin_from! !p !link !v = {
-    let c = prim.load64! link;
-    if c == 0 { 0 }
-    else if prim.ule c v && prim.ult v (c + prim.load64! (c + word)) {
-        prim.store64! link (prim.load64! c);
-        prim.store64! c (prim.load64! (p + ctx_pinned));
-        prim.store64! (p + ctx_pinned) c;
-        0
-    }
-    else { pin_from! p c v }
-};
-
-let pin_word! !p !w = if not (is_object w) || prim.ult w (not_heap_limit! ()) { 0 } else { pin_from! p (p + ctx_chunks) w };
+let pin_word! !p !w = if not (is_object w) || prim.ult w (not_heap_limit! ()) { 0 } else { words_push! (p + ctx_cands) w };
 
 let pin_range! !p !at !stop = if prim.uge at stop { 0 } else {
     pin_word! p (prim.load64! at);
     pin_range! p (at + word) stop
 };
 
-/// Every object of every pinned chunk a root, walked from the chunk's start to its end.
-let scan_pinned! !p !c = if c == 0 { 0 } else {
-    let stop = prim.load64! (c + 2 * word);
-    let reached = scan_objects! p (c + chunk_header) stop;
-    if reached != stop { fatal! "dream: a pinned chunk did not walk to its end\n"; };
-    scan_pinned! p (prim.load64! c)
+/// `w` added to the array at `a`, `[words, count, room]`, made larger as it fills.
+let words_push! !a !w = {
+    let n = prim.load64! (a + word);
+    let room = prim.load64! (a + 2 * word);
+    if n == room {
+        let more = if room == 0 { 256 } else { room * 2 };
+        prim.store64! a (prim.c2! "realloc" (prim.load64! a) (more * word));
+        prim.store64! (a + 2 * word) more;
+    };
+    prim.store64! (prim.load64! a + n * word) w;
+    prim.store64! (a + word) (n + 1);
+    0
 };
 
-let scan_objects! !p !at !stop = if prim.uge at stop { at } else {
-    let info = prim.load64! at;
-    let n = object_words! at info;
-    let kind = prim.load64! (info + info_kind);
-    if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p at info; };
-    if has_values kind { evacuate_range! p (at + word) (at + n * word); };
-    scan_objects! p (at + n * word) stop
+let word_at! !a !i = prim.load64! (prim.load64! a + i * word);
+
+/// The `n` words from `a` in ascending order, by Shell's sort: a stack's candidates are a few
+/// thousand at most, and the dialect has no `qsort` to hand a comparison to.
+let sort_words! !a !n = shell_gaps! a n (n / 2);
+
+let shell_gaps! !a !n !gap = if gap == 0 { 0 } else { shell_pass! a n gap gap; shell_gaps! a n (gap / 2) };
+
+let shell_pass! !a !n !gap !i = if i >= n { 0 } else {
+    shell_insert! a gap i (prim.load64! (a + i * word));
+    shell_pass! a n gap (i + 1)
 };
 
-/// The pinned chunks' bytes, which are the heap's as much as what was copied.
-let pinned_bytes! !c !n = if c == 0 { n } else { pinned_bytes! (prim.load64! c) (n + prim.load64! (c + word)) };
+let shell_insert! !a !gap !j !v =
+    if j >= gap && prim.ugt (prim.load64! (a + (j - gap) * word)) v {
+        prim.store64! (a + j * word) (prim.load64! (a + (j - gap) * word));
+        shell_insert! a gap (j - gap) v
+    } else { prim.store64! (a + j * word) v; 0 };
 
-/// The pinned chunks put after `to` in the list of chunks, which they are part of again.
+/// The first of the `n` sorted candidates at or above `v`.
+let lower_bound! !a !lo !hi !v = if lo >= hi { lo } else {
+    let mid = (lo + hi) / 2;
+    if prim.ult (prim.load64! (a + mid * word)) v { lower_bound! a (mid + 1) hi v } else { lower_bound! a lo mid v }
+};
+
+/// The candidates sorted, and the chunks they fall in moved from the list of chunks to the list to
+/// walk: by address, both sorted, as a merge, where looking each word up in the list of chunks
+/// cost the number of chunks for every word on the stack.
+let split_chunks! !p = {
+    let a = p + ctx_chunkv;
+    prim.store64! (a + word) 0;
+    chunks_into! a (prim.load64! (p + ctx_chunks));
+    let m = prim.load64! (a + word);
+    sort_words! (prim.load64! a) m;
+    sort_words! (prim.load64! (p + ctx_cands)) (prim.load64! (p + ctx_cands + word));
+    prim.store64! (p + ctx_chunks) 0;
+    prim.store64! (p + ctx_pinned) 0;
+    split_from! p 0 m
+};
+
+let chunks_into! !a !c = if c == 0 { 0 } else { words_push! a c; chunks_into! a (prim.load64! c) };
+
+let split_from! !p !i !m = if i >= m { 0 } else {
+    let c = word_at! (p + ctx_chunkv) i;
+    let cands = prim.load64! (p + ctx_cands);
+    let n = prim.load64! (p + ctx_cands + word);
+    let at = lower_bound! cands 0 n c;
+    let list = if at < n && prim.ult (prim.load64! (cands + at * word)) (c + prim.load64! (c + word)) { p + ctx_pinned } else { p + ctx_chunks };
+    prim.store64! c (prim.load64! list);
+    prim.store64! list c;
+    split_from! p (i + 1) m
+};
+
+/// Each chunk on the list from `c` walked, and every object a candidate points into marked and
+/// listed among the pins.
+let mark_pinned! !p !c = if c == 0 { 0 } else {
+    let cands = prim.load64! (p + ctx_cands);
+    let n = prim.load64! (p + ctx_cands + word);
+    let start = c + chunk_header;
+    mark_walk! p start (prim.load64! (c + 2 * word)) (lower_bound! cands 0 n start) n;
+    mark_pinned! p (prim.load64! c)
+};
+
+let mark_walk! !p !at !stop !i !n =
+    if prim.uge at stop || i >= n || prim.uge (word_at! (p + ctx_cands) i) stop { 0 }
+    else if prim.ult (word_at! (p + ctx_cands) i) at { mark_walk! p at stop (i + 1) n }
+    else {
+        let info = prim.load64! at;
+        let after = at + object_words! at info * word;
+        if prim.ult (word_at! (p + ctx_cands) i) after {
+            prim.store64! at (info | 2);
+            words_push! (p + ctx_pins) at;
+            mark_walk! p after stop (i + 1) n
+        } else { mark_walk! p after stop i n }
+    };
+
+/// Every pinned object a root.
+let scan_pins! !p !i !n = if i >= n { 0 } else {
+    let o = word_at! (p + ctx_pins) i;
+    let info = prim.load64! o - 2;
+    if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p o info; };
+    if has_values (prim.load64! (info + info_kind)) { evacuate_range! p (o + word) (o + object_words! o info * word); };
+    scan_pins! p (i + 1) n
+};
+
+/// After the copy: each chunk walked kept if something in it is pinned, its marks taken off and
+/// the gaps between its pinned objects made fillers, and freed if nothing is. Answers the bytes
+/// kept.
+let settle_pins! !p !c !i !kept !bytes = if c == 0 { prim.store64! (p + ctx_pinned) kept; bytes } else {
+    let next = prim.load64! c;
+    let after = fill_around! p c (c + chunk_header) i;
+    if after == i { chunk_put! p c; settle_pins! p next i kept bytes }
+    else { prim.store64! c kept; settle_pins! p next after c (bytes + prim.load64! (c + word)) }
+};
+
+/// The pins of chunk `c` from the `i`th unmarked, and the space around them from `cursor` made
+/// fillers to the chunk's end. Answers the index past them.
+let fill_around! !p !c !cursor !i = {
+    let n = prim.load64! (p + ctx_pins + word);
+    let o = if i < n { word_at! (p + ctx_pins) i } else { 0 };
+    if i < n && prim.ule c o && prim.ult o (c + prim.load64! (c + word)) {
+        let info = prim.load64! o - 2;
+        prim.store64! o info;
+        filler! cursor ((o - cursor) / word);
+        fill_around! p c (o + object_words! o info * word) (i + 1)
+    } else {
+        filler! cursor ((prim.load64! (c + 2 * word) - cursor) / word);
+        i
+    }
+};
+
+/// The chunks kept put after `to` in the list of chunks, which they are part of again.
 let unpin! !p !to = {
     let c = prim.load64! (p + ctx_pinned);
     if c != 0 {
@@ -1365,9 +1533,27 @@ let pin_native! !p !pcb !here = {
     let base = prim.load64! (pcb + pcb_nstack);
     let top = base + prim.load64! (pcb + pcb_nstack_size);
     if base == 0 || (prim.load64! (prim.info "native_frames") == 0 && prim.load64! (world_at! w_pin_test) == 0) { 0 }
-    else if prim.ult base here && prim.ult here top { pin_range! p here top }
-    else if prim.load64! (pcb + pcb_nsp) != 0 { pin_range! p (prim.load64! (pcb + pcb_nsp)) top }
+    else if prim.ult base here && prim.ult here top { pin_range! p here top; pin_segments! p (prim.load64! (pcb + pcb_segs)) }
+    else if prim.load64! (pcb + pcb_nsp) != 0 { pin_range! p (prim.load64! (pcb + pcb_nsp)) top; pin_segments! p (prim.load64! (pcb + pcb_segs)) }
     else { 0 }
+};
+
+/// The segments a process's stack went on from, each read from where it stood to its top.
+let pin_segments! !p !link = if link == 0 { 0 } else {
+    pin_range! p (prim.load64! (link + 3 * word)) (prim.load64! (link + word) + prim.load64! (link + 2 * word));
+    pin_segments! p (prim.load64! link)
+};
+
+/// A collection's line on standard error: the process, what was copied, what pinned chunks kept,
+/// the objects pinned and the words on the stack that might have been pointers.
+let gc_said! !id !live !kept !pins !cands = {
+    let buf = prim.c1! "malloc" 160;
+    prim.c6! "snprintf" buf 160 "gc pid %ld copied %ld kept %ld pins %ld" id live kept pins;
+    prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+    prim.c4! "snprintf" buf 160 " candidates %ld\n" cands;
+    prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+    prim.c1! "free" buf;
+    0
 };
 
 let spare_count! !c !n = if c == 0 { n } else { spare_count! (prim.load64! c) (n + 1) };
@@ -1382,29 +1568,42 @@ let collect! !p !sp = {
     let reporting = due != 0 && due == prim.load64! (world_at! w_census);
     prim.store64! (p + ctx_reporting) (if reporting { 1 } else { 0 });
     let budget = prim.load64! (pcb + pcb_budget);
-    let space = round_chunk! (prim.load64! (p + ctx_total) + (if budget >= min_chunk { min_chunk } else { chunk_header })) budget;
+    let direct = direct_frames! ();
+    let space = if direct { direct_chunk } else {
+        round_chunk! (prim.load64! (p + ctx_total) + (if budget >= min_chunk { min_chunk } else { chunk_header })) budget
+    };
     let to = chunk_get! p space;
     let start = to + chunk_header;
     prim.store64! to 0;
     prim.store64! (to + word) space;
+    prim.store64! (to + 2 * word) 0;
     prim.store64! (p + ctx_to) start;
+    prim.store64! (p + ctx_to_limit) (to + space);
+    prim.store64! (p + ctx_to_cur) to;
+    prim.store64! (p + ctx_copied) 0;
     prim.store64! (pcb + pcb_sp) sp;
     // Pinning first, before anything has moved: the chunks a stack points into come off the list
     // of those to be freed, each with where its objects end.
     ended_at! (prim.load64! (p + ctx_chunks)) (prim.load64! (p + ctx_hp));
     pin_native! p pcb here;
     if prim.load64! (world_at! w_pin_test) != 0 { pin_range! p sp (stack_top! pcb); };
+    if prim.load64! (p + ctx_cands + word) != 0 { split_chunks! p; mark_pinned! p (prim.load64! (p + ctx_pinned)); };
     let old = prim.load64! (p + ctx_chunks);
     scan_stack! p sp (stack_top! pcb);
     evacuate_at! p (pcb + pcb_resume);
     evacuate_at! p (pcb + pcb_kept);
     scan_mail! p (prim.load64! (pcb + pcb_mail_head));
-    scan_pinned! p (prim.load64! (p + ctx_pinned));
-    scan! p start;
+    scan_pins! p 0 (prim.load64! (p + ctx_pins + word));
+    scan! p to start;
     free_chunks! p old;
-    let live = prim.load64! (p + ctx_to) - start;
-    let pinned = pinned_bytes! (prim.load64! (p + ctx_pinned)) 0;
-    prim.store64! (to + 2 * word) (prim.load64! (p + ctx_to));
+    let live = prim.load64! (p + ctx_copied);
+    let pins = prim.load64! (p + ctx_pins + word);
+    let cands = prim.load64! (p + ctx_cands + word);
+    let pinned = settle_pins! p (prim.load64! (p + ctx_pinned)) 0 0 0;
+    if prim.load64! (world_at! w_gc_trace) != 0 { gc_said! (prim.load64! (pcb + pcb_id)) live pinned pins cands; };
+    prim.store64! (p + ctx_cands + word) 0;
+    prim.store64! (p + ctx_pins + word) 0;
+    prim.store64! (prim.load64! (p + ctx_to_cur) + 2 * word) (prim.load64! (p + ctx_to));
     prim.store64! (p + ctx_chunks) to;
     unpin! p to;
     prim.store64! (p + ctx_hp) 0;
@@ -1412,6 +1611,7 @@ let collect! !p !sp = {
     // the next to-space by its own size each time, and then no mapping is ever reused.
     prim.store64! (p + ctx_total) (live + pinned);
     prim.store64! (p + ctx_want_gc) 0;
+    prim.store64! (p + ctx_since) 0;
     prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
     prim.store64! (p + ctx_collections) (prim.load64! (p + ctx_collections) + 1);
     // A collection scans the whole stack, so a deep one asks for room in proportion, or a deep
@@ -1419,7 +1619,8 @@ let collect! !p !sp = {
     let deep = round_chunk! ((stack_top! pcb - sp) * 2) budget;
     let grown = if budget < max_budget { budget * 2 } else { budget };
     prim.store64! (pcb + pcb_budget) (if deep > grown { if deep > min_chunk { min_chunk } else { deep } } else { grown });
-    new_chunk! p (live * 2);
+    prim.store64! (p + ctx_gc_at) (2 * (live + pinned));
+    new_chunk! p (if direct { 0 } else { live * 2 });
     if reporting {
         mark_drain! p;
         prim.store64! (p + ctx_reporting) 0;
@@ -1686,12 +1887,13 @@ let init! () = {
     world_init! p;
     timeline_open! ();
     if prim.c1! "getenv" "DREAM_GC_PIN_TEST" != 0 { prim.store64! (world_at! w_pin_test) 1; };
+    if prim.c1! "getenv" "DREAM_GC_TRACE" != 0 { prim.store64! (world_at! w_gc_trace) 1; };
     note_context! p;
     init_handles! p;
     // A peer that has gone is an error from the write, not the end of the program.
     prim.c2! "signal" 13 1;
     make_current! p (new_pcb! p);
-    new_chunk! p min_chunk;
+    new_chunk! p (if direct_frames! () { 0 } else { min_chunk });
     p
 };
 
@@ -1709,7 +1911,7 @@ let new_string! !p !bytes = {
 };
 
 /// `bytes` of room that are not an object, for C to write into: a string's header in front of them,
-/// so that the chunk they are in can still be walked object by object (`scan_pinned!`).
+/// so that the chunk they are in can still be walked object by object (`mark_pinned!`).
 let scratch! !p !bytes = new_string! p bytes + 2 * word;
 
 /// The `words` words from `at` made a filler: what is left of an object that became a smaller one
@@ -2004,6 +2206,11 @@ let unwind! !p !at !e !b !c !d = {
         prim.jump! (prim.load64! (info + info_call)) p at e 0 0 0
     } else if kind == frame_catch && prim.load64! (current! p + pcb_killing) != 1 {
         prim.jump! (prim.load64! (info + info_call)) p at e 0 0 0
+    } else if kind == frame_bridge {
+        // Direct-style code below: the call that put the bridge here answers 0, the error in
+        // the context, and goes on failing there (`machine.dexpr`).
+        prim.store64! (p + ctx_error) e;
+        0
     } else if kind == frame_halt {
         // The first process failing ends the run; what it was is the library's to say.
         if prim.load64! (current! p + pcb_id) == 1 {
@@ -2062,7 +2269,7 @@ let place_entry! !p !place = {
 let places_from! !p !at !left !room !last = {
     let info = prim.load64! at;
     let kind = prim.load64! (info + info_kind);
-    if kind == frame_halt || left == 0 || room == 0 { nil_word }
+    if kind == frame_halt || kind == frame_bridge || left == 0 || room == 0 { nil_word }
     else {
         let place = prim.load64! (info + info_place);
         let next = at + frame_words! at info * word;
@@ -3654,7 +3861,11 @@ let pcb_nstack_size = 296;
 /// Where its native stack stood when it stopped with something on it to come back to, or 0: under
 /// code that jumps, a process parks with nothing there and is run again from the top.
 let pcb_nsp = 304;
-let pcb_size = 312;
+/// In direct style, the segments its machine stack went on from, most recent first, each
+/// `[older, base, size, where it stood]`, and how many bytes they hold (`segment_call!`).
+let pcb_segs = 312;
+let pcb_depth = 320;
+let pcb_size = 328;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
 // its heap (`take_mail!`) they are nobody's, and the value is only in them.
@@ -4402,6 +4613,18 @@ let native_stack_top! !p !pcb = {
         prim.store64! (pcb + pcb_nstack) kept;
         prim.store64! (pcb + pcb_nstack_size) (prim.load64! (kept + 4096 + word));
         kept
+    } else if prim.load64! (pcb + pcb_id) == 1 && direct_frames! () {
+        // The first process, in direct style, is where a deep recursion usually is, and its
+        // stack is what it recurses on: a gigabyte reserved, or what can be had.
+        let m = root_stack! pcb root_stack_bytes;
+        prim.c3! "mprotect" m 4096 0;
+        prim.store64! (pcb + pcb_nstack) m;
+        m
+    } else if direct_frames! () {
+        let m = taken_stack! p;
+        prim.store64! (pcb + pcb_nstack) m;
+        prim.store64! (pcb + pcb_nstack_size) (prim.load64! (m + 4096 + word));
+        m
     } else {
         // Reserved, not committed. Once one could not be had at full size, the rest are asked
         // for at the size that could.
@@ -4416,6 +4639,118 @@ let native_stack_top! !p !pcb = {
     base + prim.load64! (pcb + pcb_nstack_size)
 };
 
+// In direct style every process that has run and parked holds its machine stack, and a mapping
+// for each -- two, with its guard page -- ran into the kernel's limit on mappings (65,530) with
+// fifty thousand processes waiting in `recv!`. They are cut from arenas instead, sixty-four to a
+// mapping, with no guard page: a function's entry checks the stack against a floor a margin
+// above the next one down (`direct_floor!`), which is what reports a recursion too deep. When an
+// arena cannot be had, the stacks cut after it are half the size, as far as `least_native_stack`.
+
+let arena_stacks = 64;
+
+/// A machine stack for direct style: one given back here, or a new one cut from an arena. Its
+/// size is written just above its first page, where a kept one has it, to be read at once.
+let taken_stack! !p = {
+    let kept = prim.load64! (p + ctx_nstacks);
+    if kept != 0 {
+        prim.store64! (p + ctx_nstacks) (prim.load64! (kept + 4096));
+        prim.store64! (p + ctx_nstack_count) (prim.load64! (p + ctx_nstack_count) - 1);
+        kept
+    } else {
+        let m = arena_stack! ();
+        prim.store64! (m + 4096 + word) (prim.load64! (world_at! w_arena_stack));
+        m
+    }
+};
+
+/// A machine stack, reserved and not committed: its base. Its size is `w_arena_stack`'s now.
+let arena_stack! () = {
+    let l = world_at! w_arena_lock;
+    spin_lock! l;
+    if prim.load64! (world_at! w_arena_stack) == 0 { prim.store64! (world_at! w_arena_stack) (native_stack_bytes! ()); };
+    let size = prim.load64! (world_at! w_arena_stack);
+    if prim.ugt (prim.load64! (world_at! w_arena_next) + size) (prim.load64! (world_at! w_arena_end)) { new_arena! size; };
+    let base = prim.load64! (world_at! w_arena_next);
+    prim.store64! (world_at! w_arena_next) (base + prim.load64! (world_at! w_arena_stack));
+    spin_unlock! l;
+    base
+};
+
+let new_arena! !size = {
+    let bytes = size * arena_stacks;
+    // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE.
+    let m = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
+    if m != 0 - 1 {
+        prim.store64! (world_at! w_arena_stack) size;
+        prim.store64! (world_at! w_arena_next) m;
+        prim.store64! (world_at! w_arena_end) (m + bytes);
+        0
+    } else if size > least_native_stack { new_arena! (size / 2) }
+    else { fatal! "dream: no address space for a process's stack (is `ulimit -v` set low?)\n"; 0 }
+};
+
+/// The first process's first segment: larger than another's, since a quarter of it is its stack of
+/// frames, which cannot grow, and a compiler's recursion through the runtime goes there.
+let root_stack_bytes = 8388608;
+
+/// The first process's stack: `bytes` reserved, or less, down to the size every process has.
+let root_stack! !pcb !bytes = {
+    let m = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
+    if m != 0 - 1 { prim.store64! (pcb + pcb_nstack_size) bytes; m }
+    else if bytes > native_stack_bytes! () { root_stack! pcb (bytes / 2) }
+    else { fatal! "dream: no address space for the first process's stack\n"; 0 }
+};
+
+/// Whether this program's code keeps values of its own on the machine stack: direct style.
+let direct_frames! () = prim.load64! (prim.info "native_frames") != 0;
+
+// In direct style a process's stack of frames, which only the runtime's own code and bridges use
+// now, is the bottom eighth of its machine stack's reservation, moved there before the process
+// first runs. A machine frame holds where that stack stood when it called, so it can never move
+// again, as a stack in code that jumps could (`move_stack!`); and one reservation is one stack to
+// keep, give back and pin. Above it is the machine stack, which a guard keeps a margin above.
+
+/// `pcb`'s stack of frames moved to the bottom of its machine stack, at `base`, if it is not
+/// there yet.
+let carved! !p !pcb = {
+    let base = prim.load64! (pcb + pcb_nstack);
+    let stack = prim.load64! (pcb + pcb_stack);
+    if prim.ule base stack && prim.ult stack (base + prim.load64! (pcb + pcb_nstack_size)) { 0 } else {
+        let size = carved_bytes! pcb;
+        let low = base + 4096;
+        let top = low + size;
+        let sp = prim.load64! (pcb + pcb_sp);
+        let used = stack + prim.load64! (pcb + pcb_stack_size) - sp;
+        prim.c3! "memcpy" (top - used) sp used;
+        stack_done! p stack (prim.load64! (pcb + pcb_stack_size));
+        prim.store64! (pcb + pcb_stack) low;
+        prim.store64! (pcb + pcb_stack_size) size;
+        prim.store64! (pcb + pcb_sp) (top - used);
+        0
+    }
+};
+
+let carved_bytes! !pcb = prim.load64! (pcb + pcb_nstack_size) / 4;
+
+/// The guard for direct style: a margin above the stack of frames, below which a function's
+/// entry reports a recursion too deep. What asked to stop the process is kept asked.
+let direct_floor! !p !pcb = {
+    let base = prim.load64! (pcb + pcb_nstack);
+    let top = base + prim.load64! (pcb + pcb_nstack_size);
+    let frames = prim.load64! (pcb + pcb_stack);
+    // The first segment has the stack of frames at its bottom; a later one, nothing.
+    let above = if prim.ule base frames && prim.ult frames top { frames + prim.load64! (pcb + pcb_stack_size) } else { base + 4096 + 2 * word };
+    let room = top - above;
+    // A quarter left below the floor, for what runs past a function's entry -- C above all.
+    let margin = if room / 4 > 1048576 { 1048576 } else { room / 4 };
+    let floor = above + margin;
+    let asked = prim.load64! (p + ctx_guard) == 0 - 1;
+    prim.store64! (p + ctx_floor) floor;
+    prim.store64! (p + ctx_guard) (if asked { 0 - 1 } else { floor });
+    prim.store64! (p + ctx_frames_floor) (frames + 1024);
+    0
+};
+
 /// `pcb`'s native stack given back once it has switched off it, if nothing on it is needed: when
 /// it has finished, or has parked with nothing there to come back to (`pcb_nsp`), which under
 /// code that jumps is every park -- fifty thousand processes waiting in `recv!` held fifty
@@ -4426,7 +4761,8 @@ let native_stack_done! !p !pcb = {
     let base = prim.load64! (pcb + pcb_nstack);
     let size = prim.load64! (pcb + pcb_nstack_size);
     if base != 0 && (prim.load64! (pcb + pcb_state) == state_done || prim.load64! (pcb + pcb_nsp) == 0) {
-        if prim.load64! (p + ctx_nstack_count) < kept_native_stacks {
+        // One cut from an arena is part of a mapping, and is never given back to the kernel.
+        if direct_frames! () || prim.load64! (p + ctx_nstack_count) < kept_native_stacks {
             prim.store64! (base + 4096) (prim.load64! (p + ctx_nstacks));
             prim.store64! (base + 4096 + word) size;
             prim.store64! (p + ctx_nstacks) base;
@@ -4444,15 +4780,29 @@ let off_its_stack! !pcb !n = if prim.load_acq! (pcb + pcb_on_stack) == 0 { 0 } e
 };
 
 let dispatch! !p !pcb !b !c !d !e = {
+    off_its_stack! pcb 0;
+    let direct = direct_frames! ();
+    let top = native_stack_top! p pcb;
+    // In direct style on aarch64 a process stays on the worker it first ran on: its frames hold
+    // this context, and there is no word of the thread's to read another from (`ctx_here!`).
+    if direct {
+        // Only before it first runs: resumed, it may be on a segment its stack of frames is not
+        // in, and nothing may move under the frames it kept.
+        if prim.load64! (pcb + pcb_nsp) == 0 && prim.load64! (pcb + pcb_segs) == 0 { carved! p pcb; };
+        if prim.arch () == arch_aarch64 && prim.load64! (pcb + pcb_pinned) == 0 { prim.store64! (pcb + pcb_pinned) p; };
+    };
     make_current! p pcb;
     load_heap! p pcb;
     // Due to report to a census: at its first function entry.
     if prim.load64! (pcb + pcb_census_due) != 0 { prim.store64! (p + ctx_guard) (0 - 1); };
+    if direct { direct_floor! p pcb; };
     prim.store64! (p + ctx_on_process) 1;
-    off_its_stack! pcb 0;
+    prim.store64! (p + ctx_running) pcb;
     prim.store64! (pcb + pcb_on_stack) 1;
     let started = if timeline_on! () { timeline_now! () } else { 0 };
-    prim.run_on! (native_stack_top! p pcb) p pcb (p + ctx_sched_sp);
+    let kept = prim.load64! (pcb + pcb_nsp);
+    // Back where it parked, if it left frames there; from the top otherwise.
+    if kept != 0 { prim.switch! (p + ctx_sched_sp) kept; } else { prim.run_on! top p pcb (p + ctx_sched_sp); };
     // Back on the scheduler's stack: the process has given the worker back.
     if timeline_on! () {
         let state = prim.load64! (pcb + pcb_state);
@@ -4479,8 +4829,19 @@ let run_process! !p !pcb !b !c !d !e = {
 let schedule! !p !a !b !c !d !e = if prim.load64! (p + ctx_on_process) != 0 {
     // From a process, on its stack: back to the scheduler's first, where `dispatch!` goes on.
     prim.store64! (p + ctx_on_process) 0;
-    prim.return_to! (prim.load64! (p + ctx_sched_sp));
-    0
+    let pcb = prim.load64! (p + ctx_running);
+    if direct_frames! () && prim.load64! (pcb + pcb_state) != state_done {
+        // Its frames are its stack's, below this: kept, and come back to when it runs again,
+        // which is on this worker (`dispatch!`).
+        prim.switch! (pcb + pcb_nsp) (prim.load64! (p + ctx_sched_sp));
+        // Possibly on another worker now, which is the one to go on with.
+        let here = if prim.arch () == arch_aarch64 { p } else { prim.ctx_here! () };
+        prim.store64! (pcb + pcb_nsp) 0;
+        run_process! here pcb 0 0 0 0
+    } else {
+        prim.return_to! (prim.load64! (p + ctx_sched_sp));
+        0
+    }
 } else {
     if waiting_on_system! () { maybe_service! p; };
     let next = run_pop! p;
@@ -4779,7 +5140,8 @@ let finish! !p !v !failed !d !e !f = {
     prim.store64! (pcb + pcb_mail_tail) 0;
     prim.store64! (pcb + pcb_mail_fresh) 0;
     prim.store64! (pcb + pcb_mail_count) 0;
-    stack_done! p (prim.load64! (pcb + pcb_stack)) (prim.load64! (pcb + pcb_stack_size));
+    // In direct style the stack is the bottom of the machine stack's, given back with it.
+    if not (direct_frames! ()) { stack_done! p (prim.load64! (pcb + pcb_stack)) (prim.load64! (pcb + pcb_stack_size)); };
     prim.store64! (pcb + pcb_stack) 0;
     prim.store64! (pcb + pcb_kept) 0;
     // The first process's heap is where what failed unseen is reported from, at the end.
@@ -4858,6 +5220,166 @@ let yield_now! !p !sp !v !b !c !d = {
     let pcb = current! p;
     prim.store64! (pcb + pcb_sp) sp;
     prim.store64! (pcb + pcb_resume) v;
+    leave! p pcb;
+    pcb_lock! pcb;
+    prim.store64! (pcb + pcb_state) state_ready;
+    pcb_unlock! pcb;
+    run_push! p pcb;
+    schedule! p 0 0 0 0 0
+};
+
+// --- what direct-style code calls -------------------------------------------------------------
+//
+// (dreams/docs/aot-direct.md, `machine.dexpr`.) Each answers a value, or 0 for a failure whose
+// error is in the context, as a native does. Code that answers through frames is reached across
+// a bridge: a frame on the stack whose code returns (`frame_bridge!`), below which the call is
+// made as an ordinary call, so that the chain of jumps it begins comes back here.
+
+let frame_bridge! !p !sp !v !b !c !d = v;
+
+/// `v` evaluated, for direct code that found it is not a value yet: an indirection followed, a
+/// thunk with a direct body called, and anything else -- a hole, a shared thunk, one the runtime
+/// made -- entered across a bridge.
+let force_d! !p !sp !v !b !c !d = {
+    let info = prim.load64! v;
+    let kind = prim.load64! (info + info_kind);
+    if kind == kind_ind {
+        let t = prim.load64! (v + word);
+        if is_object t && prim.load64! (prim.load64! t + info_kind) <= kind_hole { force_d! p sp t 0 0 0 } else { t }
+    } else if kind == kind_thunk && prim.load64! (info + info_direct) != 0 {
+        prim.call! (prim.load64! (info + info_direct)) p sp v 0 0 0
+    } else if kind > kind_hole { v }
+    else if prim.ult sp (prim.load64! (p + ctx_frames_floor)) {
+        fail! p atom_stack_overflow "recursion too deep";
+        0
+    } else {
+        prim.store64! (sp - word) (prim.info "bridge");
+        enter! p (sp - word) v
+    }
+};
+
+/// At a direct function's entry, when the guard said stop: the machine stack run too deep, or a
+/// collection, a census or a switch asked for. Answers 0 for the stack overflow, or a kill seen as
+/// it switched.
+let entry_d! !p !sp !a !b !c !d = {
+    let here = prim.stack_here! ();
+    let pcb = current! p;
+    if prim.ult here (prim.load64! (p + ctx_floor)) && prim.load64! (p + ctx_want_gc) == 0 && prim.load64! (pcb + pcb_census_due) == 0 {
+        if prim.load64! (pcb + pcb_depth) + prim.load64! (pcb + pcb_nstack_size) < (if prim.load64! (pcb + pcb_id) == 1 { 1073741824 } else { 268435456 }) {
+            segment_call! p sp a b c d
+        } else {
+            fail! p atom_stack_overflow "recursion too deep";
+            0
+        }
+    } else {
+        let inside_c = prim.load64! (p + ctx_in_callback) != 0;
+        if (prim.load64! (p + ctx_want_gc) != 0 || prim.load64! (pcb + pcb_census_due) != 0) && not inside_c { collect! p sp; };
+        prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
+        if not inside_c && (prim.load64! (p + ctx_run_head) != 0 || prim.load64! (pcb + pcb_kill) != 0
+                            || (waiting_on_system! () && prim.load64! (world_at! w_polling) == 0)) {
+            prim.store64! (sp - word) (prim.info "bridge");
+            yield_now! p (sp - word) unit_word 0 0 0
+        } else { unit_word }
+    }
+};
+
+// A machine stack in direct style is a chain of segments. A process starts on one; a function
+// entered too near its floor is called again on another (`dream_call_on`), its six words from
+// the registers and the context (`machine.dsafepoint`), and its answer is the answer of the call
+// that ran low. The segment goes back to the worker's pool when the call returns, so a call that
+// keeps landing on the edge costs a pop, a push and two switches. Stack overflow is the chain
+// passing a quarter of a gigabyte -- a gigabyte for the first process -- as code that jumps had
+// for its stack of frames.
+
+let segment_call! !p !sp !a !b !c !d = {
+    let pcb = current! p;
+    let code = prim.load64! (p + ctx_retry);
+    let sp0 = prim.load64! (p + ctx_retry_stack);
+    let here = prim.stack_here! ();
+    let kept_at = prim.c1! "malloc" (4 * word);
+    prim.store64! kept_at (prim.load64! (pcb + pcb_segs));
+    prim.store64! (kept_at + word) (prim.load64! (pcb + pcb_nstack));
+    prim.store64! (kept_at + 2 * word) (prim.load64! (pcb + pcb_nstack_size));
+    prim.store64! (kept_at + 3 * word) here;
+    prim.store64! (pcb + pcb_segs) kept_at;
+    prim.store64! (pcb + pcb_depth) (prim.load64! (pcb + pcb_depth) + prim.load64! (pcb + pcb_nstack_size));
+    let seg = taken_stack! p;
+    let size = prim.load64! (seg + 4096 + word);
+    prim.store64! (pcb + pcb_nstack) seg;
+    prim.store64! (pcb + pcb_nstack_size) size;
+    direct_floor! p pcb;
+    let r = seg + size - 8 * word;
+    prim.store64! r code;
+    prim.store64! (r + word) p;
+    prim.store64! (r + 2 * word) sp0;
+    prim.store64! (r + 3 * word) a;
+    prim.store64! (r + 4 * word) b;
+    prim.store64! (r + 5 * word) c;
+    prim.store64! (r + 6 * word) d;
+    let v = prim.call_on! r r;
+    // The process may have parked in there and gone on on another worker.
+    let q = if prim.arch () == arch_aarch64 { p } else { prim.ctx_here! () };
+    prim.store64! (seg + 4096) (prim.load64! (q + ctx_nstacks));
+    prim.store64! (seg + 4096 + word) size;
+    prim.store64! (q + ctx_nstacks) seg;
+    prim.store64! (q + ctx_nstack_count) (prim.load64! (q + ctx_nstack_count) + 1);
+    prim.store64! (pcb + pcb_nstack) (prim.load64! (kept_at + word));
+    prim.store64! (pcb + pcb_nstack_size) (prim.load64! (kept_at + 2 * word));
+    prim.store64! (pcb + pcb_segs) (prim.load64! kept_at);
+    prim.store64! (pcb + pcb_depth) (prim.load64! (pcb + pcb_depth) - prim.load64! (kept_at + 2 * word));
+    prim.c1! "free" kept_at;
+    direct_floor! q pcb;
+    if v != 0 { prim.store64! (q + ctx_seg_ran) 1; };
+    v
+};
+
+/// A bridge with no room left on the stack of frames below it.
+let frames_full! !p !sp !a !b !c !d = {
+    fail! p atom_stack_overflow "recursion too deep";
+    0
+};
+
+/// What a `catching` in direct code was given, made the process's own and located, or 0 when it
+/// is not this one's to catch: a kill goes on past everything but a cleanup, which runs and then
+/// may handle its own errors, as `unwind!` has it.
+let caught_d! !p !sp !cleanup !b !c !d = {
+    let e = own_error! p (prim.load64! (p + ctx_error));
+    if is_object e && kind_of! e == kind_error { locate! p e sp 0; };
+    let pcb = current! p;
+    let killing = prim.load64! (pcb + pcb_killing);
+    if cleanup == 1 {
+        if killing == 1 { prim.store64! (pcb + pcb_killing) 2; };
+        e
+    } else if killing == 1 { prim.store64! (p + ctx_error) e; 0 }
+    else { e }
+};
+
+/// A thunk whose evaluation failed made an indirection to the failure, as `unwind!` makes one it
+/// passes, so that forcing it again raises the same; the failure goes on.
+let thunk_raised_d! !p !sp !thunk !b !c !d = {
+    let e = own_error! p (prim.load64! (p + ctx_error));
+    if is_object e && kind_of! e == kind_error { locate! p e sp 0; };
+    let raised = alloc! p (2 * word);
+    prim.store64! raised (prim.info "raised");
+    prim.store64! (raised + word) e;
+    prim.store64! (thunk + word) raised;
+    prim.store64! thunk (prim.info "ind");
+    prim.store64! (p + ctx_error) e;
+    0
+};
+
+/// The first process started as any other is, from the scheduler, on a stack of its own: its
+/// entry `code` called with up to three arguments when it first runs (`frame_retry_call!`).
+let run_root! !p !sp !code !a !b !c = {
+    let pcb = current! p;
+    let at = sp - 5 * word;
+    prim.store64! at (prim.info "retry_call");
+    prim.store64! (at + word) code;
+    prim.store64! (at + 2 * word) a;
+    prim.store64! (at + 3 * word) b;
+    prim.store64! (at + 4 * word) c;
+    prim.store64! (pcb + pcb_sp) at;
+    prim.store64! (pcb + pcb_resume) unit_word;
     leave! p pcb;
     pcb_lock! pcb;
     prim.store64! (pcb + pcb_state) state_ready;
@@ -9317,6 +9839,8 @@ let cb_raised! !p !sp !e !b !c !d = {
 let note_context! !p = {
     prim.store64! (prim.info "cb_context") p;
     prim.c2! "pthread_setspecific" (prim.load64! (world_at! w_cb_key)) p;
+    // Where direct-style code finds it after a call that may have moved its process here.
+    prim.set_ctx_here! p;
     0
 };
 
