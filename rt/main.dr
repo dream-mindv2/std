@@ -1370,7 +1370,12 @@ let free_run! !i !len_ = if len_ == 0 { 0 } else {
 
 let object_words! !o !info = {
     let kind = prim.load64! (info + info_kind);
-    if kind == kind_string {
+    let size = prim.load64! (info + info_size);
+    // Most of what a collection copies has its size in its info -- a cell, a thunk, a float, a
+    // leaf -- and was found there only after every kind of variable size had been asked about.
+    // A hole is the exception: two words, whatever the thunk it was had.
+    if size != 0 && kind != kind_hole { 1 + size }
+    else if kind == kind_string {
         2 + (prim.load64! (o + word) + word) / word
     } else if kind == kind_array || kind == kind_pap || kind == kind_map || kind == kind_tensor {
         2 + untag_fix (prim.load64! (o + word))
@@ -1510,13 +1515,19 @@ let verify_words! !p !o !at !stop = if prim.uge at stop { 0 } else {
 
 let evacuate! !p !v =
     if not (is_object v) { v }
+    // In a minor collection the one question is whether it is in the nursery: what is not -- old,
+    // shared, static -- is where it is and not looked into, and a minor collection is never a
+    // census's.
+    else if prim.load64! (p + ctx_minor) != 0 { if in_nursery! v { evacuate_heap! p v } else { v } }
     else if prim.ult v (not_heap_limit! ()) {
         if prim.load64! (p + ctx_reporting) != 0 { census_mark! p v; };
         v
     }
-    // Old, in a minor collection: where it is, and not looked into.
-    else if prim.load64! (p + ctx_minor) != 0 && not (in_nursery! v) { v }
-    else {
+    else { evacuate_heap! p v };
+
+/// `v`, an object of the heap being collected, copied to to-space or found there already.
+let evacuate_heap! !p !v =
+    {
         let info = prim.load64! v;
         if info & 1 == 1 { info - 1 }
         // Pinned: kept where it is, and a root already (`scan_pins!`).
