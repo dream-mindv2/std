@@ -168,8 +168,12 @@ priv let rec pool! me ref done! f items width !started !finished results = {
 /// Start one element in a process of its own. A function of its own, so the
 /// thunk handed to `spawn!` carries only these arguments and not the pool's
 /// frame -- the whole list and every answer so far.
+///
+/// `x` is strict: what `pool!` hands it is `items.[started]`, unevaluated, and the suspension the
+/// new process copies held the whole array, so that every process copied every element -- a
+/// native compile mapping its parts of IR into twelve processes copied all of them into each.
 priv let launch! : Process -> :integer -> (a -> b) -> :integer -> a -> Process;
-priv let launch! me ref f i x = spawn! $( answer! me ref f i x );
+priv let launch! me ref f i !x = spawn! $( answer! me ref f i x );
 
 /// Work out `f x` here, all the way down, and send it home as an outcome.
 priv let answer! : Process -> :integer -> (a -> b) -> :integer -> a -> :any;

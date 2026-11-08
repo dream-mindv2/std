@@ -336,12 +336,21 @@ let young_put! !p !c = {
     0
 };
 
-/// The nursery's address space reserved: `DREAM_NURSERY_MB`, or 16 GB, and less as the address
-/// space allowed the process refuses more (`ulimit -v`), to a floor of 256 MB. It is reserved
+/// The nursery's address space reserved: `DREAM_NURSERY_MB`, or 16 GB, but no more than a quarter of
+/// the address space allowed the process (`ulimit -v`), and less as a reservation is refused, to a
+/// floor of 256 MB. It is reserved
 /// and not committed: a page costs memory when it is first written.
 let nursery_init! () = {
     let asked = prim.c1! "getenv" "DREAM_NURSERY_MB";
-    let want = if asked != 0 { prim.c1! "atol" asked * 1048576 } else { 17179869184 };
+    // A quarter of the address space the process may have (`ulimit -v`), at most: halving until a
+    // reservation fit took half of a 14 GB limit, and what a compile maps besides -- LLVM, its
+    // heaps -- ran out.
+    let limit_buf = prim.c1! "malloc" 16;
+    let limited = if prim.c2! "getrlimit" 9 limit_buf == 0 { prim.load64! limit_buf } else { 0 - 1 };
+    prim.c1! "free" limit_buf;
+    let room = if limited == 0 - 1 { 17179869184 } else { limited / 4 };
+    let want0 = if asked != 0 { prim.c1! "atol" asked * 1048576 } else { 17179869184 };
+    let want = if want0 > room { room } else { want0 };
     let at = nursery_reserve! (if want < 268435456 { 268435456 } else { want });
     prim.store64! (world_at! w_young_next) at;
     let most = prim.c1! "getenv" "DREAM_NURSERY_MAX_MB";

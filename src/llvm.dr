@@ -1,0 +1,169 @@
+// LLVM, as a library: a module of LLVM IR text compiled to an object file.
+//
+// `dreams --aot` writes LLVM IR and needs objects of it. On the VM that was the VM's own LLVM,
+// linked into it for the JIT (`vm.llvm_objects!`); a compiler built native has no VM to ask, so
+// LLVM is reached here instead, through its C API and `std.ffi`, from the shared library a
+// toolchain carries in its `lib` (`from system`, so `$DREAM_LIB_LLVM` names another). The version
+// is exact: the IR is written in LLVM 21's syntax, and an LLVM that reads it otherwise is not one
+// to compile with. This is how Rust and Julia reach theirs.
+//
+// One call is one module, in an LLVM context of its own, so modules compile in parallel from
+// processes of their own: a call holds the worker it runs on, as any foreign call does.
+
+import std.foreign;
+import std.str;
+
+foreign llvm from system "LLVM" "21.1" {
+    init_x86_info! : :void -> :void = LLVMInitializeX86TargetInfo
+    init_x86! : :void -> :void = LLVMInitializeX86Target
+    init_x86_mc! : :void -> :void = LLVMInitializeX86TargetMC
+    init_x86_printer! : :void -> :void = LLVMInitializeX86AsmPrinter
+    init_x86_parser! : :void -> :void = LLVMInitializeX86AsmParser
+    init_arm_info! : :void -> :void = LLVMInitializeAArch64TargetInfo
+    init_arm! : :void -> :void = LLVMInitializeAArch64Target
+    init_arm_mc! : :void -> :void = LLVMInitializeAArch64TargetMC
+    init_arm_printer! : :void -> :void = LLVMInitializeAArch64AsmPrinter
+    init_arm_parser! : :void -> :void = LLVMInitializeAArch64AsmParser
+    context_create! : :void -> :ptr = LLVMContextCreate
+    context_dispose! : :ptr -> :void = LLVMContextDispose
+    buffer_copy! : :bytes -> :size -> :cstr -> :ptr = LLVMCreateMemoryBufferWithMemoryRangeCopy
+    buffer_dispose! : :ptr -> :void = LLVMDisposeMemoryBuffer
+    buffer_start! : :ptr -> :ptr = LLVMGetBufferStart
+    buffer_size! : :ptr -> :size = LLVMGetBufferSize
+    parse! : :ptr -> :ptr -> out :ptr -> out :ptr -> :int = LLVMParseIRInContext
+    verify! : :ptr -> :int -> out :ptr -> :int = LLVMVerifyModule
+    module_dispose! : :ptr -> :void = LLVMDisposeModule
+    target_triple! : :ptr -> :ptr = LLVMGetTarget
+    target_of! : :cstr -> out :ptr -> out :ptr -> :int = LLVMGetTargetFromTriple
+    machine_create! : :ptr -> :cstr -> :cstr -> :cstr -> :int -> :int -> :int -> :ptr = LLVMCreateTargetMachine
+    machine_dispose! : :ptr -> :void = LLVMDisposeTargetMachine
+    data_layout! : :ptr -> :ptr = LLVMCreateTargetDataLayout
+    set_data_layout! : :ptr -> :ptr -> :void = LLVMSetModuleDataLayout
+    data_layout_dispose! : :ptr -> :void = LLVMDisposeTargetData
+    pass_options! : :void -> :ptr = LLVMCreatePassBuilderOptions
+    pass_options_dispose! : :ptr -> :void = LLVMDisposePassBuilderOptions
+    run_passes! : :ptr -> :cstr -> :ptr -> :ptr -> :ptr = LLVMRunPasses
+    error_message! : :ptr -> :ptr = LLVMGetErrorMessage
+    emit! : :ptr -> :ptr -> :int -> out :ptr -> out :ptr -> :int = LLVMTargetMachineEmitToMemoryBuffer
+    message_dispose! : :ptr -> :void = LLVMDisposeMessage
+    get_version! : out :u32 -> out :u32 -> out :u32 -> :void = LLVMGetVersion
+}
+
+foreign libc {
+    memcpy! : :buffer -> :ptr -> :size -> :ptr = memcpy
+    strlen! : :ptr -> :size = strlen
+}
+
+/// The bytes at `p`, `n` of them, copied into a string: a buffer of our own filled by C, since
+/// Dream reads no memory it was not told the size of.
+let copied! : :ptr -> :integer -> :string;
+let copied! p n = if n == 0 { "" } else {
+    let b = foreign.buffer! n;
+    libc.memcpy! b p n
+    foreign.read! b 0 n
+};
+
+/// A message LLVM made, as a string, and given back.
+let message! : :ptr | :unit -> :string;
+let message! p = match p {
+    () => "",
+    0 => "",
+    m => {
+        let text = copied! m (libc.strlen! m);
+        llvm.message_dispose! m
+        text
+    },
+};
+
+/// The LLVM loaded, `major.minor.patch`: what an object compiled by it is keyed on, since another
+/// patch release may compile the same text otherwise.
+let version! : :unit -> :string;
+let version! () = {
+    let [_, major, minor, patch] = llvm.get_version! ();
+    str.join_str "." [to_string major, to_string minor, to_string patch]
+};
+
+/// The targets of every machine a toolchain is built for, made known to LLVM once a process: a
+/// second time is a no-op.
+let targets! : :unit -> :unit;
+let targets! () = {
+    llvm.init_x86_info! ()
+    llvm.init_x86! ()
+    llvm.init_x86_mc! ()
+    llvm.init_x86_printer! ()
+    // Inline assembly is parsed as it is written into an object, and the code reads its context
+    // from the thread with some.
+    llvm.init_x86_parser! ()
+    llvm.init_arm_info! ()
+    llvm.init_arm! ()
+    llvm.init_arm_mc! ()
+    llvm.init_arm_printer! ()
+    llvm.init_arm_parser! ()
+};
+
+/// The processor the code is for: x86-64-v2 (POPCNT and SSE4.2, which every x86-64 since 2009
+/// has), and the generic one elsewhere. The same choice the VM's LLVM makes (dream/src/aot_object.cpp).
+let cpu_for : :string -> :string;
+let cpu_for triple = if str.starts_with "x86_64" triple { "x86-64-v2" } else { "generic" };
+
+/// Module `ir`, its target the triple it names, optimized at `level` (0, 1 or 2) and written as an
+/// object file, or why not. Relocations are static and the code model small: the executable
+/// writer lays out a fixed address space and resolves what the object leaves to it.
+let object! : :string -> :integer -> Result :string :string;
+let object! ir level = {
+    targets! ()
+    let ctx = llvm.context_create! ();
+    let answer = in_context! ctx ir level;
+    llvm.context_dispose! ctx
+    answer
+};
+
+/// `object!` in context `ctx`: the IR parsed and verified there, the module given back after.
+priv let in_context! : :ptr -> :string -> :integer -> Result :string :string;
+priv let in_context! ctx ir level = {
+    // The context takes the buffer and gives it back when the module is parsed.
+    let buffer = llvm.buffer_copy! ir (str.byte_length ir) "dream";
+    let [failed, m, why] = llvm.parse! ctx buffer;
+    if failed != 0 { Result.error ("LLVM cannot read the IR: " + message! why) } else {
+        let [bad, vwhy] = llvm.verify! m 2;
+        let answer = if bad != 0 { Result.error ("LLVM refuses the IR: " + message! vwhy) } else { for_target! m level };
+        llvm.module_dispose! m
+        answer
+    }
+};
+
+/// Module `m` for the machine its triple names, told that machine's layout.
+priv let for_target! : :ptr -> :integer -> Result :string :string;
+priv let for_target! m level = {
+    let triple_p = llvm.target_triple! m;
+    let triple = copied! triple_p (libc.strlen! triple_p);
+    let [bad, target, why] = llvm.target_of! triple;
+    if bad != 0 { Result.error ("LLVM has no target " + triple + ": " + message! why) } else {
+        let machine = llvm.machine_create! target triple (cpu_for triple) "" (if level <= 0 { 0 } else if level == 1 { 1 } else { 2 }) 1 3;
+        let layout = llvm.data_layout! machine;
+        llvm.set_data_layout! m layout
+        llvm.data_layout_dispose! layout
+        let answer = optimized_and_emitted! m machine level;
+        llvm.machine_dispose! machine
+        answer
+    }
+};
+
+/// Module `m` through the optimization pipeline of `level`, then written as an object by `machine`.
+priv let optimized_and_emitted! : :ptr -> :ptr -> :integer -> Result :string :string;
+priv let optimized_and_emitted! m machine level = {
+    let passed = if level <= 0 { "" } else {
+        let options = llvm.pass_options! ();
+        let err = llvm.run_passes! m (if level == 1 { "default<O1>" } else { "default<O2>" }) machine options;
+        llvm.pass_options_dispose! options
+        match err { () => "", 0 => "", e => message! (llvm.error_message! e) }
+    };
+    if passed != "" { Result.error ("LLVM's passes failed: " + passed) } else {
+        let [failed, why, out] = llvm.emit! machine m 1;
+        if failed != 0 { Result.error ("LLVM cannot write an object: " + message! why) } else {
+            let bytes = copied! (llvm.buffer_start! out) (llvm.buffer_size! out);
+            llvm.buffer_dispose! out
+            Result.ok bytes
+        }
+    }
+};
