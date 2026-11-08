@@ -638,6 +638,9 @@ let w_young_next = 672;
 let w_nursery_max = 680;
 /// The last token given a loop that writes a map in place (`fresh_token!`).
 let w_tokens = 688;
+/// The least the shared region grows by before a census is begun: `census_min`, or
+/// `DREAM_CENSUS_MIN_MB`.
+let w_census_min = 696;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -1006,7 +1009,10 @@ let free_segments! !p !seg = if seg == 0 { 0 } else {
 // made during a round marks every shared object it leaves in place and every pid it carries.
 // Reading a CAF or joining is reading a root, which the last report marks.
 
-let census_min = 33554432;
+/// The least the shared region grows by before a census: 256 MB. At 32 MB a native self-compile
+/// ran two rounds, each a major collection of every process and a mark of the region, for 2% of
+/// its CPU and a higher peak than it saved: 1.75 GB against 1.64.
+let census_min = 268435456;
 let census_finished = 65536;
 
 let census_on! () = prim.load64! (world_at! w_census) != 0;
@@ -1110,7 +1116,8 @@ let census_segments! !p !seg = if seg == 0 { 0 } else {
 let census_maybe! !p = if census_on! () { 0 } else {
     let grown = prim.load64! (world_at! w_shared_since);
     let finished = prim.load64! (world_at! w_finished_since);
-    let threshold = if prim.load64! (world_at! w_shared_live) > census_min { prim.load64! (world_at! w_shared_live) } else { census_min };
+    let floor = prim.load64! (world_at! w_census_min);
+    let threshold = if prim.load64! (world_at! w_shared_live) > floor { prim.load64! (world_at! w_shared_live) } else { floor };
     if grown > threshold || finished > census_finished { census_begin! p } else { 0 }
 };
 
@@ -1611,7 +1618,12 @@ let scan_mail! !p !entry = if entry == 0 { 0 } else {
 // object pinned is kept, the gaps between its pinned objects made fillers once everything is
 // copied, so it can be walked again (`settle_pins!`).
 
-let pin_word! !p !w = if not (is_object w) || prim.ult w (not_heap_limit! ()) { 0 } else { words_push! (p + ctx_cands) w };
+/// A word that may pin. In a minor collection only a word into the nursery can: nothing old moves.
+/// Before that was asked, a collection in a deep recursion of the compiler sorted thousands of
+/// words into its old chunks every time, to find none of them pinned anything.
+let pin_word! !p !w = if not (is_object w) || prim.ult w (not_heap_limit! ()) { 0 }
+    else if prim.load64! (p + ctx_minor) != 0 && not (in_nursery! w) { 0 }
+    else { words_push! (p + ctx_cands) w };
 
 let pin_range! !p !at !stop = if prim.uge at stop { 0 } else {
     pin_word! p (prim.load64! at);
@@ -2271,6 +2283,8 @@ let init! () = {
     if prim.c1! "getenv" "DREAM_GC_TRACE" != 0 { prim.store64! (world_at! w_gc_trace) 1; };
     if prim.c1! "getenv" "DREAM_GC_FULL" != 0 { prim.store64! (world_at! w_gc_full) 1; };
     if prim.c1! "getenv" "DREAM_GC_VERIFY" != 0 { prim.store64! (world_at! w_gc_verify) 1; };
+    let census_floor = prim.c1! "getenv" "DREAM_CENSUS_MIN_MB";
+    prim.store64! (world_at! w_census_min) (if census_floor != 0 { prim.c1! "atol" census_floor * 1048576 } else { census_min });
     note_context! p;
     init_handles! p;
     // A peer that has gone is an error from the write, not the end of the program.
