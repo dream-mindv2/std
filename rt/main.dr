@@ -134,7 +134,11 @@ let ctx_gc_at = 800;
 /// answer it gave; and the lowest a bridge may put a frame (`machine.frames_room`).
 let ctx_seg_ran = 808;
 let ctx_frames_floor = 816;
-let ctx_size = 824;
+/// 1 during a minor collection: only what is in the nursery is copied (`in_nursery!`).
+let ctx_minor = 824;
+/// Freed chunks of the nursery too large for a size class, to be given out again (`young_get!`).
+let ctx_young_spare = 832;
+let ctx_size = 840;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -249,6 +253,7 @@ let class_of !size !c = if size <= small_chunk { c } else { class_of (size / 2) 
 /// A class's state: `[free list, cursor, end]`, the cursor walking the slab it carves from.
 let class_words = 3;
 
+/// Every context's table holds both halves: `2 * small_class_count` classes, the old's first.
 let class_head! !p !size = prim.load64! (p + ctx_classes) + class_of size 0 * class_words * word;
 
 // A slab is carved as it is used, one chunk at a time, not all at once: carving the whole of it
@@ -277,7 +282,86 @@ let chunk_get! !p !size =
         }
     };
 
-let chunk_put! !p !c = {
+// The nursery's chunks come from an address space of their own, reserved once (`nursery_init!`),
+// so that whether a word points into the nursery is a subtraction and a comparison: the
+// collector asks it of every word it moves in a minor collection, and compiled code of every
+// thunk it updates, which is how the old are told from the young (see "generations"). Its own
+// size classes are the second half of the context's, its slabs carved from it in turn by every
+// worker, and its large chunks kept for reuse rather than given back.
+
+let in_nursery! !v = prim.ult (v - prim.load64! (world_at! w_young_lo)) (prim.load64! (world_at! w_young_size));
+
+let young_class_head! !p !size = prim.load64! (p + ctx_classes) + (small_class_count + class_of size 0) * class_words * word;
+
+/// `bytes` of the nursery's address space, never handed out before.
+let nursery_take! !bytes = {
+    let at = prim.xadd64! (world_at! w_young_next) bytes;
+    if prim.ugt (at + bytes) (prim.load64! (world_at! w_young_lo) + prim.load64! (world_at! w_young_size)) {
+        fatal! "dream: the nursery's address space is used up (DREAM_NURSERY_MB sets its size)\n"
+    } else { at }
+};
+
+/// A chunk of the nursery, as `chunk_get!` is one of the old.
+let young_get! !p !size =
+    if size > slab_bytes / 2 {
+        let c = spare_fit! (p + ctx_young_spare) (prim.load64! (p + ctx_young_spare)) size;
+        if c != 0 { c } else { nursery_take! size }
+    } else {
+        let head = young_class_head! p size;
+        let csize = small_chunk << class_of size 0;
+        let c = prim.load64! head;
+        if c != 0 {
+            prim.store64! head (prim.load64! c);
+            c
+        } else {
+            if prim.load64! (head + word) + csize > prim.load64! (head + 2 * word) {
+                let slab = nursery_take! slab_bytes;
+                prim.store64! (head + word) slab;
+                prim.store64! (head + 2 * word) (slab + slab_bytes);
+            };
+            let fresh_ = prim.load64! (head + word);
+            prim.store64! (head + word) (fresh_ + csize);
+            prim.store64! (fresh_ + word) csize;
+            fresh_
+        }
+    };
+
+let young_put! !p !c = {
+    let size = prim.load64! (c + word);
+    let head = if size > slab_bytes / 2 { p + ctx_young_spare } else { young_class_head! p size };
+    prim.store64! c (prim.load64! head);
+    prim.store64! head c;
+    0
+};
+
+/// The nursery's address space reserved: `DREAM_NURSERY_MB`, or 16 GB, and less as the address
+/// space allowed the process refuses more (`ulimit -v`), to a floor of 256 MB. It is reserved
+/// and not committed: a page costs memory when it is first written.
+let nursery_init! () = {
+    let asked = prim.c1! "getenv" "DREAM_NURSERY_MB";
+    let want = if asked != 0 { prim.c1! "atol" asked * 1048576 } else { 17179869184 };
+    let at = nursery_reserve! (if want < 268435456 { 268435456 } else { want });
+    prim.store64! (world_at! w_young_next) at;
+    let most = prim.c1! "getenv" "DREAM_NURSERY_MAX_MB";
+    prim.store64! (world_at! w_nursery_max) (if most != 0 { prim.c1! "atol" most * 1048576 } else { nursery_max });
+    0
+};
+
+let nursery_reserve! !bytes = {
+    let at = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
+    if at != 0 - 1 {
+        // In pages of two megabytes where the kernel gives them (MADV_HUGEPAGE): a nursery is
+        // written through from one end to the other at every fill, and in pages of four
+        // kilobytes each first touch was a fault, a third more of them than the slabs had.
+        prim.c3! "madvise" at bytes 14;
+        prim.store64! (world_at! w_young_lo) at;
+        prim.store64! (world_at! w_young_size) bytes;
+        at
+    } else if bytes > 268435456 { nursery_reserve! (bytes / 2) }
+    else { fatal! "dream: no address space for the nursery\n" }
+};
+
+let chunk_put! !p !c = if in_nursery! c { young_put! p c } else {
     let size = prim.load64! (c + word);
     if size > slab_bytes / 2 { spare_put! p c }
     else {
@@ -319,7 +403,7 @@ let new_chunk! !p !bytes = {
     let size = round_chunk! want (if direct_frames! () && budget > direct_chunk { direct_chunk } else { budget });
     prim.store64! (p + ctx_since) (prim.load64! (p + ctx_since) + size);
     ended_at! (prim.load64! (p + ctx_chunks)) (prim.load64! (p + ctx_hp));
-    let chunk = chunk_get! p size;
+    let chunk = young_get! p size;
     prim.store64! chunk (prim.load64! (p + ctx_chunks));
     prim.store64! (chunk + word) size;
     prim.store64! (chunk + 2 * word) 0;
@@ -390,6 +474,14 @@ let load_heap! !p !pcb = {
 /// The heap of a process that has ended, all of it at once. Nothing can reach into it:
 /// what it answered was promoted to the shared region first.
 let free_heap! !p = {
+    let pcb = current! p;
+    free_chunks! p (prim.load64! (pcb + pcb_old));
+    prim.store64! (pcb + pcb_old) 0;
+    prim.store64! (pcb + pcb_old_bytes) 0;
+    if prim.load64! (pcb + pcb_ssb) != 0 { prim.c1! "free" (prim.load64! (pcb + pcb_ssb)); };
+    prim.store64! (pcb + pcb_ssb) 0;
+    prim.store64! (pcb + pcb_ssb + word) 0;
+    prim.store64! (pcb + pcb_ssb + 2 * word) 0;
     free_chunks! p (prim.load64! (p + ctx_chunks));
     prim.store64! (p + ctx_chunks) 0;
     prim.store64! (p + ctx_total) 0;
@@ -531,6 +623,17 @@ let w_arena_stack = 616;
 let w_arena_lock = 624;
 /// 1 when each collection says what it found, as the VM's `DREAM_GC_TRACE` does.
 let w_gc_trace = 632;
+/// 1 for every collection a major one (`DREAM_GC_FULL`), to measure the generations against.
+let w_gc_full = 640;
+/// 1 to check after each minor collection that nothing old points where the nursery was
+/// (`DREAM_GC_VERIFY`): what a write that was not remembered leaves.
+let w_gc_verify = 648;
+/// The nursery's address space (`young_get!`): where it starts, how large it is, and how much of
+/// it has been carved, taken by every worker at once.
+let w_young_lo = 656;
+let w_young_size = 664;
+let w_young_next = 672;
+let w_nursery_max = 680;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -859,9 +962,13 @@ let promote_as! !p !v !mode = if not (is_heap_object! v) { v } else {
 };
 
 /// Segments copied out for another heap, taken into the running process's as chunks.
+///
+/// They are old from the start: what a copy made points only into itself and at what lives
+/// longer, and they are outside the nursery's address space.
 let adopt_segments! !p !first !bytes = if first == 0 { 0 } else {
-    adopt_link! p first;
-    prim.store64! (p + ctx_chunks) first;
+    let pcb = current! p;
+    prim.store64! (pcb + pcb_old) (joined_chunks! first (prim.load64! (pcb + pcb_old)));
+    prim.store64! (pcb + pcb_old_bytes) (prim.load64! (pcb + pcb_old_bytes) + bytes);
     prim.store64! (p + ctx_total) (prim.load64! (p + ctx_total) + bytes);
     0
 };
@@ -1270,12 +1377,134 @@ let copy_words! !from !to !n = if n == 0 { 0 } else {
     copy_words! (from + word) (to + word) (n - 1)
 };
 
+// --- generations ---------------------------------------------------------------------------
+//
+// A collection was a copy of the process's whole heap, and a heap that lives -- the compiler's
+// tables, a map being built -- was copied again at every one: a third of a native self-compile
+// and two fifths of `maps` were the collector. Now most collections are minor: only the nursery,
+// the chunks allocated since the last collection, is copied, and what survives it is old, in
+// chunks that stay where they are until a major collection copies everything as before. A major
+// one comes when the old chunks have grown to three times what the last major kept, and for a
+// census.
+//
+// An old object can point into the nursery only by being written into after it was made: a
+// thunk updated, a `let rec` patched, an array forced in place. Each such write records the
+// word written (`remember!`), into a buffer of the process's own, and a minor collection moves
+// what the old ones among them hold. The word and not its object, so that an array forced
+// element by element is each element once and not the whole array as many times. The buffer is
+// not filtered as it is written: what it holds is bounded by what was made since the last
+// collection and by every old thunk, which is updated once, and a write into the nursery is not
+// recorded at all. The nursery is told from the old by where it is (`in_nursery!`).
+//
+// A chunk of the nursery that a stack pins stays where it is, and stays the nursery's: what is
+// pinned is copied out at a later collection, when nothing pins it. A word of to-space, or of an
+// old object, that points at it is remembered as it is moved (`evacuate_kept_at!`), so that
+// the collection that does copy it finds the word.
+
+/// The word at `at` written since the last collection, maybe pointing into the nursery now. A
+/// word in the nursery itself is not: the nursery is traced from its roots.
+let remember! !p !at = if in_nursery! at { 0 } else { words_push! (current! p + pcb_ssb) at; 0 };
+
+/// The same where what was written, `v`, is known: only an object of a heap matters.
+let remember_value! !p !at !v = if v & 7 == 0 && v != 0 { remember! p at } else { 0 };
+
+
+/// The most a nursery grows to between collections, by default: past it a larger one copies the
+/// same survivors, later. `DREAM_NURSERY_MAX_MB` sets it (`w_nursery_max`).
+let nursery_max = 8388608;
+
+/// The chunks from `c` that pins kept, each put on the nursery's list or the old one by where it is.
+let kept_chunks! !p !pcb !c = if c == 0 { 0 } else {
+    let next = prim.load64! c;
+    if in_nursery! c {
+        prim.store64! c (prim.load64! (p + ctx_chunks));
+        prim.store64! (p + ctx_chunks) c;
+    } else {
+        prim.store64! c (prim.load64! (pcb + pcb_old));
+        prim.store64! (pcb + pcb_old) c;
+        prim.store64! (pcb + pcb_old_bytes) (prim.load64! (pcb + pcb_old_bytes) + prim.load64! (c + word));
+    };
+    kept_chunks! p pcb next
+};
+
+/// The chunk list `a` with `b` after it.
+let joined_chunks! !a !b = if a == 0 { b } else if b == 0 { a } else {
+    prim.store64! (last_chunk! a) b;
+    a
+};
+
+/// The words remembered in old objects, roots of a minor collection, each moved as a word of
+/// to-space's would be. One remembered twice is moved once: the second time it holds what is
+/// no longer in the nursery.
+let scan_remembered! !p !buf !i !n = if i >= n { 0 } else {
+    let at = word_at! buf i;
+    if prim.uge at (not_heap_limit! ()) && not (in_nursery! at) { evacuate_kept_at! p at; };
+    scan_remembered! p buf (i + 1) n
+};
+
+/// A word of what will be old moved, and remembered if what it holds is still in the nursery:
+/// an object a stack pinned there.
+let evacuate_kept_at! !p !at = evacuate_kept_range! p at (at + word);
+
+/// The words from `at` to `stop` so, the nursery's bounds read once for all of them.
+let evacuate_kept_range! !p !at !stop =
+    kept_words! p at stop (prim.load64! (world_at! w_young_lo)) (prim.load64! (world_at! w_young_size));
+
+let kept_words! !p !at !stop !lo !size = if prim.uge at stop { 0 } else {
+    let w = prim.load64! at;
+    if is_object w {
+        let v = evacuate! p w;
+        prim.store64! at v;
+        if prim.ult (v - lo) size && is_object v { remember! p at; };
+    };
+    kept_words! p (at + word) stop lo size
+};
+
+/// `DREAM_GC_VERIFY`: every value in the old chunks from `c` checked, after a minor collection
+/// has copied and before the nursery is freed, for one still pointing into the nursery at what
+/// was not pinned -- an object written into and not remembered.
+let verify_chunks! !p !c = if c == 0 { 0 } else {
+    verify_objects! p (c + chunk_header) (prim.load64! (c + 2 * word));
+    verify_chunks! p (prim.load64! c)
+};
+
+let verify_objects! !p !at !stop = if prim.uge at stop { 0 } else {
+    let info = prim.load64! at;
+    let n = object_words! at info;
+    if has_values (prim.load64! (info + info_kind)) { verify_words! p at (at + word) (at + n * word); };
+    verify_objects! p (at + n * word) stop
+};
+
+let in_chunks! !c !w = if c == 0 { 0 } else if prim.ule c w && prim.ult w (c + prim.load64! (c + word)) { 1 } else { in_chunks! (prim.load64! c) w };
+
+let in_words! !a !i !n !w = if i >= n { 0 } else if prim.load64! (a + i * word) == w { 1 } else { in_words! a (i + 1) n w };
+
+let verify_words! !p !o !at !stop = if prim.uge at stop { 0 } else {
+    let w = prim.load64! at;
+    if is_heap_object! w && in_nursery! w && prim.load64! w & 2 == 0 {
+        let buf = prim.c1! "malloc" 200;
+        prim.c6! "snprintf" buf 200 "dream: gc verify: an old object of kind %ld at %lx points into the nursery at %lx (+%ld)\n"
+            (kind_of! o) o w (at - o);
+        prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+        let pcb = current! p;
+        prim.c6! "snprintf" buf 200 "  code %lx, remembered %ld, its code %lx, in this nursery %ld\n"
+            (prim.load64! (prim.load64! o)) (in_words! (prim.load64! (pcb + pcb_ssb)) 0 (prim.load64! (pcb + pcb_ssb + word)) at)
+            (prim.load64! (prim.load64! w))
+            (in_chunks! (prim.load64! (p + ctx_chunks)) w + 2 * in_chunks! (prim.load64! (p + ctx_pinned)) w);
+        prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+        prim.c1! "abort" 0;
+    };
+    verify_words! p o (at + word) stop
+};
+
 let evacuate! !p !v =
     if not (is_object v) { v }
     else if prim.ult v (not_heap_limit! ()) {
         if prim.load64! (p + ctx_reporting) != 0 { census_mark! p v; };
         v
     }
+    // Old, in a minor collection: where it is, and not looked into.
+    else if prim.load64! (p + ctx_minor) != 0 && not (in_nursery! v) { v }
     else {
         let info = prim.load64! v;
         if info & 1 == 1 { info - 1 }
@@ -1313,7 +1542,7 @@ let scan! !p !c !at = {
         let info = prim.load64! at;
         let n = object_words! at info;
         if has_values (prim.load64! (info + info_kind)) {
-            evacuate_range! p (at + word) (at + n * word);
+            evacuate_kept_range! p (at + word) (at + n * word);
         };
         scan! p c (at + n * word)
     }
@@ -1401,9 +1630,53 @@ let words_push! !a !w = {
 
 let word_at! !a !i = prim.load64! (prim.load64! a + i * word);
 
-/// The `n` words from `a` in ascending order, by Shell's sort: a stack's candidates are a few
-/// thousand at most, and the dialect has no `qsort` to hand a comparison to.
-let sort_words! !a !n = shell_gaps! a n (n / 2);
+/// The `n` words from `a` in ascending order: by Shell's sort when they are few, and otherwise by
+/// a radix sort, sixteen bits a pass. A stack's candidates are a few thousand, until a collection
+/// lands in a deep recursion: 1.3 million in `strs`, which Shell's sort took most of a run over.
+/// The dialect has no `qsort` to hand a comparison to.
+let sort_words! !a !n = if n < 1024 { shell_gaps! a n (n / 2) } else {
+    let buf = prim.c1! "malloc" (n * word);
+    let counts = prim.c1! "malloc" (65536 * word);
+    radix_pass! a buf n counts 0;
+    radix_pass! buf a n counts 16;
+    radix_pass! a buf n counts 32;
+    radix_pass! buf a n counts 48;
+    prim.c1! "free" counts;
+    prim.c1! "free" buf;
+    0
+};
+
+/// The words of `from` into `to`, stably, by the sixteen bits at `shift`.
+let radix_pass! !from !to !n !counts !shift = {
+    zero_counts! counts 0;
+    count_digits! from n counts shift 0;
+    prefix_counts! counts 0 0;
+    scatter_digits! from to n counts shift 0;
+    0
+};
+
+let zero_counts! !c !i = if i >= 65536 { 0 } else { prim.store64! (c + i * word) 0; zero_counts! c (i + 1) };
+
+let count_digits! !from !n !c !shift !i = if i >= n { 0 } else {
+    let d = prim.ushr (prim.load64! (from + i * word)) shift & 65535;
+    prim.store64! (c + d * word) (prim.load64! (c + d * word) + 1);
+    count_digits! from n c shift (i + 1)
+};
+
+let prefix_counts! !c !i !sum = if i >= 65536 { 0 } else {
+    let here = prim.load64! (c + i * word);
+    prim.store64! (c + i * word) sum;
+    prefix_counts! c (i + 1) (sum + here)
+};
+
+let scatter_digits! !from !to !n !c !shift !i = if i >= n { 0 } else {
+    let w = prim.load64! (from + i * word);
+    let d = prim.ushr w shift & 65535;
+    let at = prim.load64! (c + d * word);
+    prim.store64! (to + at * word) w;
+    prim.store64! (c + d * word) (at + 1);
+    scatter_digits! from to n c shift (i + 1)
+};
 
 let shell_gaps! !a !n !gap = if gap == 0 { 0 } else { shell_pass! a n gap gap; shell_gaps! a n (gap / 2) };
 
@@ -1480,7 +1753,9 @@ let scan_pins! !p !i !n = if i >= n { 0 } else {
     let o = word_at! (p + ctx_pins) i;
     let info = prim.load64! o - 2;
     if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p o info; };
-    if has_values (prim.load64! (info + info_kind)) { evacuate_range! p (o + word) (o + object_words! o info * word); };
+    // Kept, since a major collection pins old objects too, which will be old after it: a word of
+    // one that points at what is pinned in the nursery is remembered (`evacuate_kept_range!`).
+    if has_values (prim.load64! (info + info_kind)) { evacuate_kept_range! p (o + word) (o + object_words! o info * word); };
     scan_pins! p (i + 1) n
 };
 
@@ -1543,6 +1818,22 @@ let pin_native! !p !pcb !here = {
     else { 0 }
 };
 
+/// The bytes of native stack a collection reads for pins (`pin_native!`): from `here`, or where a
+/// parked process stopped, to the top, and every segment it went on from.
+let native_depth! !pcb !here = {
+    let base = prim.load64! (pcb + pcb_nstack);
+    let top = base + prim.load64! (pcb + pcb_nstack_size);
+    let own = if base == 0 { 0 }
+        else if prim.ult base here && prim.ult here top { top - here }
+        else if prim.load64! (pcb + pcb_nsp) != 0 { top - prim.load64! (pcb + pcb_nsp) }
+        else { 0 };
+    own + segments_depth! (prim.load64! (pcb + pcb_segs)) 0
+};
+
+let segments_depth! !link !acc = if link == 0 { acc } else {
+    segments_depth! (prim.load64! link) (acc + prim.load64! (link + word) + prim.load64! (link + 2 * word) - prim.load64! (link + 3 * word))
+};
+
 /// The segments a process's stack went on from, each read from where it stood to its top.
 let pin_segments! !p !link = if link == 0 { 0 } else {
     pin_range! p (prim.load64! (link + 3 * word)) (prim.load64! (link + word) + prim.load64! (link + 2 * word));
@@ -1551,11 +1842,20 @@ let pin_segments! !p !link = if link == 0 { 0 } else {
 
 /// A collection's line on standard error: the process, what was copied, what pinned chunks kept,
 /// the objects pinned and the words on the stack that might have been pointers.
+/// The rest of the line: which kind of collection, and the words remembered for it.
+let gc_said_more! !minor !remembered = {
+    let buf = prim.c1! "malloc" 160;
+    prim.c5! "snprintf" buf 160 " %s remembered %ld\n" (if minor { "minor" } else { "major" }) remembered;
+    prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
+    prim.c1! "free" buf;
+    0
+};
+
 let gc_said! !id !live !kept !pins !cands = {
     let buf = prim.c1! "malloc" 160;
     prim.c6! "snprintf" buf 160 "gc pid %ld copied %ld kept %ld pins %ld" id live kept pins;
     prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
-    prim.c4! "snprintf" buf 160 " candidates %ld\n" cands;
+    prim.c4! "snprintf" buf 160 " candidates %ld" cands;
     prim.c3! "write" 2 buf (prim.c1! "strlen" buf);
     prim.c1! "free" buf;
     0
@@ -1574,6 +1874,24 @@ let collect! !p !sp = {
     prim.store64! (p + ctx_reporting) (if reporting { 1 } else { 0 });
     let budget = prim.load64! (pcb + pcb_budget);
     let direct = direct_frames! ();
+    // Minor when the process has old chunks to leave where they are and they have not grown
+    // past what the last major allowed; a census, code that jumps (whose to-space is one chunk)
+    // and `DREAM_GC_FULL` always copy everything.
+    let minor = direct && not reporting && prim.load64! (world_at! w_gc_full) == 0
+        && prim.load64! (pcb + pcb_old) != 0 && prim.load64! (pcb + pcb_old_bytes) < prim.load64! (pcb + pcb_major_at);
+    if not minor {
+        // Everything is from-space: the old chunks join the nursery's.
+        prim.store64! (p + ctx_chunks) (joined_chunks! (prim.load64! (p + ctx_chunks)) (prim.load64! (pcb + pcb_old)));
+        prim.store64! (pcb + pcb_old) 0;
+        prim.store64! (pcb + pcb_old_bytes) 0;
+    };
+    prim.store64! (p + ctx_minor) (if minor { 1 } else { 0 });
+    // What was remembered before this collection, read before anything is moved: what it
+    // remembers itself, from here on, is the next one's.
+    let remembered_n = prim.load64! (pcb + pcb_ssb + word);
+    // What was made since the last one, before anything here resets it: what the nursery's size
+    // is measured against.
+    let made = prim.load64! (p + ctx_since);
     let space = if direct { direct_chunk } else {
         round_chunk! (prim.load64! (p + ctx_total) + (if budget >= min_chunk { min_chunk } else { chunk_header })) budget
     };
@@ -1599,22 +1917,46 @@ let collect! !p !sp = {
     evacuate_at! p (pcb + pcb_kept);
     scan_mail! p (prim.load64! (pcb + pcb_mail_head));
     scan_pins! p 0 (prim.load64! (p + ctx_pins + word));
+    if minor { scan_remembered! p (pcb + pcb_ssb) 0 remembered_n; };
     scan! p to start;
+    if minor && prim.load64! (world_at! w_gc_verify) != 0 { verify_chunks! p (prim.load64! (pcb + pcb_old)); };
     free_chunks! p old;
+    // What was remembered before is done with; what this collection remembered -- words now old
+    // that point at what a stack pinned in the nursery -- is the next one's.
+    let ssb_words = prim.load64! (pcb + pcb_ssb);
+    let ssb_now = prim.load64! (pcb + pcb_ssb + word);
+    if ssb_now > remembered_n { move_words_down! (ssb_words + remembered_n * word) ssb_words (ssb_now - remembered_n); };
+    prim.store64! (pcb + pcb_ssb + word) (ssb_now - remembered_n);
     let live = prim.load64! (p + ctx_copied);
     let pins = prim.load64! (p + ctx_pins + word);
     let cands = prim.load64! (p + ctx_cands + word);
     let pinned = settle_pins! p (prim.load64! (p + ctx_pinned)) 0 0 0;
-    if prim.load64! (world_at! w_gc_trace) != 0 { gc_said! (prim.load64! (pcb + pcb_id)) live pinned pins cands; };
+    if prim.load64! (world_at! w_gc_trace) != 0 { gc_said! (prim.load64! (pcb + pcb_id)) live pinned pins cands; gc_said_more! minor remembered_n; };
     prim.store64! (p + ctx_cands + word) 0;
     prim.store64! (p + ctx_pins + word) 0;
     prim.store64! (prim.load64! (p + ctx_to_cur) + 2 * word) (prim.load64! (p + ctx_to));
-    prim.store64! (p + ctx_chunks) to;
-    unpin! p to;
+    if direct {
+        // What was copied is old: to-space, in front of the old chunks a minor collection left
+        // where they were. The chunks pins kept are the nursery's still, and the nursery goes on
+        // from them.
+        let old_bytes = (if minor { prim.load64! (pcb + pcb_old_bytes) } else { 0 }) + live;
+        prim.store64! (pcb + pcb_old) (joined_chunks! to (prim.load64! (pcb + pcb_old)));
+        prim.store64! (pcb + pcb_old_bytes) old_bytes;
+        if not minor { prim.store64! (pcb + pcb_major_at) (if 3 * live > min_chunk { 3 * live } else { min_chunk }); };
+        // A kept chunk goes back where it was: the nursery's to the nursery, and an old one -- a
+        // major collection pins in old chunks too -- to the old, or the next minor collection would
+        // free it with what is pinned in it.
+        prim.store64! (p + ctx_chunks) 0;
+        kept_chunks! p pcb (prim.load64! (p + ctx_pinned));
+        prim.store64! (p + ctx_pinned) 0;
+    } else {
+        prim.store64! (p + ctx_chunks) to;
+        unpin! p to;
+    };
     prim.store64! (p + ctx_hp) 0;
     // What is in use, not what was mapped for it: counting the unused end of to-space would grow
     // the next to-space by its own size each time, and then no mapping is ever reused.
-    prim.store64! (p + ctx_total) (live + pinned);
+    prim.store64! (p + ctx_total) ((if direct { prim.load64! (pcb + pcb_old_bytes) } else { live }) + pinned);
     prim.store64! (p + ctx_want_gc) 0;
     prim.store64! (p + ctx_since) 0;
     prim.store64! (p + ctx_guard) (prim.load64! (p + ctx_floor));
@@ -1628,7 +1970,32 @@ let collect! !p !sp = {
     // a heap that only grows (`maps`, a map path-copied as it is built) was copied half a byte for
     // every byte made. Three was 17% off `tree` and a little off `maps`; four was more off `maps`
     // and nothing off `tree`, which is where collections land against each one's live peak.
-    prim.store64! (p + ctx_gc_at) (3 * (live + pinned));
+    // With generations the nursery is what is made between collections: as large as that rule
+    // says, up to `nursery_max`, past which a larger one only copies the same survivors later.
+    let spaced = 3 * (if direct { prim.load64! (pcb + pcb_old_bytes) } else { live + pinned });
+    // The nursery follows what survives it: twice as large while a quarter or more of it does,
+    // four times while half does,
+    // since what is made to last is copied once however often the nursery fills, and half as
+    // large while a sixteenth or less does, to stay where the caches are. `maps` and `tree` want
+    // a small one and `strs` and `sorts`, whose lists live, a large one; 8 MB to start
+    // (`DREAM_NURSERY_MAX_MB`), between 2 MB and 256 MB.
+    let was = prim.load64! (pcb + pcb_nursery);
+    let size_now = if was == 0 { prim.load64! (world_at! w_nursery_max) } else { was };
+    let resized = if not minor || made == 0 { size_now }
+        else if live * 2 > made && size_now < 268435456 { size_now * 4 }
+        else if live * 4 > made && size_now < 268435456 { size_now * 2 }
+        else if live * 16 < made && size_now > 2097152 { size_now / 2 }
+        else { size_now };
+    prim.store64! (pcb + pcb_nursery) resized;
+    let most = resized;
+    // And at least twice the stack: a collection reads all of it, word by word for what may be a
+    // pointer, so a deep recursion that allocates pays for that once per its own depth's worth of
+    // allocation. Capped at the nursery's most, a collection landing ten megabytes down `strs`
+    // read 1.3 million words for every eight megabytes made.
+    let stack_twice = 2 * (stack_top! pcb - sp + native_depth! pcb here);
+    let capped = if direct && spaced > most { most } else { spaced };
+    prim.store64! (p + ctx_gc_at) (if capped < stack_twice { stack_twice } else { capped });
+    prim.store64! (p + ctx_minor) 0;
     new_chunk! p (if direct { 0 } else { live * 2 });
     if reporting {
         mark_drain! p;
@@ -1756,6 +2123,7 @@ let frame_update! !p !sp !v !b !c !d = {
     let thunk = prim.load64! (sp + word);
     prim.store64! (thunk + word) v;
     prim.store64! thunk (prim.info "ind");
+    remember_value! p (thunk + word) v;
     return! p (sp + 2 * word) v
 };
 
@@ -1891,12 +2259,14 @@ let raise_text! !p !sp s = {
 /// A process's context and its empty stack, whose top holds the frame that ends it.
 let init! () = {
     let p = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (p + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
+    prim.store64! (p + ctx_classes) (prim.c2! "calloc" (2 * small_class_count * class_words) word);
     prim.store64! (p + ctx_timebuf) (prim.c2! "calloc" 2 word);
     world_init! p;
     timeline_open! ();
     if prim.c1! "getenv" "DREAM_GC_PIN_TEST" != 0 { prim.store64! (world_at! w_pin_test) 1; };
     if prim.c1! "getenv" "DREAM_GC_TRACE" != 0 { prim.store64! (world_at! w_gc_trace) 1; };
+    if prim.c1! "getenv" "DREAM_GC_FULL" != 0 { prim.store64! (world_at! w_gc_full) 1; };
+    if prim.c1! "getenv" "DREAM_GC_VERIFY" != 0 { prim.store64! (world_at! w_gc_verify) 1; };
     note_context! p;
     init_handles! p;
     // A peer that has gone is an error from the write, not the end of the program.
@@ -2236,6 +2606,7 @@ let unwind! !p !at !e !b !c !d = {
             prim.store64! (raised + word) e;
             prim.store64! (thunk + word) raised;
             prim.store64! thunk (prim.info "ind");
+            remember! p (thunk + word);
         };
         unwind! p (at + frame_words! at info * word) e 0 0 0
     }
@@ -3179,6 +3550,7 @@ let array_new! !p !n !fill = {
 /// A slot of an array still being built, by the library.
 let array_store! !p !a !i !v = {
     prim.store64! (a + (2 + untag_fix i) * word) v;
+    remember_value! p (a + (2 + untag_fix i) * word) v;
     a
 };
 
@@ -3316,7 +3688,9 @@ let leaf_evaluated! !l !functions = if l == nil_word { 1 }
 /// `a` with its `i`th element the head of the cell `xs`, as the cell holds it: what
 /// `array.of_list` stores, with no suspension made of reading it (rt/lib.dr, `array_fill`).
 let array_store_head! !p !a !i !xs = {
-    prim.store64! (a + (2 + untag_fix i) * word) (prim.load64! (xs + word));
+    let v = prim.load64! (xs + word);
+    prim.store64! (a + (2 + untag_fix i) * word) v;
+    remember_value! p (a + (2 + untag_fix i) * word) v;
     a
 };
 
@@ -3931,7 +4305,16 @@ let pcb_nsp = 304;
 /// `[older, base, size, where it stood]`, and how many bytes they hold (`segment_call!`).
 let pcb_segs = 312;
 let pcb_depth = 320;
-let pcb_size = 328;
+/// The generations (`collect!`): the chunks that survived a collection, the bytes in them, the
+/// size they may reach before the next collection is a major one, and the objects written into
+/// since the last collection (`[words, count, room]`, `remember!`).
+let pcb_old = 328;
+let pcb_old_bytes = 336;
+let pcb_major_at = 344;
+let pcb_ssb = 352;
+/// The nursery's size for this process, which a minor collection moves by what survived it.
+let pcb_nursery = 376;
+let pcb_size = 384;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
 // its heap (`take_mail!`) they are nobody's, and the value is only in them.
@@ -5430,6 +5813,7 @@ let thunk_raised_d! !p !sp !thunk !b !c !d = {
     prim.store64! (raised + word) e;
     prim.store64! (thunk + word) raised;
     prim.store64! thunk (prim.info "ind");
+    remember! p (thunk + word);
     prim.store64! (p + ctx_error) e;
     0
 };
@@ -5516,7 +5900,7 @@ let submit_job! !p !job = {
 
 let start_pool! !i !n = if i >= n { 0 } else {
     let c = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (c + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
+    prim.store64! (c + ctx_classes) (prim.c2! "calloc" (2 * small_class_count * class_words) word);
     prim.store64! (c + ctx_timebuf) (prim.c2! "calloc" 2 word);
     prim.store64! (c + ctx_run_lock) (new_lock! ());
     prim.start_pool! c;
@@ -5581,7 +5965,7 @@ let max_workers = 256;
 
 let new_worker_ctx! !index = {
     let w = prim.c2! "calloc" 1 ctx_size;
-    prim.store64! (w + ctx_classes) (prim.c2! "calloc" (small_class_count * class_words) word);
+    prim.store64! (w + ctx_classes) (prim.c2! "calloc" (2 * small_class_count * class_words) word);
     prim.store64! (w + ctx_timebuf) (prim.c2! "calloc" 2 word);
     prim.store64! (w + ctx_run_lock) (new_lock! ());
     prim.store64! (w + ctx_index) index;
@@ -5623,6 +6007,7 @@ let run_workers! !i !n = if i >= n { 0 } else {
 
 let world_init! !p = {
     shared_init! ();
+    nursery_init! ();
     prim.store64! (world_at! w_table) (map_memory! (table_cap * word));
     prim.store64! (world_at! w_table_cap) table_cap;
     prim.store64! (world_at! w_next_id) 1;
@@ -5675,22 +6060,18 @@ let spawn! !p !work = {
         if segs == 0 { census_mark! p copied; } else { census_segments! p segs; };
         mark_drain! p;
     };
-    let left = prim.load64! (p + ctx_xc_limit) - prim.load64! (p + ctx_xc_to);
-    if segs != 0 && left >= 256 {
-        prim.store64! (pcb + pcb_chunks) segs;
-        prim.store64! (pcb + pcb_total) (prim.load64! (p + ctx_xc_bytes));
-        prim.store64! (pcb + pcb_hp) (prim.load64! (p + ctx_xc_to));
-        prim.store64! (pcb + pcb_limit) (prim.load64! (p + ctx_xc_limit));
-    } else {
-        let first = chunk_get! p first_budget;
-        prim.store64! first segs;
-        prim.store64! (first + word) first_budget;
-        prim.store64! (first + 2 * word) 0;
-        prim.store64! (pcb + pcb_chunks) first;
-        prim.store64! (pcb + pcb_total) (first_budget + prim.load64! (p + ctx_xc_bytes));
-        prim.store64! (pcb + pcb_hp) (first + chunk_header);
-        prim.store64! (pcb + pcb_limit) (first + first_budget);
-    };
+    // What was copied for it is old (`adopt_segments!`), and it allocates in a nursery chunk of
+    // its own.
+    let first = young_get! p first_budget;
+    prim.store64! first 0;
+    prim.store64! (first + word) first_budget;
+    prim.store64! (first + 2 * word) 0;
+    prim.store64! (pcb + pcb_chunks) first;
+    prim.store64! (pcb + pcb_old) segs;
+    prim.store64! (pcb + pcb_old_bytes) (prim.load64! (p + ctx_xc_bytes));
+    prim.store64! (pcb + pcb_total) (first_budget + prim.load64! (p + ctx_xc_bytes));
+    prim.store64! (pcb + pcb_hp) (first + chunk_header);
+    prim.store64! (pcb + pcb_limit) (first + first_budget);
     let sp = prim.load64! (pcb + pcb_sp) - 2 * word;
     prim.store64! sp (prim.info "start");
     prim.store64! (sp + word) copied;
