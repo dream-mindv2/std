@@ -1624,7 +1624,11 @@ let collect! !p !sp = {
     let deep = round_chunk! ((stack_top! pcb - sp) * 2) budget;
     let grown = if budget < max_budget { budget * 2 } else { budget };
     prim.store64! (pcb + pcb_budget) (if deep > grown { if deep > min_chunk { min_chunk } else { deep } } else { grown });
-    prim.store64! (p + ctx_gc_at) (2 * (live + pinned));
+    // The next one after three times what survived, as the VM's majors are spaced: at twice it,
+    // a heap that only grows (`maps`, a map path-copied as it is built) was copied half a byte for
+    // every byte made. Three was 17% off `tree` and a little off `maps`; four was more off `maps`
+    // and nothing off `tree`, which is where collections land against each one's live peak.
+    prim.store64! (p + ctx_gc_at) (3 * (live + pinned));
     new_chunk! p (if direct { 0 } else { live * 2 });
     if reporting {
         mark_drain! p;
@@ -3538,12 +3542,9 @@ let key_equal! !a !b = {
     else { false }
 };
 
-let popcount !x = {
-    let a = x - (prim.ushr x 1 & 1431655765);
-    let b = (a & 858993459) + (prim.ushr a 2 & 858993459);
-    let c = (b + prim.ushr b 4) & 252645135;
-    prim.ushr ((c * 16843009) & 4294967295) 24
-};
+/// The bits set in a 32-bit bitmap: one instruction where the target has it (`x86-64-v2`, and
+/// aarch64's through its vector unit), which a map pays at every level it goes down.
+let popcount !x = prim.popcount x;
 
 let branch_count! !b = untag_fix (prim.load64! (b + 2 * word));
 let branch_bitmap! !b = untag_fix (prim.load64! (b + 3 * word));
