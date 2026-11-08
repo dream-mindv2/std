@@ -138,7 +138,9 @@ let ctx_frames_floor = 816;
 let ctx_minor = 824;
 /// Freed chunks of the nursery too large for a size class, to be given out again (`young_get!`).
 let ctx_young_spare = 832;
-let ctx_size = 840;
+/// The token of the map a loop writes in place, during one of its sets (`map_assoc_owned!`).
+let ctx_token = 840;
+let ctx_size = 848;
 
 let kind_thunk = 0;
 let kind_ind = 1;
@@ -634,6 +636,8 @@ let w_young_lo = 656;
 let w_young_size = 664;
 let w_young_next = 672;
 let w_nursery_max = 680;
+/// The last token given a loop that writes a map in place (`fresh_token!`).
+let w_tokens = 688;
 
 let world_at! !field = prim.info "world" + field;
 
@@ -4032,6 +4036,119 @@ let map_assoc! !p !node !h !k !v !shift = {
 };
 
 let map_put! !p !m !k !v = map_assoc! p m (key_hash! k) k v 0;
+
+// --- maps written in place ----------------------------------------------------------------
+//
+// A loop that threads a map through itself and lets each version go once it has made the next
+// -- `go (m.[k => v]) ..` and nothing else reading `m` -- need not copy the path to every key it
+// sets: no one can see the version it would be keeping (dreams/src/aot/core.dr, "Linear
+// accumulators"). The compiler proves that much of a function and no more, and the map proves
+// the rest: a branch the loop made carries the loop's token, one word past its slots, and a set
+// writes in place only into a branch carrying the root's. Every entry into such a loop sets its
+// first key with a token never given before (`index_set_fresh!`), so a map that came from
+// anywhere else -- the caller's, or what an earlier run of the loop answered -- is copied on the
+// way down as it always was, and only what this run made is ever written. A branch without a
+// token is the ordinary layout: `n` is the slots and two, and a token is a third.
+
+/// The token of branch `b`, or 0.
+let branch_token! !b = {
+    let slots = popcount (branch_bitmap! b);
+    if untag_fix (prim.load64! (b + word)) == slots + 3 { prim.load64! (branch_slot b slots) } else { 0 };
+};
+
+/// A branch as `new_branch!`, carrying token `t` when it is one.
+let new_branch_t! !p !slots !count !bitmap !t = if t == 0 { new_branch! p slots count bitmap } else {
+    let o = alloc! p ((5 + slots) * word);
+    prim.store64! o (prim.info "map");
+    prim.store64! (o + word) (tag_fix (slots + 3));
+    prim.store64! (o + 2 * word) (tag_fix count);
+    prim.store64! (o + 3 * word) (tag_fix bitmap);
+    prim.store64! (branch_slot o slots) t;
+    o
+};
+
+/// `map_assoc!` where a branch carrying the token in `ctx_token` is the caller's to change: the
+/// slot set in it, and its count, in place. Every branch made on the way carries the token.
+let map_assoc_owned! !p !node !h !k !v !shift = {
+    let t = prim.load64! (p + ctx_token);
+    let bit = 1 << (prim.ushr h shift & 31);
+    let bitmap = branch_bitmap! node;
+    let at = popcount (bitmap & (bit - 1));
+    let slots = popcount bitmap;
+    if bitmap & bit == 0 {
+        prim.store64! (p + ctx_scratch) 1;
+        let o = new_branch_t! p (slots + 1) (branch_count! node + 1) (bitmap | bit) t;
+        copy_words! (branch_slot node 0) (branch_slot o 0) at;
+        prim.store64! (branch_slot o at) (new_leaf! p h k v nil_word);
+        copy_words! (branch_slot node at) (branch_slot o (at + 1)) (slots - at);
+        o
+    } else {
+        let child = prim.load64! (branch_slot node at);
+        let replaced =
+            if is_leaf! child {
+                if leaf_hash! child == h {
+                    if chain_find! child k != 0 {
+                        prim.store64! (p + ctx_scratch) 0;
+                        chain_replace! p child k v
+                    } else {
+                        prim.store64! (p + ctx_scratch) 1;
+                        new_leaf! p h k v child
+                    }
+                } else {
+                    prim.store64! (p + ctx_scratch) 1;
+                    split_leaves_t! p child (new_leaf! p h k v nil_word) (chain_length! child + 1) (shift + 5) t
+                }
+            } else { map_assoc_owned! p child h k v (shift + 5) };
+        let count = branch_count! node + prim.load64! (p + ctx_scratch);
+        if branch_token! node == t {
+            prim.store64! (branch_slot node at) replaced;
+            remember_value! p (branch_slot node at) replaced;
+            prim.store64! (node + 2 * word) (tag_fix count);
+            node
+        } else {
+            let o = new_branch_t! p slots count bitmap t;
+            copy_words! (branch_slot node 0) (branch_slot o 0) slots;
+            prim.store64! (branch_slot o at) replaced;
+            o
+        }
+    }
+};
+
+/// `split_leaves!`, its branches carrying `t`.
+let split_leaves_t! !p !a !b !count !shift !t = {
+    let ia = prim.ushr (leaf_hash! a) shift & 31;
+    let ib = prim.ushr (leaf_hash! b) shift & 31;
+    if ia == ib {
+        let inner = split_leaves_t! p a b count (shift + 5) t;
+        let o = new_branch_t! p 1 count (1 << ia) t;
+        prim.store64! (branch_slot o 0) inner;
+        o
+    } else {
+        let o = new_branch_t! p 2 count ((1 << ia) | (1 << ib)) t;
+        prim.store64! (branch_slot o (if ia < ib { 0 } else { 1 })) a;
+        prim.store64! (branch_slot o (if ia < ib { 1 } else { 0 })) b;
+        o
+    }
+};
+
+/// A token never given before.
+let fresh_token! () = tag_fix (prim.xadd64! (world_at! w_tokens) 1 + 1);
+
+/// `c.[k => v]` entering a loop that writes in place: the map's path copied under a new token.
+let index_set_fresh! !p !c !k !v =
+    if is_kind! c kind_map {
+        prim.store64! (p + ctx_token) (fresh_token! ());
+        map_assoc_owned! p c (key_hash! k) k v 0
+    } else { index_set! p c k v };
+
+/// `c.[k => v]` inside one: in place where the root's token says the loop made it. A root without
+/// one is fresh -- set by the ordinary path, in a suspension -- and is given one.
+let index_set_linear! !p !c !k !v =
+    if is_kind! c kind_map {
+        let t = branch_token! c;
+        prim.store64! (p + ctx_token) (if t == 0 { fresh_token! () } else { t });
+        map_assoc_owned! p c (key_hash! k) k v 0
+    } else { index_set! p c k v };
 
 let map_has! !p !m !k = as_word (is_kind! m kind_map && map_find! m (key_hash! k) k 0 != 0);
 
