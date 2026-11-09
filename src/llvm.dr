@@ -2,18 +2,26 @@
 //
 // `dreams --aot` writes LLVM IR and needs objects of it. On the VM that was the VM's own LLVM,
 // linked into it for the JIT (`vm.llvm_objects!`); a compiler built native has no VM to ask, so
-// LLVM is reached here instead, through its C API and `std.ffi`, from the shared library a
-// toolchain carries in its `lib` (`from system`, so `$DREAM_LIB_LLVM` names another). The version
-// is exact: the IR is written in LLVM 21's syntax, and an LLVM that reads it otherwise is not one
-// to compile with. This is how Rust and Julia reach theirs.
+// LLVM is reached here instead, through its C API and `std.ffi`. This is how Rust and Julia
+// reach theirs.
+//
+// Which LLVM: the toolchain's own first, `dream_llvm`, which is the VM's -- the same static
+// archives, so it reads what the VM's AOT writes -- linked as a library of just the functions
+// named here and carried in the installation's `lib` (`dream_llvm` in dream/CMakeLists.txt). Then
+// an LLVM on the system of a version the IR is written for: 21, which this repository builds
+// with, and the two before it, which the toolchain's VM has been built with. `$DREAM_LIB_LLVM` or
+// `$DREAM_LIB_DREAM_LLVM` names a file. The LLVM a part was compiled by is in its cache key
+// (`version!`), so changing it never reads an object another one made.
 //
 // One call is one module, in an LLVM context of its own, so modules compile in parallel from
 // processes of their own: a call holds the worker it runs on, as any foreign call does.
 
 import std.foreign;
+import std.os;
 import std.str;
 
-foreign llvm from system "LLVM" "21.1" {
+foreign llvm from (foreign.any_of [foreign.system "dream_llvm", foreign.system_version "LLVM" "21.1",
+                                   foreign.system_version "LLVM" "20.1", foreign.system_version "LLVM" "19.1"]) {
     init_x86_info! : :void -> :void = LLVMInitializeX86TargetInfo
     init_x86! : :void -> :void = LLVMInitializeX86Target
     init_x86_mc! : :void -> :void = LLVMInitializeX86TargetMC
@@ -83,22 +91,27 @@ let version! () = {
     str.join_str "." [to_string major, to_string minor, to_string patch]
 };
 
-/// The targets of every machine a toolchain is built for, made known to LLVM once a process: a
-/// second time is a no-op.
+/// The target of the machine this runs on made known to LLVM, once a process: a second time is a
+/// no-op. Only this machine's: `dream_llvm` carries that one alone, as the VM it is built beside
+/// does, and a symbol is looked up when it is first called, so the other's need not be there.
 let targets! : :unit -> :unit;
-let targets! () = {
-    llvm.init_x86_info! ()
-    llvm.init_x86! ()
-    llvm.init_x86_mc! ()
-    llvm.init_x86_printer! ()
-    // Inline assembly is parsed as it is written into an object, and the code reads its context
-    // from the thread with some.
-    llvm.init_x86_parser! ()
-    llvm.init_arm_info! ()
-    llvm.init_arm! ()
-    llvm.init_arm_mc! ()
-    llvm.init_arm_printer! ()
-    llvm.init_arm_parser! ()
+let targets! () = match os.arch () {
+    :aarch64 => {
+        llvm.init_arm_info! ()
+        llvm.init_arm! ()
+        llvm.init_arm_mc! ()
+        llvm.init_arm_printer! ()
+        llvm.init_arm_parser! ()
+    },
+    _ => {
+        llvm.init_x86_info! ()
+        llvm.init_x86! ()
+        llvm.init_x86_mc! ()
+        llvm.init_x86_printer! ()
+        // Inline assembly is parsed as it is written into an object, and the code reads its
+        // context from the thread with some.
+        llvm.init_x86_parser! ()
+    },
 };
 
 /// The processor the code is for: x86-64-v2 (POPCNT and SSE4.2, which every x86-64 since 2009

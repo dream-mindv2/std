@@ -313,13 +313,24 @@ let nursery_take! !bytes = {
     } else { at }
 };
 
-/// A chunk of the nursery, as `chunk_get!` is one of the old.
+/// A chunk of the nursery, as `chunk_get!` is one of the old: the last put back of its size, which
+/// is still resident, or one given back to the system (`young_trim!`), or address space never
+/// handed out before.
 let young_get! !p !size = {
     let lock = world_at! w_young_lock;
     spin_lock! lock;
     let head = young_class! size;
     let c = prim.load64! head;
-    let chunk = if c != 0 { prim.store64! head (prim.load64! c); c } else { 0 };
+    let chunk = if c != 0 {
+        prim.store64! head (prim.load64! c);
+        prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) - prim.load64! (c + word));
+        c
+    } else {
+        let cold = head + young_cold;
+        let d = prim.load64! cold;
+        if d != 0 { prim.store64! cold (prim.load64! d); };
+        d
+    };
     spin_unlock! lock;
     if chunk != 0 { chunk } else {
         let fresh_ = nursery_take! size;
@@ -334,8 +345,79 @@ let young_put! !p !c = {
     let head = young_class! (prim.load64! (c + word));
     prim.store64! c (prim.load64! head);
     prim.store64! head c;
+    prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) + prim.load64! (c + word));
     spin_unlock! lock;
     0
+};
+
+// The free chunks of the nursery stay resident up to `young_resident`, the most recently put back
+// of each size first, and after a major collection the rest give their pages back (`young_trim!`):
+// a nursery a process may grow to 256 MB was two gigabytes resident in the compiler, chunks of
+// every size freed by one process and the next. A chunk given back costs a fault for each page
+// when it is next used, so it is the coldest that go -- the end of each list, not the chunk being
+// put back, which is the next one taken: releasing that one was a fault for every page of a
+// minor collection's nursery, and a self-compile 35 s slower.
+let young_resident = 536870912;
+
+/// Where a size's chunks given back are listed, from where its resident ones are.
+let young_cold = 64 * word;
+
+/// The free chunks of the nursery past what may stay resident given back to the system, when
+/// there are more than that: cut from each size's list in order, made a list of their own, then
+/// released with no lock held -- none is on a list another process takes from while it is -- and
+/// listed as given back.
+let young_trim! !p = if prim.load64! (world_at! w_young_free) <= young_resident { 0 } else {
+    let lock = world_at! w_young_lock;
+    spin_lock! lock;
+    let cut = young_cut! 0 young_resident 0;
+    spin_unlock! lock;
+    released_chunks! cut;
+    spin_lock! lock;
+    young_cold_put! cut;
+    spin_unlock! lock;
+    0
+};
+
+/// From size class `k` on, each list kept while `room` lasts and the rest of it taken off, onto
+/// `acc`; answers what was taken, and counts it no longer resident.
+let young_cut! !k !room !acc = if k >= 64 { acc } else {
+    let head = prim.load64! (world_at! w_young_classes) + k * word;
+    let at = kept_prefix! head (prim.load64! head) room;
+    // `at` is the link the rest hangs from, and `room` what is left after the kept ones.
+    let rest = prim.load64! (prim.load64! at);
+    prim.store64! (prim.load64! at) 0;
+    let gone = chunks_bytes! rest 0;
+    prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) - gone);
+    young_cut! (k + 1) (prim.load64! (at + word)) (joined_chunks! rest acc)
+};
+
+/// The link after the kept chunks of the list at `link` and the room left, in a pair of words at
+/// the world's scratch (`w_young_scratch`), the walk's answer: two words, where a list would be
+/// an allocation, and this runs with the lock held.
+let kept_prefix! !link !c !room = {
+    let out = world_at! w_young_scratch;
+    if c == 0 || prim.load64! (c + word) > room {
+        prim.store64! out link;
+        prim.store64! (out + word) room;
+        out
+    } else { kept_prefix! c (prim.load64! c) (room - prim.load64! (c + word)) }
+};
+
+let chunks_bytes! !c !n = if c == 0 { n } else { chunks_bytes! (prim.load64! c) (n + prim.load64! (c + word)) };
+
+/// Each chunk from `c` given back, its first page -- its header -- kept.
+let released_chunks! !c = if c == 0 { 0 } else {
+    released! (c + chunk_header) (c + prim.load64! (c + word));
+    released_chunks! (prim.load64! c)
+};
+
+/// Each chunk from `c` onto the list of given-back chunks of its size.
+let young_cold_put! !c = if c == 0 { 0 } else {
+    let next = prim.load64! c;
+    let cold = young_class! (prim.load64! (c + word)) + young_cold;
+    prim.store64! c (prim.load64! cold);
+    prim.store64! cold c;
+    young_cold_put! next
 };
 
 /// The nursery's address space reserved: `DREAM_NURSERY_MB`, or 16 GB, but no more than a quarter of
@@ -355,7 +437,7 @@ let nursery_init! () = {
     let want = if want0 > room { room } else { want0 };
     let at = nursery_reserve! (if want < 268435456 { 268435456 } else { want });
     prim.store64! (world_at! w_young_next) at;
-    prim.store64! (world_at! w_young_classes) (prim.c2! "calloc" 64 word);
+    prim.store64! (world_at! w_young_classes) (prim.c2! "calloc" 128 word);
     let most = prim.c1! "getenv" "DREAM_NURSERY_MAX_MB";
     prim.store64! (world_at! w_nursery_max) (if most != 0 { prim.c1! "atol" most * 1048576 } else { nursery_max });
     0
@@ -399,7 +481,9 @@ let spare_fit! !link !c !size =
     } else { spare_fit! c (prim.load64! c) size };
 
 let spare_put! !p !c = {
-    if prim.load64! (c + word) <= 128 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
+    // Up to 64 MB: a larger spare was a gigabyte resident that the next to-space, the size of the
+    // heap, could not use, and four of them were kept.
+    if prim.load64! (c + word) <= 8 * min_chunk && spare_count! (prim.load64! (p + ctx_spare)) 0 < 4 {
         prim.store64! c (prim.load64! (p + ctx_spare));
         prim.store64! (p + ctx_spare) c;
     } else {
@@ -653,6 +737,10 @@ let w_tokens = 688;
 /// The nursery's free chunks, a list for each power of two (`young_get!`), and the lock on them.
 let w_young_classes = 704;
 let w_young_lock = 712;
+/// The bytes of free nursery chunks still resident (`young_put!`), and two words `young_trim!`
+/// answers through.
+let w_young_free = 720;
+let w_young_scratch = 728;
 /// The least the shared region grows by before a census is begun: `census_min`, or
 /// `DREAM_CENSUS_MIN_MB`.
 let w_census_min = 696;
@@ -2003,6 +2091,7 @@ let collect! !p !sp = {
             let old_now = prim.load64! (pcb + pcb_old_bytes);
             let spaced = if old_now > 1073741824 { old_now + old_now / 2 } else { 3 * old_now };
             prim.store64! (pcb + pcb_major_at) (if spaced > min_chunk { spaced } else { min_chunk });
+            young_trim! p;
         };
     } else {
         prim.store64! (p + ctx_chunks) to;
@@ -2360,7 +2449,27 @@ let filler! !at !words =
     if words <= 0 { 0 }
     else if words == 1 { prim.store64! at (prim.info "fill"); 0 }
     else if words == 2 { prim.store64! at (prim.info "fill"); prim.store64! (at + word) (prim.info "fill"); 0 }
-    else { prim.store64! at (prim.info "string"); prim.store64! (at + word) ((words - 3) * word); 0 };
+    else {
+        prim.store64! at (prim.info "string");
+        prim.store64! (at + word) ((words - 3) * word);
+        if words * word >= released_filler { released! (at + 2 * word) (at + words * word); };
+        0
+    };
+
+/// A filler this large gives its pages back. A chunk with one object pinned in it is kept whole,
+/// and a major collection's to-space is one chunk as large as the heap: the native self-compile
+/// kept gigabytes resident around a handful of pins, where the gaps were fillers no one reads
+/// past their header.
+let released_filler = 1048576;
+
+/// The whole pages from `lo` to `hi` given back to the system (`MADV_DONTNEED`): still mapped,
+/// and zero when next read, which is what a filler's bytes and a free chunk's may be.
+let released! !lo !hi = {
+    let first = (lo + 4095) & (0 - 4096);
+    let last = hi & (0 - 4096);
+    if prim.ugt last first { prim.c3! "madvise" first (last - first) 4; };
+    0
+};
 
 /// String `s`, made for `room` bytes, cut to its first `n`, what is left of it a filler.
 let string_cut! !s !room !n = {

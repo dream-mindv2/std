@@ -1782,7 +1782,7 @@ let ffi_try_files dirs files = match dirs {
 let ffi_try_in dir files = match files {
     [] => (),
     [f, ..rest] => {
-        let path = path_join dir f;
+        let path = path_join (at_home dir) f;
         let h = native.ffi_dlopen path;
         if h != 0 { [h, path] } else { ffi_try_in dir rest }
     },
@@ -1803,14 +1803,50 @@ let ffi_search name files dirs = {
         :string => { let h = native.ffi_dlopen named; if h != 0 { [h, named] } else { () } },
         _ => (),
     };
+    // Then what someone set up on purpose, as the VM looks (dream/src/ffi.cpp, "Finding a
+    // library"): `$DREAM_LIBRARY_PATH`, and each installation's `lib` -- where a toolchain
+    // carries what it ships, `libdream_llvm.so` for a native `dreams` among it.
+    let chosen = path_dirs (native.os_env "DREAM_LIBRARY_PATH") 0 (libs_of (native.os_install_dirs ()));
     match from_env {
-        () => match ffi_try_files dirs files {
-            () => concat_list ["cannot find the C library `", name, "`: looked for ", join_items files, " in ", join_items dirs, " and on the loader's path; `$", env_name, "` names it"],
+        () => match ffi_try_dirs chosen files {
+            () => match ffi_try_files dirs files {
+                () => concat_list ["cannot find the C library `", name, "`: looked for ", join_items files, " in ",
+                                   join_items (append_onto chosen dirs), " and on the loader's path; `$", env_name, "` names it"],
+                found => found,
+            },
             found => found,
         },
         found => found,
     }
 };
+
+/// The first of `files` in the first of `dirs` that has one, or `()`.
+let ffi_try_dirs dirs files = match dirs {
+    [] => (),
+    [d, ..more] => match ffi_try_in d files { () => ffi_try_dirs more files, found => found },
+};
+
+/// The directories of a `PATH`-like list from byte `from`, the empty ones left out, before `tail`.
+let path_dirs s !from tail = if type_of s != :string { tail } else {
+    let at = native.str_find_any s ":" from;
+    let piece = native.str_slice_any s from (if at < 0 { 1073741824 } else { at - from });
+    let rest = if at < 0 { tail } else { path_dirs s (at + 1) tail };
+    if piece == "" { rest } else { piece :: rest }
+};
+
+/// `dir` with a leading `~` made the home directory, as the VM reads `foreign.library_dirs`: left
+/// as it was, `~/.nix-profile/lib` was a directory no native program ever looked in.
+let at_home dir = if native.str_find_any dir "~" 0 != 0 { dir } else {
+    match native.os_env "HOME" {
+        () => dir,
+        home => native.concat2 home (native.str_slice_any dir 1 1073741824),
+    }
+};
+
+/// Each installation directory's `lib`.
+let libs_of dirs = match dirs { [] => [], [d, ..more] => path_join d "lib" :: libs_of more };
+
+let append_onto xs ys = match xs { [] => ys, [x, ..more] => x :: append_onto more ys };
 
 let ffi_open_payload which = {
     let index = match type_of which { :string => native.payload_index which, _ => which };
