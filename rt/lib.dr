@@ -12,14 +12,17 @@ import std.json;
 
 // --- rendering --------------------------------------------------------------------
 
+let quoted : :any -> :any;
 let quoted v = match type_of v {
     :string => native.concat3 "\"" (native.escape_string v) "\"",
     :char => native.concat3 "'" (show v) "'",
     _ => show v,
 };
 
+let join_items : :any -> :any;
 let join_items xs = concat_list (separated xs);
 
+let separated : :any -> :any;
 let separated xs = match xs {
     [] => [],
     [x] => [quoted x],
@@ -27,16 +30,20 @@ let separated xs = match xs {
 };
 
 /// A list, whose tail may turn out not to be a list at all.
+let show_list : :any -> :any;
 let show_list xs = native.concat3 "[" (join_items xs) "]";
 
+let pair_text : :any -> :any;
 let pair_text p = native.concat3 (quoted p.[0]) " => " (quoted p.[1]);
 
+let separated_pairs : :any -> :any;
 let separated_pairs ps = match ps {
     [] => [],
     [x] => [pair_text x],
     [x, ..rest] => pair_text x :: ", " :: separated_pairs rest,
 };
 
+let show : :any -> :any;
 let show v = {
     let t = type_of v;
     match t {
@@ -61,8 +68,10 @@ let show v = {
     }
 };
 
+let show_function : :any -> :any;
 let show_function f = native.concat3 "<fn " (native.closure_name f) ">";
 
+let show_record : :any -> :any;
 let show_record r = {
     let name = native.record_display (native.record_id r);
     match native.record_size r {
@@ -74,14 +83,17 @@ let show_record r = {
 
 // --- lengths and forcing -------------------------------------------------------------
 
+let length_from : :any -> :any -> :any;
 let length_from !xs !n = if is_cons_of xs { length_from (native.list_tail xs) (n + 1) } else { n };
 
+let length : :any -> :any;
 let length v = match type_of v {
     :list => length_from v 0,
     _ => native.size v,
 };
 
 /// All the way down.
+let deep! : :any -> :any;
 let deep! v = if settle v { v } else { v };
 
 // A value forced all the way down, which `strict!`, `lazy.settled` and `vm.share!` ask of whatever
@@ -90,17 +102,21 @@ let deep! v = if settle v { v } else { v };
 // their index. Taken apart by a pattern, every element was two thunks and an array was a list
 // first, and a native compile spent most of its time here and in collecting what that made.
 
+let settle_list : :any -> :any;
 let settle_list !xs = if is_cons_of xs {
     if settle_walk (native.list_head xs) { settle_list (native.list_tail xs) } else { false }
 } else { true };
 
+let settle_items : :any -> :any -> :any -> :any;
 let settle_items !a !i !n = if i >= n { true }
     else if settle_walk (native.match_at a i) { settle_items a (i + 1) n } else { false };
 
 /// What the runtime is asked first, and the walk that forces only if it says no -- after which the
 /// runtime is asked again, and marks what the walk forced, so the next force of it is one test.
+let settle : :any -> :bool;
 let settle !v = native.quick_settled v || (settle_walk v && native.quick_settled v);
 
+let settle_walk : :any -> :bool;
 let settle_walk !v = native.marked_settled v || match type_of v {
     :list => settle_list v,
     :array => settle_items v 0 (native.size v),
@@ -114,6 +130,7 @@ let settle_walk !v = native.marked_settled v || match type_of v {
     _ => settle_items v 0 (native.record_size v),
 };
 
+let forced : :any -> :bool;
 let forced v = { let t = type_of v; true };
 
 // --- strings and arrays from lists ----------------------------------------------------
@@ -121,54 +138,67 @@ let forced v = { let t = type_of v; true };
 // A list made an array, the spine walked through strict parameters and each element stored as the
 // cell holds it: taken apart by a pattern, each element was a thunk of reading it and so was the
 // rest, and `array.of_list`, which a compiler calls everywhere, was half of a native compile.
+let array_fill : :any -> :any -> :any -> :any;
 let array_fill !a !xs !i = if is_cons_of xs {
     array_fill (native.array_store_head a i xs) (native.list_tail xs) (i + 1)
 } else { a };
 
+let array_of_list : :any -> :any;
 let array_of_list xs = array_fill (native.array_new (length_from xs 0) ()) xs 0;
 
 /// Each element evaluated where it lies.
+let array_forced : :any -> :any -> :any -> :any;
 let array_forced a !i !n =
     if i >= n { a }
     else { array_forced (native.array_force_store a i (native.match_at a i)) (i + 1) n };
 
+let forced_array : :any -> :any;
 let forced_array xs = {
     let a = array_of_list xs;
     array_forced a 0 (native.size a)
 };
 
+let concat_list : :any -> :any;
 let concat_list xs = native.join_strings (forced_array xs);
 
+let text_array : :any -> :any -> :any -> :any;
 let text_array a !i !n =
     if i >= n { a }
     else { array_forced_text a i n };
 
+let array_forced_text : :any -> :any -> :any -> :any;
 let array_forced_text a !i !n =
     text_array (native.array_force_store a i (show (native.match_at a i))) (i + 1) n;
 
+let str_interp : :any -> :any;
 let str_interp xs = {
     let a = array_of_list xs;
     native.join_strings (text_array a 0 (native.size a))
 };
 
+let str_of_chars : :any -> :any;
 let str_of_chars cs = {
     let a = array_of_list cs;
     native.join_strings (char_texts a 0 (native.size a))
 };
 
+let char_texts : :any -> :any -> :any -> :any;
 let char_texts a !i !n =
     if i >= n { a }
     else { char_texts (native.array_force_store a i (native.char_text (native.match_at a i))) (i + 1) n };
 
+let str_of_bytes : :any -> :any;
 let str_of_bytes bs = native.string_of_bytes (forced_array bs);
 
 // --- structure ------------------------------------------------------------------------
 
+let concat_lists : :any -> :any -> :any;
 let concat_lists xs ys = match xs {
     [] => ys,
     [x, ..rest] => x :: concat_lists rest ys,
 };
 
+let lists_equal : :any -> :any -> :bool;
 let lists_equal xs ys = match [xs, ys] {
     [[], []] => true,
     [[x, ..xr], [y, ..yr]] => x == y && lists_equal xr yr,
@@ -178,6 +208,7 @@ let lists_equal xs ys = match [xs, ys] {
 // One match on one type: a match on the pair of them is a test for every row against both, and came
 // to a third of the code in a program that only says hello. The runtime asks only when the two
 // are not the same word, so of these, scalars are simply different.
+let equal : :any -> :any -> :bool;
 let equal a b = match type_of a {
     :list => type_of b == :list && lists_equal a b,
     :array => type_of b == :array && lists_equal (native.array_to_list a) (native.array_to_list b),
@@ -192,6 +223,7 @@ let equal a b = match type_of a {
     _ => native.is_record_value a && native.is_record_value b && native.record_id a == native.record_id b
          && lists_equal (native.array_to_list (native.record_fields a)) (native.array_to_list (native.record_fields b)),
 };
+let map_within : :any -> :any -> :bool;
 let map_within ps m = match ps {
     [] => true,
     [[k, v], ..rest] => match native.match_key m k {
@@ -200,8 +232,10 @@ let map_within ps m = match ps {
     },
 };
 
+let not_equal : :any -> :any -> :bool;
 let not_equal a b = not (equal a b);
 
+let compare_lists : :any -> :any -> :any;
 let compare_lists xs ys = match [xs, ys] {
     [[], []] => 0,
     [[], _] => -1,
@@ -212,6 +246,7 @@ let compare_lists xs ys = match [xs, ys] {
     },
 };
 
+let compare_values : :any -> :any -> :any;
 let compare_values a b = match native.flat_compare a b {
     3 => match type_of a {
         :list => compare_lists a b,
@@ -233,30 +268,36 @@ let compare_values a b = match native.flat_compare a b {
 
 // --- positions in a list ---------------------------------------------------------------
 
+let list_at : :any -> :any -> :any -> :any -> :any;
 let list_at xs i !walked fallback = match xs {
     [] => fallback walked,
     [x, ..rest] => if i == walked { x } else { list_at rest i (walked + 1) fallback },
 };
 
+let index_of_list : :any -> :any -> :any;
 let index_of_list xs i = {
     let off_the_end = fn walked -> lib_raise (native.past_end_error i walked);
     if type_of i != :integer || i < 0 { off_the_end 0 }
     else { list_at xs i 0 off_the_end }
 };
 
+let index_of_list_else : :any -> :any -> :any -> :any;
 let index_of_list_else xs i fallback =
     if type_of i != :integer || i < 0 { fallback }
     else { list_at xs i 0 (fn _ -> fallback) };
 
 /// The cells in front of the position are walked now, as a `set` does, so that one
 /// past the end raises where it was written and not when the list is next read.
+let list_set_from : :any -> :any -> :any -> :any -> :any -> :any;
 let list_set_from xs i v !walked before = match xs {
     [] => lib_raise (native.past_end_error i walked),
     [x, ..rest] => if i == walked { rev_onto before (v :: rest) } else { list_set_from rest i v (walked + 1) (x :: before) },
 };
 
+let list_set : :any -> :any -> :any -> :any;
 let list_set xs i v = list_set_from xs i v 0 [];
 
+let lib_raise : :any -> :any;
 let lib_raise e = native.raise_value e;
 
 // --- sorting, by keys --------------------------------------------------------------------
@@ -264,8 +305,10 @@ let lib_raise e = native.raise_value e;
 // Merging builds its answer backward and turns it round, rather than as a lazy list: a sort forces
 // everything it sorts, and a suspension per element per level is what it would otherwise leave for
 // the collector to copy.
+let merge_pairs : :any -> :any -> :any;
 let merge_pairs xs ys = merge_pairs_onto xs ys [];
 
+let merge_pairs_onto : :any -> :any -> :any -> :any;
 let merge_pairs_onto xs ys !acc = match xs {
     [] => rev_onto acc ys,
     [[kx, _] as x, ..xr] => match ys {
@@ -274,15 +317,18 @@ let merge_pairs_onto xs ys !acc = match xs {
     },
 };
 
+let split_at : :any -> :any -> :any -> :any;
 let split_at xs !n acc = if n == 0 { [native.array_to_list (array_of_list (rev_onto acc [])), xs] } else {
     match xs { [x, ..rest] => split_at rest (n - 1) (x :: acc), [] => [rev_onto acc [], []] }
 };
 
+let rev_onto : :any -> :any -> :any;
 let rev_onto xs ys = match xs {
     [] => ys,
     [x, ..rest] => rev_onto rest (x :: ys),
 };
 
+let merge_sort : :any -> :any -> :any;
 let merge_sort xs !n =
     if n < 2 { xs }
     else {
@@ -291,11 +337,13 @@ let merge_sort xs !n =
         merge_pairs (merge_sort left half) (merge_sort right (n - half))
     };
 
+let pair_up : :any -> :any -> :any;
 let pair_up ks vs = match [ks, vs] {
     [[k, ..kr], [v, ..vr]] => [k, v] :: pair_up kr vr,
     _ => [],
 };
 
+let seconds : :any -> :any;
 let seconds ps = match ps {
     [] => [],
     [p, ..rest] => p.[1] :: seconds rest,
@@ -303,6 +351,7 @@ let seconds ps = match ps {
 
 /// Keys that are all small integers or all strings are sorted by the runtime, which needs no
 /// suspension or list cell to do it; anything else is compared here, as only here can it be.
+let sort_keyed : :any -> :any -> :any;
 let sort_keyed keys items = match native.sort_prim (forced_array keys) items {
     () => {
         let vs = native.array_to_list items;
@@ -311,36 +360,50 @@ let sort_keyed keys items = match native.sort_prim (forced_array keys) items {
     sorted => sorted,
 };
 
+let type_assert : :any -> :any -> :any -> :any;
 let type_assert ok why v = if ok { v } else { lib_raise (native.error_new :type_error why) };
 
+let match_fail : :any -> :any -> :any -> :any -> :any;
 let match_fail v path line col = lib_raise (native.error_new :match_error [v, path, line, col]);
 
+let error_trace! : :any -> :any;
 let error_trace! e = native.error_where e;
 
+let json_encode : :any -> :any;
 let json_encode v = json.encode_value v;
 
+let raise_any! : :any -> :any;
 let raise_any! v = native.raise_or_wrap v;
 
+let cons_of : :any -> :any -> :any;
 let cons_of x xs = x :: xs;
 
 // What a pattern is compiled to, as functions: the compiler writes each of these in place where
 // it is called, and a program that runs images (dre) holds them as values.
+let is_cons_of : :any -> :bool;
 let is_cons_of v = match v { _ :: _ => true, _ => false };
+let is_empty_of : :any -> :bool;
 let is_empty_of v = match v { [] => true, _ => false };
+let head_of : :any -> :any;
 let head_of v = match v { x :: _ => x, _ => lib_raise (native.error_new :type_error "match_head needs a list cell") };
+let tail_of : :any -> :any;
 let tail_of v = match v { _ :: rest => rest, _ => lib_raise (native.error_new :type_error "match_tail needs a list cell") };
 
+let send_value! : :any -> :any -> :any;
 let send_value! pid message = if settle message { native.send_forced pid message } else { () };
 
+let kill_value! : :any -> :any -> :any;
 let kill_value! pid reason = if settle reason { native.kill_forced pid reason } else { () };
 
 /// The run is over: what failed unjoined is said, and is the exit status.
+let finish! : :any -> :any;
 let finish! u = {
     let failures = native.unjoined_failures ();
     report_failures! failures;
     native.exit (match failures { [] => 0, _ => 1 })
 };
 
+let report_failures! : :any -> :any;
 let report_failures! es = match es {
     [] => (),
     [e, ..rest] => {
@@ -351,8 +414,10 @@ let report_failures! es = match es {
 
 // --- files and directories, in terms of what the runtime has ---------------------------
 
+let merge_strings : :any -> :any -> :any;
 let merge_strings xs ys = merge_strings_onto xs ys [];
 
+let merge_strings_onto : :any -> :any -> :any -> :any;
 let merge_strings_onto xs ys !acc = match xs {
     [] => rev_onto acc ys,
     [x, ..xr] => match ys {
@@ -361,6 +426,7 @@ let merge_strings_onto xs ys !acc = match xs {
     },
 };
 
+let sort_strings : :any -> :any -> :any;
 let sort_strings xs !n =
     if n < 2 { xs }
     else {
@@ -369,13 +435,16 @@ let sort_strings xs !n =
         merge_strings (sort_strings left half) (sort_strings right (n - half))
     };
 
+let list_dir! : :any -> :any;
 let list_dir! path = {
     let names = native.dir_list path;
     deep! (sort_strings names (length_from names 0))
 };
 
+let path_join : :any -> :any -> :any;
 let path_join a b = native.concat3 a "/" b;
 
+let remove_all! : :any -> :any;
 let remove_all! path = match native.io_lstat path {
     () => 0,
     [_, _, kind] => if kind == :dir {
@@ -392,6 +461,7 @@ let remove_all! path = match native.io_lstat path {
     },
 };
 
+let mkdir_all! : :any -> :any;
 let mkdir_all! path = {
     let parent = parent_of path;
     if native.io_is_dir path { () }
@@ -401,12 +471,14 @@ let mkdir_all! path = {
     }
 };
 
+let parent_of : :any -> :any;
 let parent_of path = {
     let i = native.str_rfind path "/" (native.size path);
     if i <= 0 { "" } else { native.str_slice_any path 0 i }
 };
 
 /// Every regular file under a directory, sorted, each as a path from that directory.
+let walk! : :any -> :any;
 let walk! root = {
     let rec under! dir prefix acc = {
         let rec go! names acc1 = match names {
@@ -431,6 +503,7 @@ let walk! root = {
 
 // --- running a program ---------------------------------------------------------------------
 
+let read_all! : :any -> :any -> :any;
 let read_all! h acc = {
     let chunk = native.io_read_m h 65536;
     if native.size chunk == 0 { concat_list (rev_onto acc []) }
@@ -438,6 +511,7 @@ let read_all! h acc = {
 };
 
 /// Wait for a child, killing it past `deadline` (0 for none); `[code, timed_out]`.
+let wait_child! : :any -> :any -> :any -> :any;
 let wait_child! pid deadline killed = match native.child_wait_m pid (if killed { 0 } else { deadline }) {
     () => {
         native.child_kill pid;
@@ -446,6 +520,7 @@ let wait_child! pid deadline killed = match native.child_wait_m pid (if killed {
     code => [code, killed],
 };
 
+let exec_full! : :any -> :any -> :any -> :any -> :any -> :any -> %{:code => :any, :out => :any, :err => :any, :timed_out => :any};
 let exec_full! dir env program args ms joined = {
     // Forced here: a native looks pure to the compiler, so this could be a suspension, and the
     // processes below are each given a copy of what they read, which would start the child again.
@@ -465,9 +540,13 @@ let exec_full! dir env program args ms joined = {
     %{:code => code, :out => got, :err => got_err, :timed_out => timed_out}
 };
 
+let exec! : :any -> :any -> :any;
 let exec! program args = exec_full! () [] program args 0 false;
+let exec_for! : :any -> :any -> :any -> :any;
 let exec_for! program args ms = exec_full! () [] program args ms false;
+let exec_in! : :any -> :any -> :any -> :any -> :any;
 let exec_in! dir program args ms = exec_full! dir [] program args ms false;
+let valid_env : :any -> :any;
 let valid_env env = match env {
     [] => true,
     [kv, ..rest] => {
@@ -477,17 +556,21 @@ let valid_env env = match env {
     },
 };
 
+let exec_with! : :any -> :any -> :any -> :any -> :any -> :any;
 let exec_with! dir env program args ms = if valid_env env { exec_full! dir env program args ms false } else { () };
+let exec_joined! : :any -> :any -> :any -> :any -> :any -> :any;
 let exec_joined! dir env program args ms = if valid_env env { exec_full! dir env program args ms true } else { () };
 
 /// `vm.share!`: a value forced all the way down and moved where every process can read it,
 /// so that handing it to one copies a pointer. It is promoted into the shared region and kept
 /// a root of the census for the rest of the run, as the VM's shared area keeps what it is given.
+let share! : :any -> :any;
 let share! v = if native.quick_shareable v || (share_check v && native.quick_shareable v) { native.keep_forever v } else { v };
 
 /// Forced, as the VM forces what it shares. A function is shared as it is, as the VM shares
 /// one: what it captured was a value when it was made, or the program that made it is the
 /// one that knows (dre's compiled program is made so).
+let share_check : :any -> :bool;
 let share_check !v = native.marked_shareable v || match type_of v {
     :pure_fn => shareable_function v,
     :impure_fn => shareable_function v,
@@ -500,49 +583,63 @@ let share_check !v = native.marked_shareable v || match type_of v {
     _ => share_items v 0 (native.record_size v),
 };
 
+let shareable_function : :any -> :any;
 let shareable_function f = if native.captures_settled f { true }
     else { lib_raise (native.error_new :type_error "cannot share a thunk: force it first") };
 
 /// As `settle` walks, for the same reason. A map is walked as the parts of it not already
 /// marked shareable (`unshared_parts`), and a marked cell ends a spine.
+let share_list : :any -> :any;
 let share_list !xs = if native.marked_shareable xs { true } else if is_cons_of xs {
     if share_check (native.list_head xs) { share_list (native.list_tail xs) } else { false }
 } else { true };
 
+let share_items : :any -> :any -> :any -> :any;
 let share_items !a !i !n = if i >= n { true }
     else if share_check (native.match_at a i) { share_items a (i + 1) n } else { false };
 
 // --- trunks: what looks at elements ---------------------------------------------------------
 
+let trunk_of : :any -> :any;
 let trunk_of xs = trunk_fill xs (native.trunk_empty ());
+let trunk_fill : :any -> :any -> :any;
 let trunk_fill xs t = match xs {
     [] => t,
     [x, ..rest] => trunk_fill rest (native.trunk_push x t),
 };
 
+let trunk_concat : :any -> :any -> :any;
 let trunk_concat a b = trunk_fill (native.trunk_to_list b) a;
 
+let trunk_index_from : :any -> :any -> :any -> :any;
 let trunk_index_from xs x !i = match xs {
     [] => -1,
     [y, ..rest] => if y == x { i } else { trunk_index_from rest x (i + 1) },
 };
 
+let trunk_index_of : :any -> :any -> :any;
 let trunk_index_of x t = trunk_index_from (native.trunk_to_list t) x 0;
+let trunk_contains : :any -> :any -> :bool;
 let trunk_contains x t = trunk_index_of x t >= 0;
 
+let trunk_count_from : :any -> :any -> :any -> :any;
 let trunk_count_from xs x !n = match xs {
     [] => n,
     [y, ..rest] => trunk_count_from rest x (if y == x { n + 1 } else { n }),
 };
+let trunk_count : :any -> :any -> :any;
 let trunk_count x t = trunk_count_from (native.trunk_to_list t) x 0;
 
 /// An association trunk's `[key, value]` pairs: the position of the first with this key.
+let trunk_lookup_from : :any -> :any -> :any -> :any;
 let trunk_lookup_from xs key !i = match xs {
     [] => -1,
     [p, ..rest] => if p.[0] == key { i } else { trunk_lookup_from rest key (i + 1) },
 };
+let trunk_lookup : :any -> :any -> :any;
 let trunk_lookup key t = trunk_lookup_from (native.trunk_to_list t) key 0;
 
+let trunk_put : :any -> :any -> :any -> :any;
 let trunk_put key v t = {
     let at = trunk_lookup key t;
     if at >= 0 { native.trunk_set at [key, v] t } else { native.trunk_push [key, v] t }
@@ -553,16 +650,22 @@ let trunk_put key v t = {
 // RFC 8032, in the plainest arithmetic: integers and the extended twisted Edwards formulas.
 // Dream's integers are exact, so nothing here is more than the RFC's own reference code.
 
+let ed_p : :any;
 let ed_p = native.pow 2 255 - 19;
+let ed_l : :any;
 let ed_l = native.pow 2 252 + 27742317777372353535851937790883648493;
+let ed_d : :any;
 let ed_d = mod_p (-121665 * mod_inverse 121666);
+let ed_i : :any;
 let ed_i = pow_mod 2 ((ed_p - 1) / 4) ed_p;
 
+let mod_p : :any -> :any;
 let mod_p !x = {
     let r = x % ed_p;
     if r < 0 { r + ed_p } else { r }
 };
 
+let pow_mod : :any -> :any -> :any -> :any;
 let pow_mod !b !e !m =
     if e == 0 { 1 }
     else {
@@ -570,8 +673,10 @@ let pow_mod !b !e !m =
         if e % 2 == 1 { half * b % m } else { half }
     };
 
+let mod_inverse : :any -> :any;
 let mod_inverse x = pow_mod (mod_p x) (ed_p - 2) ed_p;
 
+let ed_recover : :any -> :any -> :any;
 let ed_recover y sign = {
     let xx = mod_p ((y * y - 1) * mod_inverse (ed_d * y * y + 1));
     if xx == 0 && sign != 0 { () }
@@ -584,12 +689,14 @@ let ed_recover y sign = {
     }
 };
 
+let ed_base : [:any, :any, :integer, :any];
 let ed_base = {
     let y = mod_p (4 * mod_inverse 5);
     let x = ed_recover y 0;
     [x, y, 1, mod_p (x * y)]
 };
 
+let ed_add : :any -> :any -> :any;
 let ed_add a b = {
     let [x1, y1, z1, t1] = a;
     let [x2, y2, z2, t2] = b;
@@ -605,11 +712,13 @@ let ed_add a b = {
 };
 
 /// Each coordinate computed now, so that a long multiplication is not a long chain.
+let forced_point : :any -> :any;
 let forced_point q = {
     let [a, b, c, d] = q;
     if a + b + c + d >= 0 { q } else { q }
 };
 
+let ed_mul : :any -> :any -> :any;
 let ed_mul !s q = {
     let rec go !k base acc = if k == 0 { acc } else {
         let next = if k % 2 == 1 { ed_add acc base } else { acc };
@@ -618,6 +727,7 @@ let ed_mul !s q = {
     go s q [0, 1, 1, 0]
 };
 
+let ed_encode : :any -> :any;
 let ed_encode q = {
     let [x, y, z, _] = q;
     let zi = mod_inverse z;
@@ -626,10 +736,12 @@ let ed_encode q = {
     le_bytes (yy + (if xx % 2 == 1 { native.pow 2 255 } else { 0 })) 32
 };
 
+let le_bytes : :any -> :any -> :any;
 let le_bytes !v !n = if n == 0 { "" } else {
     native.concat2 (native.string_of_bytes (forced_array [v % 256])) (le_bytes (v / 256) (n - 1))
 };
 
+let ed_decode : :any -> :any;
 let ed_decode s = {
     let raw = native.le_int s;
     let sign = (raw / native.pow 2 255) % 2;
@@ -643,6 +755,7 @@ let ed_decode s = {
     }
 };
 
+let ed_secret : :any -> [:any, :any];
 let ed_secret seed = {
     let h = native.crypto_sha512 seed;
     let low = native.le_int (native.str_slice_any h 0 32);
@@ -650,15 +763,18 @@ let ed_secret seed = {
     [clamped, native.str_slice_any h 32 32]
 };
 
+let need_seed : :any -> :any -> :any;
 let need_seed seed what = if type_of seed != :string || native.size seed != 32 {
     lib_raise (native.error_new :type_error what)
 } else { true };
 
+let ed25519_public : :any -> :any;
 let ed25519_public seed = if need_seed seed "ed25519_public needs a 32-byte seed" {
     let [a, _] = ed_secret seed;
     ed_encode (ed_mul a ed_base)
 } else { "" };
 
+let ed25519_sign : :any -> :any -> :any;
 let ed25519_sign seed message = if need_seed seed "ed25519_sign needs a 32-byte seed" {
     let [a, prefix] = ed_secret seed;
     let public = ed_encode (ed_mul a ed_base);
@@ -668,6 +784,7 @@ let ed25519_sign seed message = if need_seed seed "ed25519_sign needs a 32-byte 
     native.concat2 big_r (le_bytes ((r + h * a) % ed_l) 32)
 } else { "" };
 
+let ed25519_verify : :any -> :any -> :any -> :any;
 let ed25519_verify key message signature =
     if type_of key != :string || type_of message != :string || type_of signature != :string {
         lib_raise (native.error_new :type_error "ed25519_verify needs a key, a message and a signature, all strings")
@@ -688,17 +805,20 @@ let ed25519_verify key message signature =
 
 /// What a person reads of an uncaught error. A function and the value it made, side by
 /// side, are one place, and a run of the standard library is one line.
+let error_text : :any -> :any;
 let error_text e = match type_of e {
     :error => concat_list [describe_error e, trace_lines (kept_places (native.error_where e) ()) true],
     _ => show e,
 };
 
+let describe_error : :any -> :any;
 let describe_error e = match [native.error_kind e, native.error_payload e] {
     [:match_error, [value, path, line, col]] =>
         concat_list [path, ":", show line, ":", show col, ": no pattern fits ", show value],
     _ => show e,
 };
 
+let kept_places : :any -> :any -> :any;
 let kept_places places last = match places {
     [] => [],
     [at, ..rest] => {
@@ -707,15 +827,19 @@ let kept_places places last = match places {
     },
 };
 
+let in_std : :any -> :bool;
 let in_std at = native.str_find_any at.[2] "std/" 0 == 0;
 
+let std_run : :any -> :any;
 let std_run places = match places {
     [at, ..rest] => if in_std at { 1 + std_run rest } else { 0 },
     [] => 0,
 };
 
+let drop_some : :any -> :any -> :any;
 let drop_some xs !n = if n == 0 { xs } else { match xs { [_, ..rest] => drop_some rest (n - 1), [] => [] } };
 
+let trace_lines : :any -> :any -> :any;
 let trace_lines places first = match places {
     [] => "",
     [at, ..rest] => {
@@ -732,6 +856,7 @@ let trace_lines places first = match places {
 };
 
 /// An error nothing caught ends the program, saying what it was.
+let uncaught! : :any -> :any;
 let uncaught! e = {
     native.write_err (native.concat3 "dream: uncaught error: " (error_text e) "\n");
     native.exit 1
@@ -739,30 +864,37 @@ let uncaught! e = {
 
 // The compiler's own reasons to keep each root: it names them, and a program must
 // have an entry to compile at all.
+let main! : :unit -> :integer;
 let main! () = 0;
 
 // --- tensors: everything but the loops ----------------------------------------------------------
 
+let shape_error : :any -> :any;
 let shape_error why = lib_raise (native.error_new :shape_error why);
+let type_error : :any -> :any;
 let type_error why = lib_raise (native.error_new :type_error why);
 
 /// Shape and numbers of nested lists and arrays, read off the nesting; every row must match.
+let as_items : :any -> :any;
 let as_items v = match type_of v {
     :list => v,
     :array => native.array_to_list v,
     _ => (),
 };
 
+let nest_shape : :any -> :any;
 let nest_shape v = match as_items v {
     () => [],
     [] => shape_error "a tensor cannot be empty",
     items => length_from items 0 :: nest_shape items.[0],
 };
 
+let check_number : :any -> :any;
 let check_number w = if native.is_number_value w { w } else {
     type_error (native.concat2 "a tensor holds numbers, not " (native.describe_value w))
 };
 
+let flat_onto : :any -> :any -> :any -> :any;
 let flat_onto v shape acc = match shape {
     [] => check_number v :: acc,
     [n, ..rest] => {
@@ -773,11 +905,13 @@ let flat_onto v shape acc = match shape {
     },
 };
 
+let flat_items : :any -> :any -> :any -> :any;
 let flat_items items rest acc = match items {
     [] => acc,
     [x, ..more] => flat_items more rest (flat_onto x rest acc),
 };
 
+let as_tensor : :any -> :any;
 let as_tensor v = if native.is_tensor_value v { v } else {
     match type_of v {
         :list => tensor_from v,
@@ -786,11 +920,13 @@ let as_tensor v = if native.is_tensor_value v { v } else {
     }
 };
 
+let tensor_from : :any -> :any;
 let tensor_from v = {
     let shape = nest_shape v;
     native.tensor_of_flat (forced_array shape) (forced_array (rev_onto (flat_onto v shape []) []))
 };
 
+let read_shape : :any -> :any;
 let read_shape v = match as_items v {
     () => type_error (native.concat2 "a shape is a list of integers, not " (native.describe_value v)),
     items => {
@@ -801,6 +937,7 @@ let read_shape v = match as_items v {
     },
 };
 
+let check_dims : :any -> :any;
 let check_dims items = match items {
     [] => true,
     [d, ..rest] => if type_of d != :integer || d < 0 {
@@ -808,11 +945,13 @@ let check_dims items = match items {
     } else { check_dims rest },
 };
 
+let tensor_to_list : :any -> :any;
 let tensor_to_list v = {
     let t = as_tensor v;
     nest_rows (native.tensor_flat t) (native.tensor_shape t)
 };
 
+let take_n : :any -> :any -> [[:never], :any] | [:any, :any] | [[:never], [:never]];
 let take_n xs !n = if n == 0 { [[], xs] } else {
     match xs {
         [x, ..rest] => {
@@ -823,6 +962,7 @@ let take_n xs !n = if n == 0 { [[], xs] } else {
     }
 };
 
+let nest_rows : :any -> :any -> :any;
 let nest_rows flat shape = match shape {
     [_] => flat,
     [n, ..rest] => {
@@ -835,11 +975,13 @@ let nest_rows flat shape = match shape {
     },
 };
 
+let list_product : :any -> :any;
 let list_product xs = match xs {
     [] => 1,
     [x, ..rest] => x * list_product rest,
 };
 
+let rendered_axis : :any -> :any -> :any;
 let rendered_axis flat shape = match shape {
     [_] => join_items flat,
     [n, ..rest] => {
@@ -853,6 +995,7 @@ let rendered_axis flat shape = match shape {
     },
 };
 
+let show_tensor : :any -> :any;
 let show_tensor t = {
     let shape = native.tensor_shape t;
     if native.tensor_size t > 1000 {
@@ -862,25 +1005,40 @@ let show_tensor t = {
     }
 };
 
+let t_zeros : :any -> :any;
 let t_zeros s = native.tensor_fill (read_shape s) 0;
+let t_ones : :any -> :any;
 let t_ones s = native.tensor_fill (read_shape s) 1;
+let t_fill : :any -> :any -> :any;
 let t_fill s x = if native.is_number_value x { native.tensor_fill (read_shape s) x }
     else { type_error (native.concat2 "`fill` fills with a number, not " (native.describe_value x)) };
+let t_identity : :any -> :any;
 let t_identity n = native.tensor_identity (forced_array [n, n]);
+let t_range : :any -> :any;
 let t_range n = native.tensor_range (forced_array [n]);
+let seed_check : :any -> :any -> :any;
 let seed_check seed what = if type_of seed != :integer {
     type_error (concat_list ["`", what, "` takes an integer seed, not ", native.describe_value seed])
 } else { true };
+let t_random : :any -> :any -> :any;
 let t_random seed s = if seed_check seed "random" { native.tensor_random seed (read_shape s) } else { () };
+let t_normal : :any -> :any -> :any;
 let t_normal seed s = if seed_check seed "normal" { native.tensor_normal seed (read_shape s) } else { () };
+let t_random_like : :any -> :any -> :any;
 let t_random_like seed t = if type_of seed != :integer { type_error "`random_like` takes an integer seed" }
     else { native.tensor_random_like seed (as_tensor t) };
+let t_shape : :any -> :any;
 let t_shape t = native.tensor_shape (as_tensor t);
+let t_rank : :any -> :any;
 let t_rank t = native.tensor_rank (as_tensor t);
+let t_size : :any -> :any;
 let t_size t = native.tensor_size (as_tensor t);
+let t_device : :any -> :host;
 let t_device t = if native.is_tensor_value (as_tensor t) { :host } else { :host };
+let t_dtype : :any -> :f64;
 let t_dtype t = if native.is_tensor_value (as_tensor t) { :f64 } else { :f64 };
 
+let t_reshape : :any -> :any -> :any;
 let t_reshape s v = {
     let t = as_tensor v;
     let shape = read_shape s;
@@ -890,8 +1048,10 @@ let t_reshape s v = {
     } else { native.tensor_reshape shape t }
 };
 
+let show_shape : :any -> :any;
 let show_shape xs = native.concat3 "[" (join_items xs) "]";
 
+let t_transpose : :any -> :any;
 let t_transpose v = {
     let t = as_tensor v;
     if native.tensor_rank t > 2 {
@@ -899,6 +1059,7 @@ let t_transpose v = {
     } else { native.tensor_transpose t }
 };
 
+let at_offset : :any -> :any -> :any -> :any -> :any;
 let at_offset items shape !offset !axis = match [items, shape] {
     [[], []] => offset,
     [[i, ..more], [d, ..rest]] =>
@@ -908,6 +1069,7 @@ let at_offset items shape !offset !axis = match [items, shape] {
     _ => 0,
 };
 
+let t_at : :any -> :any -> :any;
 let t_at v indices = {
     let t = as_tensor v;
     match as_items indices {
@@ -921,6 +1083,7 @@ let t_at v indices = {
     }
 };
 
+let t_matmul : :any -> :any -> :any;
 let t_matmul x y = {
     let a = as_tensor x;
     let b = as_tensor y;
@@ -944,6 +1107,7 @@ let t_matmul x y = {
     }
 };
 
+let mismatch : :any -> :any -> :any;
 let mismatch a b = {
     let sa = native.tensor_shape a;
     let sb = native.tensor_shape b;
@@ -953,8 +1117,10 @@ let mismatch a b = {
                               " (shapes ", native.shape_text a, " and ", native.shape_text b, ")"])
 };
 
+let list_last : :any -> :any;
 let list_last xs = match xs { [x] => x, [_, ..rest] => list_last rest };
 
+let t_dot : :any -> :any -> :any;
 let t_dot x y = {
     let a = as_tensor x;
     let b = as_tensor y;
@@ -963,6 +1129,7 @@ let t_dot x y = {
     } else { t_matmul a b }
 };
 
+let t_outer : :any -> :any -> :any;
 let t_outer x y = {
     let a = as_tensor x;
     let b = as_tensor y;
@@ -973,13 +1140,20 @@ let t_outer x y = {
     }
 };
 
+let t_sum : :any -> :any;
 let t_sum v = native.tensor_sum (as_tensor v);
+let t_sum_tensor : :any -> :any;
 let t_sum_tensor v = as_tensor [t_sum v];
+let t_minimum : :any -> :any;
 let t_minimum v = native.tensor_min (as_tensor v);
+let t_maximum : :any -> :any;
 let t_maximum v = native.tensor_max (as_tensor v);
+let t_mean : :any -> :any;
 let t_mean v = native.tensor_mean (as_tensor v);
+let t_norm : :any -> :any;
 let t_norm v = native.tensor_norm (as_tensor v);
 
+let axis_call : :any -> :any -> :any -> :any -> :any;
 let axis_call op name axis v = {
     let t = as_tensor v;
     if type_of axis != :integer || axis < 0 || axis >= native.tensor_rank t {
@@ -997,49 +1171,83 @@ let axis_call op name axis v = {
     } else { native.tensor_axis op axis t }
 };
 
+let t_sum_axis : :any -> :any -> :any;
 let t_sum_axis a v = axis_call 0 "sum_axis" a v;
+let t_min_axis : :any -> :any -> :any;
 let t_min_axis a v = axis_call 1 "min_axis" a v;
+let t_max_axis : :any -> :any -> :any;
 let t_max_axis a v = axis_call 2 "max_axis" a v;
+let t_argmin_axis : :any -> :any -> :any;
 let t_argmin_axis a v = axis_call 3 "argmin_axis" a v;
+let t_argmax_axis : :any -> :any -> :any;
 let t_argmax_axis a v = axis_call 4 "argmax_axis" a v;
 
+let t_sqrt : :any -> :any;
 let t_sqrt v = native.tensor_unary 0 (as_tensor v);
+let t_exp : :any -> :any;
 let t_exp v = native.tensor_unary 1 (as_tensor v);
+let t_log : :any -> :any;
 let t_log v = native.tensor_unary 2 (as_tensor v);
+let t_abs : :any -> :any;
 let t_abs v = native.tensor_unary 3 (as_tensor v);
+let t_tanh : :any -> :any;
 let t_tanh v = native.tensor_unary 4 (as_tensor v);
+let t_sin : :any -> :any;
 let t_sin v = native.tensor_unary 5 (as_tensor v);
+let t_cos : :any -> :any;
 let t_cos v = native.tensor_unary 6 (as_tensor v);
+let t_relu : :any -> :any;
 let t_relu v = native.tensor_unary 7 (as_tensor v);
+let t_sigmoid : :any -> :any;
 let t_sigmoid v = native.tensor_unary 8 (as_tensor v);
+let t_floor : :any -> :any;
 let t_floor v = native.tensor_unary 9 (as_tensor v);
+let t_ceil : :any -> :any;
 let t_ceil v = native.tensor_unary 10 (as_tensor v);
+let t_round : :any -> :any;
 let t_round v = native.tensor_unary 11 (as_tensor v);
+let t_sign : :any -> :any;
 let t_sign v = native.tensor_unary 12 (as_tensor v);
+let t_erf : :any -> :any;
 let t_erf v = native.tensor_unary 13 (as_tensor v);
 
 /// A number stays a number, so that it broadcasts; a list becomes a tensor.
+let operand : :any -> :any;
 let operand v = if native.is_number_value v { v } else { as_tensor v };
+let binary : :any -> :any -> :any -> :any;
 let binary op a b = native.tensor_binary op (operand a) (operand b);
+let t_max : :any -> :any -> :any;
 let t_max a b = binary 5 a b;
+let t_min : :any -> :any -> :any;
 let t_min a b = binary 6 a b;
+let t_pow : :any -> :any -> :any;
 let t_pow a b = binary 7 a b;
+let t_lt : :any -> :any -> :any;
 let t_lt a b = binary 8 a b;
+let t_le : :any -> :any -> :any;
 let t_le a b = binary 9 a b;
+let t_gt : :any -> :any -> :any;
 let t_gt a b = binary 10 a b;
+let t_ge : :any -> :any -> :any;
 let t_ge a b = binary 11 a b;
+let t_eq : :any -> :any -> :any;
 let t_eq a b = binary 12 a b;
+let t_ne : :any -> :any -> :any;
 let t_ne a b = binary 13 a b;
 
+let t_fill_like : :any -> :any -> :any;
 let t_fill_like v x = if native.is_number_value x { native.tensor_fill_like (as_tensor v) x }
     else { type_error (native.concat2 "`fill_like` fills with a number, not " (native.describe_value x)) };
 
+let count_arg : :any -> :any -> :any;
 let count_arg n what = if type_of n != :integer || n < 0 {
     type_error (concat_list ["`", what, "` takes a length, not ", native.describe_value n])
 } else { n };
 
+let t_repeat : :any -> :any -> :any;
 let t_repeat n v = native.tensor_repeat (count_arg n "repeat") (as_tensor v);
 
+let t_slice : :any -> :any -> :any -> :any;
 let t_slice start count v = {
     let t = as_tensor v;
     let rows = native.tensor_len t;
@@ -1053,8 +1261,10 @@ let t_slice start count v = {
     else { native.tensor_take (forced_array (count_up start count)) t }
 };
 
+let count_up : :any -> :any -> :any;
 let count_up !from !n = if n == 0 { [] } else { from :: count_up (from + 1) (n - 1) };
 
+let row_list : :any -> :any -> :any -> :any;
 let row_list rows what limit = {
     let items = if native.is_tensor_value rows { map_to_int (native.tensor_flat rows) } else {
         match as_items rows {
@@ -1065,11 +1275,13 @@ let row_list rows what limit = {
     if check_rows items what limit { items } else { [] }
 };
 
+let map_to_int : :any -> :any;
 let map_to_int xs = match xs {
     [] => [],
     [x, ..rest] => native.to_int x :: map_to_int rest,
 };
 
+let check_rows : :any -> :any -> :any -> :any;
 let check_rows items what limit = match items {
     [] => true,
     [r, ..rest] => if type_of r != :integer || r < 0 || r >= limit {
@@ -1077,6 +1289,7 @@ let check_rows items what limit = match items {
     } else { check_rows rest what limit },
 };
 
+let t_take : :any -> :any -> :any;
 let t_take rows v = {
     let t = as_tensor v;
     match row_list rows "take" (native.tensor_len t) {
@@ -1085,8 +1298,10 @@ let t_take rows v = {
     }
 };
 
+let shape_rest : :any -> :any;
 let shape_rest t = match native.tensor_shape t { [_, ..rest] => rest };
 
+let same_tail : :any -> :any -> :any;
 let same_tail ts first = match ts {
     [] => true,
     [t, ..rest] => if shape_rest t == shape_rest first { same_tail rest first } else {
@@ -1095,11 +1310,13 @@ let same_tail ts first = match ts {
     },
 };
 
+let tensors_of : :any -> :any;
 let tensors_of xs = match xs {
     [] => [],
     [x, ..rest] => as_tensor x :: tensors_of rest,
 };
 
+let t_concat : :any -> :any;
 let t_concat ts = match as_items ts {
     () => type_error "`concat` takes a list of tensors",
     [] => shape_error "`concat` needs at least one tensor",
@@ -1109,6 +1326,7 @@ let t_concat ts = match as_items ts {
     },
 };
 
+let t_one_hot : :any -> :any -> :any;
 let t_one_hot n classes = {
     let width = count_arg n "one_hot";
     match row_list classes "one_hot" width {
@@ -1117,7 +1335,9 @@ let t_one_hot n classes = {
     }
 };
 
+let t_to_bytes : :any -> :any;
 let t_to_bytes v = native.tensor_to_bytes (as_tensor v);
+let t_of_bytes : :any -> :any -> :any;
 let t_of_bytes s b = {
     let shape = read_shape s;
     if type_of b != :string { type_error (native.concat2 "`of_bytes` reads a string of bytes, not " (native.describe_value b)) }
@@ -1129,6 +1349,7 @@ let t_of_bytes s b = {
     }
 };
 
+let t_permute : :any -> :any -> :any;
 let t_permute axes v = {
     let t = as_tensor v;
     let rank = native.tensor_rank t;
@@ -1144,16 +1365,19 @@ let t_permute axes v = {
     }
 };
 
+let axes_ok : :any -> :any -> :any -> :bool;
 let axes_ok items rank seen = match items {
     [] => true,
     [a, ..rest] => type_of a == :integer && a >= 0 && a < rank && not (list_has seen a) && axes_ok rest rank (a :: seen),
 };
 
+let list_has : :any -> :any -> :bool;
 let list_has xs x = match xs {
     [] => false,
     [y, ..rest] => y == x || list_has rest x,
 };
 
+let t_im2col : :any -> :any -> :any -> :any -> :any -> :any;
 let t_im2col kh kw stride pad v = {
     let x = as_tensor v;
     if native.tensor_rank x != 4 { shape_error (native.concat2 "`im2col` takes images `[n, h, w, c]`, not shape " (native.shape_text x)) }
@@ -1166,12 +1390,14 @@ let t_im2col kh kw stride pad v = {
     }
 };
 
+let window_size : :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let window_size what h w kh kw stride pad =
     if type_of kh != :integer || type_of kw != :integer || type_of stride != :integer || type_of pad != :integer
        || kh <= 0 || kw <= 0 || stride <= 0 || pad < 0 || h + 2 * pad < kh || w + 2 * pad < kw {
         shape_error (concat_list ["`", what, "` takes a window that fits images of height ", show h, " and width ", show w])
     } else { [(h + 2 * pad - kh) / stride + 1, (w + 2 * pad - kw) / stride + 1] };
 
+let t_col2im : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let t_col2im shape kh kw stride pad cols = {
     let c = as_tensor cols;
     let s = read_shape shape;
@@ -1190,12 +1416,19 @@ let t_col2im shape kh kw stride pad cols = {
     }
 };
 
+let no_gpu : :any -> :any;
 let no_gpu t = lib_raise (native.error_new :no_gpu "no GPU is available: a native build has no OpenCL");
+let t_gpu : :any -> :any;
 let t_gpu t = no_gpu t;
+let t_gpu64 : :any -> :any;
 let t_gpu64 t = no_gpu t;
+let t_host : :any -> :any;
 let t_host v = as_tensor v;
+let t_gpu_available : :any -> :bool;
 let t_gpu_available u = false;
+let t_gpu_name : :any -> :unit;
 let t_gpu_name u = ();
+let t_cpu_kernels : :any -> :string;
 let t_cpu_kernels u = "baseline";
 
 // --- the wire format --------------------------------------------------------------------------
@@ -1205,12 +1438,17 @@ let t_cpu_kernels u = "baseline";
 // other's messages. `wire_pack` writes the plain form, which `decode` reads either way:
 // packing is a matter of size, and a native program has no unit cache to shrink.
 
+let le_field : :any -> :any -> :any;
 let le_field v !w = native.str_le v w;
 
+let wire_tagged : :any -> :any -> :any;
 let wire_tagged tag payload = native.concat2 (le_field tag 1) payload;
+let counted : :any -> :any -> :any -> :any;
 let counted tag n rest = tag_and_count tag n :: rest;
+let tag_and_count : :any -> :any -> :any;
 let tag_and_count tag n = native.concat2 (le_field tag 1) (le_field n 4);
 
+let wire_pieces : :any -> :any -> :any;
 let wire_pieces v rest = match type_of v {
     :unit => le_field 0 1 :: rest,
     :bool => le_field (if v { 2 } else { 1 }) 1 :: rest,
@@ -1235,18 +1473,22 @@ let wire_pieces v rest = match type_of v {
     _ => wire_record v rest,
 };
 
+let wire_text : :any -> :any -> :any;
 let wire_text v rest = { let t = show v; tag_and_count 5 (native.size t) :: t :: rest };
 
+let wire_items : :any -> :any -> :any;
 let wire_items xs rest = match xs {
     [] => rest,
     [x, ..more] => wire_pieces x (wire_items more rest),
 };
 
+let wire_map_items : :any -> :any -> :any;
 let wire_map_items ps rest = match ps {
     [] => rest,
     [[k, v], ..more] => wire_pieces k (wire_pieces v (wire_map_items more rest)),
 };
 
+let wire_integer : :any -> :any -> :any;
 let wire_integer n rest =
     if n <= native.pow 2 63 - 1 && n >= 0 - native.pow 2 63 { wire_tagged 3 (le_field n 8) :: rest }
     else {
@@ -1254,8 +1496,10 @@ let wire_integer n rest =
         tag_and_count 11 w :: le_field n w :: rest
     };
 
+let big_width : :any -> :any -> :any -> :any;
 let big_width n !w half = if n < half && n >= 0 - half { w } else { big_width n (w + 1) (half * 256) };
 
+let wire_record : :any -> :any -> :any;
 let wire_record v rest = {
     let id = native.record_id v;
     let name = native.atom_name id;
@@ -1265,25 +1509,32 @@ let wire_record v rest = {
         :: wire_items (native.array_to_list (native.record_fields v)) rest
 };
 
+let wire_tensor : :any -> :any -> :any;
 let wire_tensor t rest = {
     let dims = native.tensor_shape t;
     let rec dim_pieces ds = match ds { [] => [native.tensor_to_bytes t], [d, ..more] => le_field d 4 :: dim_pieces more };
     wire_tagged 12 (le_field (native.tensor_rank t) 1) :: list_append (dim_pieces dims) rest
 };
 
+let list_append : :any -> :any -> :any;
 let list_append xs ys = concat_lists xs ys;
 
+let wire_encode : :any -> :any;
 let wire_encode v = if settle v { concat_list (wire_pieces v []) } else { "" };
+let wire_pack : :any -> :any;
 let wire_pack v = wire_encode v;
 
+let le_at : :any -> :any -> :any -> :any;
 let le_at s at !n = if n == 0 { 0 } else { le_at s (at + 1) (n - 1) * 256 + native.str_byte_any s at };
 
+let signed_at : :any -> :any -> :any -> :any;
 let signed_at s at !n = {
     let v = le_at s at n;
     if v >= native.pow 2 (8 * n - 1) { v - native.pow 2 (8 * n) } else { v }
 };
 
 /// `[value, next]`, or `()` for what is not one, as `std.wire`'s reader answers.
+let wire_read : :any -> :any -> :any;
 let wire_read s at = {
     let size = native.size s;
     let has = fn n -> at + n <= size;
@@ -1314,6 +1565,7 @@ let wire_read s at = {
     }
 };
 
+let forced_lazy_array : :any -> :any;
 let forced_lazy_array xs = array_of_list xs;
 
 // --- the packed form ----------------------------------------------------------------------
@@ -1324,17 +1576,22 @@ let forced_lazy_array xs = array_of_list xs;
 // read only that, so what the VM packed -- a compiler's unit cache, the AOT's -- it could not
 // read. The state threaded through is `[definitions, how many, atoms, how many]`.
 
+let packed_magic : :integer;
 let packed_magic = 210;
+let packed_start : [%{}, :integer, %{}, :integer];
 let packed_start = [%{}, 0, %{}, 0];
 
+let varint_at : :any -> :any -> :any -> :any -> :any;
 let varint_at s !at !shift !acc = if at >= native.size s || shift > 63 { () } else {
     let b = native.str_byte_any s at;
     let acc1 = acc + (b % 128) * native.pow 2 shift;
     if b < 128 { [acc1, at + 1] } else { varint_at s (at + 1) (shift + 7) acc1 }
 };
 
+let unzigzag : :any -> :any;
 let unzigzag n = if n % 2 == 0 { n / 2 } else { 0 - (n + 1) / 2 };
 
+let packed_atom : :any -> :any -> :any -> :any;
 let packed_atom s at st = {
     let [defs, nd, atoms, na] = st;
     match native.str_byte_any s at {
@@ -1354,8 +1611,10 @@ let packed_atom s at st = {
     }
 };
 
+let map_find : :any -> :any -> :any;
 let map_find m k = match native.match_key m k { [v] => v, _ => () };
 
+let packed_items : :any -> :any -> :any -> :any -> :any -> :any;
 let packed_items s at !n acc st = if n == 0 { [rev_onto acc [], at, st] } else {
     match packed_read s at st {
         () => (),
@@ -1363,6 +1622,7 @@ let packed_items s at !n acc st = if n == 0 { [rev_onto acc [], at, st] } else {
     }
 };
 
+let packed_counted : :any -> :any -> :any -> :any -> :any;
 let packed_counted s at st f = match varint_at s at 0 0 {
     () => (),
     [n, next] => match packed_items s next n [] st {
@@ -1371,6 +1631,7 @@ let packed_counted s at st f = match varint_at s at 0 0 {
     },
 };
 
+let packed_map : :any -> :any -> :any -> :any -> :any -> :any;
 let packed_map s at !n m st = if n == 0 { [m, at, st] } else {
     match packed_read s at st {
         () => (),
@@ -1381,6 +1642,7 @@ let packed_map s at !n m st = if n == 0 { [m, at, st] } else {
     }
 };
 
+let packed_read : :any -> :any -> :any -> :any;
 let packed_read s at st = if at >= native.size s { () } else {
     let tag = native.str_byte_any s at;
     let next = at + 1;
@@ -1445,10 +1707,12 @@ let packed_read s at st = if at >= native.size s { () } else {
     }
 };
 
+let packed_dims : :any -> :any -> :any -> :any -> :any;
 let packed_dims s at !n acc = if n == 0 { [rev_onto acc [], at] } else {
     match varint_at s at 0 0 { () => (), [d, next] => packed_dims s next (n - 1) (d :: acc) }
 };
 
+let wire_read_bytes : :any -> :any -> :any -> :any;
 let wire_read_bytes s at f =
     if at + 4 > native.size s { () } else {
         let n = le_at s at 4;
@@ -1459,6 +1723,7 @@ let wire_read_bytes s at f =
         }
     };
 
+let wire_read_items : :any -> :any -> :any -> :any -> :any;
 let wire_read_items s at !n acc = if n == 0 { [rev_onto acc [], at] } else {
     match wire_read s at {
         () => (),
@@ -1466,6 +1731,7 @@ let wire_read_items s at !n acc = if n == 0 { [rev_onto acc [], at] } else {
     }
 };
 
+let wire_read_seq : :any -> :any -> :any -> :any;
 let wire_read_seq s at f =
     if at + 4 > native.size s { () } else {
         match wire_read_items s (at + 4) (le_at s at 4) [] {
@@ -1474,6 +1740,7 @@ let wire_read_seq s at f =
         }
     };
 
+let wire_read_map : :any -> :any -> :any -> :any -> :any;
 let wire_read_map s at !n m = if n == 0 { [m, at] } else {
     match wire_read s at {
         () => (),
@@ -1484,6 +1751,7 @@ let wire_read_map s at !n m = if n == 0 { [m, at] } else {
     }
 };
 
+let wire_read_record : :any -> :any -> :any;
 let wire_read_record s at =
     if at + 4 > native.size s { () } else {
         let n = le_at s at 4;
@@ -1499,6 +1767,7 @@ let wire_read_record s at =
         }
     };
 
+let wire_read_tensor : :any -> :any -> :any;
 let wire_read_tensor s at =
     if at + 1 > native.size s { () } else {
         let rank = native.str_byte_any s at;
@@ -1512,8 +1781,10 @@ let wire_read_tensor s at =
         }
     };
 
+let wire_dims : :any -> :any -> :any -> :any;
 let wire_dims s at !n = if n == 0 { [] } else { le_at s at 4 :: wire_dims s (at + 4) (n - 1) };
 
+let wire_decode : :any -> :any;
 let wire_decode text = if type_of text != :string { lib_raise (native.error_new :type_error "wire_decode needs a string") }
     else if native.size text > 0 && native.str_byte_any text 0 == packed_magic {
         match packed_read text 1 packed_start {
@@ -1529,12 +1800,14 @@ let wire_decode text = if type_of text != :string { lib_raise (native.error_new 
 
 /// `vm.host_members`: `[name, arity]` of a module, in the order they were written, or `()`
 /// for a module there is none of.
+let host_members_in : :any -> :any -> :any;
 let host_members_in table module_ = {
     let prefix = native.concat2 module_ ".";
     let found = table_lines table 0 prefix;
     match found { [] => (), _ => found }
 };
 
+let table_lines : :any -> :any -> :any -> :any;
 let table_lines table !at prefix = {
     if at >= native.size table { [] } else {
         let nl = native.str_find_any table "\n" at;
@@ -1551,6 +1824,7 @@ let table_lines table !at prefix = {
 
 // --- tls, what a map of options is -------------------------------------------------------------
 
+let string_option : :any -> :any -> :any -> :any;
 let string_option m key what = match native.match_key m key {
     [] => (),
     [v] => match type_of v {
@@ -1560,11 +1834,13 @@ let string_option m key what = match native.match_key m key {
     },
 };
 
+let bool_option : :any -> :any -> :any -> :any -> :any;
 let bool_option m key fallback what = match native.match_key m key {
     [] => fallback,
     [v] => if type_of v == :bool { v } else { lib_raise (native.error_new :bad_argument what) },
 };
 
+let alpn_wire : :any -> :any;
 let alpn_wire xs = match xs {
     [] => "",
     [n, ..rest] => {
@@ -1574,6 +1850,7 @@ let alpn_wire xs = match xs {
     },
 };
 
+let tls_config : :any -> :any -> :any;
 let tls_config options server = {
     let m = match type_of options {
         :unit => native.map_new (),
@@ -1601,14 +1878,18 @@ let tls_config options server = {
     }
 };
 
+let tls_upgrade! : :any -> :any -> :any -> :any;
 let tls_upgrade! h options server = {
     let handle = native.tls_start h server (tls_config options server);
     native.tls_handshake_m handle
 };
 
+let tls_connect! : :any -> :any -> :any;
 let tls_connect! h options = tls_upgrade! h options false;
+let tls_accept! : :any -> :any -> :any;
 let tls_accept! h options = tls_upgrade! h options true;
 
+let tls_info! : :any -> :any;
 let tls_info! h = match native.tls_info_parts h {
     () => (),
     [version, cipher, alpn, peer] => %{:version => version, :cipher => cipher, :alpn => alpn, :peer => peer},
@@ -1622,45 +1903,67 @@ let tls_info! h = match native.tls_info_parts h {
 // and only as fast as the program was before it was rewritten. The ones that have to answer
 // do so plainly.
 
+let indexed : :any -> :any;
 let indexed v = match type_of v { :list => array_of_list v, _ => v };
+let append_rev : :any -> :any -> :any;
 let append_rev xs ys = concat_lists xs (rev_onto ys []);
+let str_append_rev : :any -> :any -> :any;
 let str_append_rev s parts = concat_list (s :: rev_onto parts []);
+let set_of : :any -> :unit;
 let set_of xs = ();
+let set_add : :any -> :any -> :any;
 let set_add s v = s;
+let set_lookup : :any -> :any -> :unit;
 let set_lookup s v = ();
+let set_refresh : :any -> :any -> :any;
 let set_refresh s xs = s;
+let tally : :any -> :unit;
 let tally xs = ();
+let tally_lookup : :any -> :any -> :any -> :unit;
 let tally_lookup t xs v = ();
+let index_new : :any -> :any -> :any -> :unit;
 let index_new xs path sorted = ();
+let index_find : :any -> :any -> :unit;
 let index_find i v = ();
+let trunk_recall : :any -> :any -> :unit;
 let trunk_recall key t = ();
 
+let list_drop : :any -> :any -> :any;
 let list_drop !n xs = if n <= 0 { xs } else {
     match xs { [] => [], [_, ..rest] => list_drop (n - 1) rest }
 };
 
+let memo_fill : :any -> :any -> :any -> :any -> :any;
 let memo_fill a f !i !n = if i >= n { a } else { memo_fill (native.array_store a i (f i)) f (i + 1) n };
+let memo_cells : :any -> :any -> :any;
 let memo_cells n f = memo_fill (native.array_new n ()) f 0 n;
 
 /// A heap, as the sorted list it stands for: `compare` on the elements, first met first.
+let sorted_values : :any -> :any;
 let sorted_values xs = {
     let n = length_from xs 0;
     seconds (merge_sort (pair_up xs xs) n)
 };
+let heap_of : :any -> :any;
 let heap_of xs = sorted_values xs;
+let heap_empty : :any -> :bool;
 let heap_empty h = match h { [] => true, _ => false };
+let heap_min : :any -> :any;
 let heap_min h = match h {
     [x, .._] => x,
     [] => lib_raise (native.error_new :type_error "head needs a non-empty list"),
 };
+let heap_pop : :any -> :any;
 let heap_pop h = match h {
     [_, ..rest] => rest,
     [] => lib_raise (native.error_new :type_error "tail needs a non-empty list"),
 };
+let heap_insert : :any -> :any -> :any;
 let heap_insert h x = match h {
     [] => [x],
     [y, ..rest] => if compare_values x y < 0 { x :: h } else { y :: heap_insert rest x },
 };
+let heap_push : :any -> :any -> :any;
 let heap_push h xs = match xs {
     [] => h,
     [x, ..rest] => heap_push (heap_insert h x) rest,
@@ -1674,8 +1977,10 @@ let heap_push h xs = match xs {
 // needs an entry from C onto a process's stack, which a native build does not have yet, and a
 // signature that asks for one is an error saying so.
 
+let ffi_fail : :any -> :any;
 let ffi_fail why = lib_raise (native.error_new :ffi_error why);
 
+let ffi_kind_of : :any -> :any;
 let ffi_kind_of name = match name {
     "void" => [0, 0, 1], "bool" => [1, 1, 1],
     "i8" => [2, 1, 1], "char" => [2, 1, 1], "i16" => [3, 2, 2], "short" => [3, 2, 2],
@@ -1689,10 +1994,12 @@ let ffi_kind_of name = match name {
     _ => (),
 };
 
+let ffi_scalar : :any -> :any;
 let ffi_scalar name = ffi_kind_of name;
 
 /// A type as `[:scalar, kind]`, `[:handle, tag]`, `[:own, tag, dtor]`, `[:borrow, tag]`,
 /// `[:take_cstr, dtor]` or `[:out, inner]`.
+let ffi_parse : :any -> :any -> :any -> :any;
 let ffi_parse v lib pos = match type_of v {
     :atom => {
         let name = native.atom_name v;
@@ -1720,6 +2027,7 @@ let ffi_parse v lib pos = match type_of v {
     _ => ffi_fail "a type is an atom such as `:i32`, or a list such as `[:own, \"db\", \"db_close\"]`",
 };
 
+let ffi_parse_callback : :any -> :any -> :any -> :any;
 let ffi_parse_callback args ret lib = {
     let kinds = ffi_callback_kinds (as_items args) lib;
     match ffi_parse ret lib :ret {
@@ -1728,6 +2036,7 @@ let ffi_parse_callback args ret lib = {
     }
 };
 
+let ffi_callback_kinds : :any -> :any -> :any;
 let ffi_callback_kinds items lib = match items {
     [] => [],
     [t, ..rest] => match ffi_parse t lib :arg {
@@ -1736,6 +2045,7 @@ let ffi_callback_kinds items lib = match items {
     },
 };
 
+let ffi_destructor : :any -> :any -> :any;
 let ffi_destructor lib name = {
     let found = native.ffi_dlsym lib name;
     if found != 0 { found } else {
@@ -1748,6 +2058,7 @@ let ffi_destructor lib name = {
 
 // --- libraries --------------------------------------------------------------------------------
 
+let ffi_open_one : :any -> :any;
 let ffi_open_one v = match type_of v {
     :unit => [native.ffi_dlopen (), "<this program>"],
     :string => {
@@ -1763,6 +2074,7 @@ let ffi_open_one v = match type_of v {
     _ => "a library is a path, `()` for this program, `[:any, choices]`, `[:search, ..]` or `[:payload, name]`",
 };
 
+let ffi_open_any : :any -> :any -> :any;
 let ffi_open_any choices why = match choices {
     [] => if why == "" { "`any` was given no libraries to choose from" } else { native.concat2 "none of the libraries could be opened:" why },
     [c, ..rest] => match ffi_open_one c {
@@ -1771,6 +2083,7 @@ let ffi_open_any choices why = match choices {
     },
 };
 
+let ffi_try_files : :any -> :any -> :any;
 let ffi_try_files dirs files = match dirs {
     [] => ffi_try_plain files,
     [d, ..more] => match ffi_try_in d files {
@@ -1779,6 +2092,7 @@ let ffi_try_files dirs files = match dirs {
     },
 };
 
+let ffi_try_in : :any -> :any -> :any;
 let ffi_try_in dir files = match files {
     [] => (),
     [f, ..rest] => {
@@ -1788,6 +2102,7 @@ let ffi_try_in dir files = match files {
     },
 };
 
+let ffi_try_plain : :any -> :any;
 let ffi_try_plain files = match files {
     [] => (),
     [f, ..rest] => {
@@ -1796,6 +2111,7 @@ let ffi_try_plain files = match files {
     },
 };
 
+let ffi_search : :any -> :any -> :any -> :any;
 let ffi_search name files dirs = {
     let env_name = native.concat2 "DREAM_LIB_" (native.str_ascii_case name true);
     let named = native.os_env env_name;
@@ -1821,12 +2137,14 @@ let ffi_search name files dirs = {
 };
 
 /// The first of `files` in the first of `dirs` that has one, or `()`.
+let ffi_try_dirs : :any -> :any -> :any;
 let ffi_try_dirs dirs files = match dirs {
     [] => (),
     [d, ..more] => match ffi_try_in d files { () => ffi_try_dirs more files, found => found },
 };
 
 /// The directories of a `PATH`-like list from byte `from`, the empty ones left out, before `tail`.
+let path_dirs : :any -> :any -> :any -> :any;
 let path_dirs s !from tail = if type_of s != :string { tail } else {
     let at = native.str_find_any s ":" from;
     let piece = native.str_slice_any s from (if at < 0 { 1073741824 } else { at - from });
@@ -1836,6 +2154,7 @@ let path_dirs s !from tail = if type_of s != :string { tail } else {
 
 /// `dir` with a leading `~` made the home directory, as the VM reads `foreign.library_dirs`: left
 /// as it was, `~/.nix-profile/lib` was a directory no native program ever looked in.
+let at_home : :any -> :any;
 let at_home dir = if native.str_find_any dir "~" 0 != 0 { dir } else {
     match native.os_env "HOME" {
         () => dir,
@@ -1844,10 +2163,13 @@ let at_home dir = if native.str_find_any dir "~" 0 != 0 { dir } else {
 };
 
 /// Each installation directory's `lib`.
+let libs_of : :any -> :any;
 let libs_of dirs = match dirs { [] => [], [d, ..more] => path_join d "lib" :: libs_of more };
 
+let append_onto : :any -> :any -> :any;
 let append_onto xs ys = match xs { [] => ys, [x, ..more] => x :: append_onto more ys };
 
+let ffi_open_payload : :any -> :any;
 let ffi_open_payload which = {
     let index = match type_of which { :string => native.payload_index which, _ => which };
     match type_of index {
@@ -1860,11 +2182,13 @@ let ffi_open_payload which = {
     }
 };
 
+let ffi_library : :any -> :any;
 let ffi_library desc = match ffi_open_one desc {
     [h, where] => [h, where],
     why => ffi_fail why,
 };
 
+let ffi_locate! : :any -> :any;
 let ffi_locate! lib = match ffi_open_one lib {
     [_, where] => Result.ok where,
     why => Result.error why,
@@ -1874,6 +2198,7 @@ let ffi_locate! lib = match ffi_open_one lib {
 //
 // `[owner, tag, pointer, destructor, size, parents]`, by id, in the runtime's table.
 
+let ffi_adopt! : :any -> :any -> :any -> :any -> :any -> [:foreign, :any, :any];
 let ffi_adopt! tag ptr dtor size parents = {
     let id = native.foreign_new_id ();
     // An array of forced fields, because the runtime reads one when the process that owns it
@@ -1885,6 +2210,7 @@ let ffi_adopt! tag ptr dtor size parents = {
     [:foreign, tag, id]
 };
 
+let ffi_entry : :any -> :any;
 let ffi_entry h = match h {
     [:foreign, tag, id] => match native.foreign_get id {
         () => concat_list ["the `", tag, "` handle ", show id, " has been released, or belongs to another process"],
@@ -1894,19 +2220,23 @@ let ffi_entry h = match h {
     _ => "expected a handle, `[:foreign, tag, id]`",
 };
 
+let ffi_live : :any -> :any;
 let ffi_live h = match ffi_entry h {
     [id, e] => [id, e],
     why => ffi_fail why,
 };
 
 /// What goes wrong marshalling an argument is said of the argument.
+let ffi_said : :any -> :any -> :any;
 let ffi_said prefix why = lib_raise (native.error_new :ffi_error (native.concat2 prefix why));
 
+let ffi_live_as : :any -> :any -> :any;
 let ffi_live_as h prefix = match ffi_entry h {
     [id, e] => [id, e],
     why => ffi_said prefix why,
 };
 
+let ffi_release_id! : :any -> :unit;
 let ffi_release_id! id = match native.foreign_get id {
     () => (),
     e => {
@@ -1917,40 +2247,49 @@ let ffi_release_id! id = match native.foreign_get id {
     },
 };
 
+let sort_strings_any : :any -> :any;
 let sort_strings_any xs = sort_strings xs (length_from xs 0);
 
+let ffi_release_all! : :any -> :any;
 let ffi_release_all! ids = match ids {
     [] => (),
     [i, ..rest] => { ffi_release_id! i; ffi_release_all! rest },
 };
 
+let ffi_release! : :any -> :any;
 let ffi_release! h = {
     let [id, _] = ffi_live_as h "release!: ";
     ffi_release_id! id
 };
 
+let ffi_alive! : :any -> :bool;
 let ffi_alive! h = match ffi_entry h {
     [_, _] => true,
     _ => false,
 };
 
 /// Oldest first, which is what a table keyed by id reads as on the VM.
+let ffi_owned! : :any -> :any;
 let ffi_owned! u = native.foreign_owned (native.current_pid_id ());
 
+let ffi_buffer! : :any -> :any;
 let ffi_buffer! n = if type_of n != :integer || n < 0 { ffi_fail "buffer! needs a size in bytes" } else {
     ffi_adopt! "buffer" (native.ffi_calloc n) (native.ffi_dlsym (native.ffi_dlopen ()) "free") n []
 };
 
+let ffi_size! : :any -> :any;
 let ffi_size! h = {
     let [_, e] = ffi_live_as h "size!: ";
     if e.[4] == 0 { () } else { e.[4] }
 };
 
+let ffi_address! : :any -> :any;
 let ffi_address! h = {
     let [_, e] = ffi_live_as h "address!: ";
     e.[2]
 };
 
+let ffi_span : :any -> :any -> :any -> :any -> :any;
 let ffi_span h off n who = {
     let [_, e] = ffi_live h;
     let size = e.[4];
@@ -1962,6 +2301,7 @@ let ffi_span h off n who = {
     else { e.[2] + off }
 };
 
+let ffi_peekable : :any -> :any;
 let ffi_peekable t = match type_of t {
     :atom => match ffi_scalar (native.atom_name t) {
         () => ffi_fail "peek! and poke! read a number or a pointer",
@@ -1970,20 +2310,24 @@ let ffi_peekable t = match type_of t {
     _ => ffi_fail "peek! and poke! read a number or a pointer",
 };
 
+let ffi_peek! : :any -> :any -> :any -> :any;
 let ffi_peek! h off t = {
     let k = ffi_peekable t;
     native.ffi_peek_at k.[0] (ffi_span h off k.[1] "peek!")
 };
 
+let ffi_poke! : :any -> :any -> :any -> :any -> :any;
 let ffi_poke! h off t v = {
     let k = ffi_peekable t;
     native.ffi_store_at k.[0] (ffi_span h off k.[1] "poke!") v
 };
 
+let ffi_read! : :any -> :any -> :any -> :any;
 let ffi_read! h off n = if type_of n != :integer || n < 0 { ffi_fail "read! needs a byte count" } else {
     native.ffi_read_bytes (ffi_span h off n "read!") n
 };
 
+let ffi_read_string! : :any -> :any -> :any;
 let ffi_read_string! h off = {
     let [_, e] = ffi_live h;
     let at = ffi_span h off 1 "read_string!";
@@ -1992,12 +2336,16 @@ let ffi_read_string! h off = {
     if stop < 0 { ffi_fail "read_string!: no NUL before the end of the buffer" } else { native.str_slice_any rest 0 stop }
 };
 
+let ffi_write! : :any -> :any -> :any -> :any;
 let ffi_write! h off s = if type_of s != :string { ffi_fail "write! needs a string" } else {
     native.ffi_write_bytes (ffi_span h off (native.size s) "write!") s
 };
 
+let ffi_sizeof : :any -> :any;
 let ffi_sizeof t = (ffi_peekable_any t).[1];
+let ffi_alignof : :any -> :any;
 let ffi_alignof t = (ffi_peekable_any t).[2];
+let ffi_peekable_any : :any -> :any;
 let ffi_peekable_any t = match type_of t {
     :atom => match ffi_scalar (native.atom_name t) {
         () => ffi_fail (concat_list ["`:", native.atom_name t, "` is not an FFI type"]),
@@ -2006,10 +2354,12 @@ let ffi_peekable_any t = match type_of t {
     _ => ffi_fail "sizeof and alignof take a scalar type",
 };
 
+let ffi_payload_index : :any -> :any;
 let ffi_payload_index name = native.payload_index name;
 
 // --- calling ------------------------------------------------------------------------------------
 
+let ffi_needed : :any -> :any;
 let ffi_needed types = match types {
     [] => 0,
     [[:out, _], ..rest] => ffi_needed rest,
@@ -2017,6 +2367,7 @@ let ffi_needed types = match types {
 };
 
 /// The word for one argument: its value and its code, and any parent handle it names.
+let ffi_marshal : :any -> :any -> :any -> :any;
 let ffi_marshal t v prefix = match t {
     [:handle, tag] => {
         let [id, e] = ffi_live_as v prefix;
@@ -2057,8 +2408,10 @@ let ffi_marshal t v prefix = match t {
 };
 
 /// An out parameter's place: a small buffer of C's, read when the call has returned.
+let ffi_out_place! : :any -> :any;
 let ffi_out_place! u = native.ffi_calloc 16;
 
+let ffi_invoke! : :any -> :any -> :any;
 let ffi_invoke! binding args = {
     let [f, name, types, ret] = binding;
     let rec fill! ts given values codes parents outs !at = match ts {
@@ -2084,12 +2437,14 @@ let ffi_invoke! binding args = {
     }
 };
 
+let ffi_raw_kind : :any -> :any;
 let ffi_raw_kind t = match t {
     [:scalar, k] => k,
     [:take_cstr, _] => 12,
     _ => 12,
 };
 
+let ffi_result! : :any -> :any -> :any -> :any;
 let ffi_result! t raw parents = match t {
     [:own, tag, dtor] => match raw { () => (), _ => ffi_adopt! tag raw dtor 0 parents },
     [:borrow, tag] => match raw { () => (), _ => ffi_adopt! tag raw 0 0 parents },
@@ -2105,6 +2460,7 @@ let ffi_result! t raw parents = match t {
     _ => raw,
 };
 
+let ffi_out_results! : :any -> :any -> :any;
 let ffi_out_results! outs parents = match outs {
     [] => [],
     [[inner, place], ..rest] => {
@@ -2116,10 +2472,12 @@ let ffi_out_results! outs parents = match outs {
 };
 
 /// A function of `n` arguments, collected one at a time: what `apply` makes of any number.
+let ffi_curried! : :any -> :any -> :any -> :any;
 let ffi_curried! binding !n got =
     if n == 0 { ffi_invoke! binding (rev_onto got []) }
     else { fn! x -> ffi_curried! binding (n - 1) (x :: got) };
 
+let ffi_bind_in! : :any -> :any -> :any -> :any -> :any -> :any;
 let ffi_bind_in! lib label symbol args ret = {
     if type_of symbol != :string || symbol == "" { ffi_fail "a foreign function needs a name" }
     else {
@@ -2136,47 +2494,64 @@ let ffi_bind_in! lib label symbol args ret = {
     }
 };
 
+let ffi_parse_all : :any -> :any -> :any;
 let ffi_parse_all args lib = match as_items args {
     () => ffi_fail "the argument types must be a list",
     items => if length_from items 0 > 16 { ffi_fail "more than 16 arguments" } else { ffi_parse_items items lib },
 };
 
+let ffi_parse_items : :any -> :any -> :any;
 let ffi_parse_items items lib = match items {
     [] => [],
     [t, ..rest] => ffi_parse t lib :arg :: ffi_parse_items rest lib,
 };
 
+let ffi_function! : :any -> :any -> :any -> :any -> :any;
 let ffi_function! lib symbol args ret = {
     let [h, where] = ffi_library lib;
     ffi_bind_in! h where symbol args ret
 };
+let ffi_pure_function! : :any -> :any -> :any -> :any -> :any;
 let ffi_pure_function! lib symbol args ret = ffi_function! lib symbol args ret;
 
+let ffi_call! : :any -> :any -> :any;
 let ffi_call! f args = match as_items args {
     () => ffi_fail "call!'s arguments must be a list",
     [] => f (),
     items => ffi_apply_all f items,
 };
+let ffi_apply_all : :any -> :any -> :any;
 let ffi_apply_all f items = match items {
     [x] => f x,
     [x, ..rest] => ffi_apply_all (f x) rest,
 };
 
 // The older interface, by number: a number here is the library's own handle.
+let ffi_open! : :any -> :any;
 let ffi_open! lib = (ffi_library lib).[0];
+let ffi_close! : :any -> :unit;
 let ffi_close! h = ();
+let ffi_bind! : :any -> :any -> :any -> :any -> :any;
 let ffi_bind! h symbol args ret = ffi_bind_in! h "the library" symbol args ret;
+let ffi_load! : :any -> :any -> :any -> :any -> :any;
 let ffi_load! lib symbol args ret = ffi_function! lib symbol args ret;
+let ffi_alloc! : :any -> :any;
 let ffi_alloc! n = native.ffi_malloc n;
+let ffi_free! : :any -> :any;
 let ffi_free! a = native.ffi_raw_free a;
+let ffi_read_cstr! : :any -> :any;
 let ffi_read_cstr! a = native.ffi_read_text a;
+let ffi_read_u8! : :any -> :any -> :any;
 let ffi_read_u8! a i = native.ffi_peek_at 6 (a + i);
+let ffi_write_u8! : :any -> :any -> :any -> :any;
 let ffi_write_u8! a i v = native.ffi_store_at 6 (a + i) v;
 
 // --- std.os, what takes lists ---------------------------------------------------------------------
 
+let os_replace! : :any -> :any -> :any;
 let os_replace! program args = native.replace_start program (forced_array args);
 
+let os_pty_spawn! : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let os_pty_spawn! program args env dir cols rows =
     if not (valid_env env) { () }
     else if type_of cols != :integer || type_of rows != :integer || cols < 1 || rows < 1 || cols > 65535 || rows > 65535 {
