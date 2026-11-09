@@ -442,8 +442,10 @@ when test {
 
     /// What this format is for: the value that comes back is the value that
     /// went in, for every kind there is.
+    let trip : :any -> :bool;
     let trip v = round_trips v;
 
+    let tests : [:any];
     let tests = [
         test.case "tensor wire bytes match the reference writer"
             $( {

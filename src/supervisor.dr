@@ -447,6 +447,7 @@ when test {
 
     /// A worker that counts what it is sent and answers on request. It fails on
     /// `:crash`, which is how the tests make a child die on purpose.
+    let counter! : :unit -> :any;
     let counter! () =
         proc.serve! 0 (fn! n m ->
             if proc.is_shutdown m { [:stop, n] }
@@ -458,9 +459,11 @@ when test {
             else { [:go, n + 1] });
 
     /// A child that never reads its mailbox, so it can only be killed.
+    let deaf! : :unit -> :any;
     let rec deaf! () = deaf! ();
 
     /// A child that ends immediately, for the restart policies.
+    let quitter! : :unit -> :atom;
     let quitter! () = :done;
 
     /// Register for reports, say so, and answer the first one.
@@ -470,6 +473,7 @@ when test {
     /// could ask and listen at once. The report comes back as this process's
     /// *value*, through `join!`, which is still the simplest channel a test
     /// can wait on.
+    let listener! : :any -> :any -> :any;
     let listener! sup parent = {
         notify! sup
         send! parent :ready
@@ -483,8 +487,10 @@ when test {
     /// reading of it are two moments, sent by two different processes, and
     /// nothing orders them, so it asks until they agree, for as long as
     /// `test.eventually!` allows.
+    let settle! : :any -> [:string] -> [:string];
     let settle! sup want = test.eventually! (fn! () -> which! sup) (fn names -> names == want) test.patience;
 
+    let tests : [:any];
     let tests = [
         test.case "a supervisor starts its children"
             $( {

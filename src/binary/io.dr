@@ -8,11 +8,13 @@ import std.list;
 import std.streams;
 
 /// Construct an I/O error result with the requested transfer context.
+priv let failure : :atom -> :integer -> :string -> binary.Answer a;
 priv let failure kind offset message = Result.error (binary.problem kind (offset * 8) message);
 
 /// Read exactly count bytes. The callback accepts a maximum count and returns
 /// up to that many bytes; empty means EOF. Chunks are joined once. Exceptions
 /// become :io_error results. A partial EOF is :truncated, with bytes read.
+let read_exact_with! : :integer -> (:integer -> :string) -> binary.Answer :string;
 let read_exact_with! count source! =
     if type_of count != :integer || count < 0 { failure :invalid_argument 0 "read size must be non-negative" }
     else {
@@ -28,6 +30,7 @@ let read_exact_with! count source! =
     };
 
 /// Read exactly `count` bytes using `source!`, then decode them with `codec`.
+let read_with! : :map -> :integer -> (:integer -> :string) -> binary.Answer :any;
 let read_with! codec count source! = match read_exact_with! count source! {
     Result.error(e) => err e,
     Result.ok(data) => binary.decode codec data,
@@ -36,6 +39,7 @@ let read_with! codec count source! = match read_exact_with! count source! {
 /// Encode completely before doing IO; an invalid value writes no bytes.
 /// Short writes are handled by std.streams. IO failure may have written a
 /// prefix: the caller owns recovery and must not blindly retry the message.
+let write_with! : :map -> :any -> (:string -> :integer) -> binary.Answer :unit;
 let write_with! codec value sink! = match binary.encode codec value {
     Result.error(e) => err e,
     Result.ok(data) => try! {
@@ -45,6 +49,8 @@ let write_with! codec value sink! = match binary.encode codec value {
 };
 
 /// Read exactly `count` bytes from a handle and decode them with `codec`.
+let read! : :map -> :integer -> :any -> binary.Answer :any;
 let read! codec count handle = read_with! codec count (io.read! handle);
 /// Encode a value with `codec` and write all its bytes to a handle.
+let write! : :map -> :any -> :any -> binary.Answer :unit;
 let write! codec value handle = write_with! codec value (io.write! handle);

@@ -235,11 +235,16 @@ macro tap value observer = {
 when test {
     import std.test;
 
+    let mark! : :any -> :any -> :any;
     let mark! tag value = { send! (self! ()) tag; value };
+    let observe! : :any -> :any;
     let observe! value = send! (self! ()) [:observed, value];
+    let add : :integer -> :integer -> :integer;
     let add a b = a + b;
+    let double : :integer -> :integer;
     let double x = x * 2;
 
+    let tests : [:any];
     let tests = [
         test.case "when_true takes its body only when true"
             $( test.eq! [7, ()] [expand when_true true 7, expand when_true false test.boom] ),

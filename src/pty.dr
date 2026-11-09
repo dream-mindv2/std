@@ -151,6 +151,7 @@ let read_all! t = {
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "a program sees a terminal of the size asked for" $({
             let t = spawn! (Options.new () |> Options.set_program "/bin/sh"

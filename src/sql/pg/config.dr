@@ -277,6 +277,7 @@ when test {
     let ok : Result :map :string -> :map;
     let ok r = match r { Result.ok(c) => c, _ => %{ :failed => r } };
 
+    let tests : [:any];
     let tests = [
         test.case "an empty configuration is every default"
             $( test.eq! ["127.0.0.1", 5432, "postgres", (), (), "dream"]

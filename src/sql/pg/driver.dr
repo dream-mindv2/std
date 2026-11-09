@@ -223,6 +223,7 @@ priv let code_of e = if errors.is_connection_lost e || (type_of (errors.code e) 
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "PostgreSQL errors use shared codes and retain SQLSTATE and fields" $( {
             let original = errors.server %{ :code => "23505", :message => "duplicate", :constraint => "users_pkey" };

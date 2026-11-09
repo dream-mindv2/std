@@ -840,11 +840,16 @@ let token re s at = p.map Match.text (parser re) s at;
 when test {
     import std.test;
 
+    let r : :string -> :any;
     let r src = compile src;
+    let first : :string -> :string -> :string | :unit;
     let first src s = match find (r src) s { Option.none => (), Option.some(m) => Match.text m };
+    let date : :any;
     let date = compile "(?<y>\\d{4})-(?<m>\\d\\d)-(?<d>\\d\\d)";
+    let compiled_at_build : :any;
     let compiled_at_build = comp compile "[a-c]+";
 
+    let tests : [:any];
     let tests = [
         test.case "literals"                 $( test.eq! ["abc", ()] [first "abc" "xxabcxx", first "abd" "xxabcxx"] ),
         test.case "dot and classes"          $( test.eq! ["a1", "b-2", "Q"] [first "[a-z]\\d" "--a1--", first "b.\\d" "b-2", first "[^a-z]" "abQc"] ),

@@ -1056,6 +1056,7 @@ let cancel! conn = try! {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a command tag's count"
             $( test.eq! [Option.some 5, Option.some 2, Option.some 10, Option.none] (list.map count_of ["INSERT 0 5", "UPDATE 2", "SELECT 10", "CREATE TABLE"]) ),

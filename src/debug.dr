@@ -204,6 +204,7 @@ let checkpoint! label before = {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a duration reads in the unit that suits it"
             $( test.eq! ["500ns", "1.50us", "1.50ms", "1.50s"]

@@ -386,6 +386,7 @@ let prevent_keys chords = Attr.attribute "data-dream-keys" (str.join_str " " cho
 when test {
     import std.test;
     import std.graphics;
+    let tests : [:any];
     let tests = [
         test.case "an element reads as its markup" $({
             let n = div [class "card", id "c"] [p [] [text "hi"]];

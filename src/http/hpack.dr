@@ -286,6 +286,7 @@ when test {
     import std.crypto;
     import std.test;
 
+    let vectors : [:any];
     let vectors = [
         ["828684418cf1e3c2e5f23a6ba0ab90f4ff", [[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"]]],
         ["828684be5886a8eb10649cbf", [[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"], ["cache-control", "no-cache"]]],
@@ -293,6 +294,7 @@ when test {
         ["4087f2b5b5188790bf8820e5fffe3fffeeff6196d07abe941054d444a8200595040b8166e082a62d1bff77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007", [["x-unicode", "caf\u{e9}"], ["date", "Mon, 21 Oct 2013 20:13:21 GMT"], ["set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"]]]
     ];
 
+    let decode_all : :any -> [:string] -> [:any];
     let decode_all d blocks = match blocks {
         [] => [],
         [[hex, want], ..rest] => match decode d (match crypto.unhex hex { () => "", b => b }) {
@@ -301,6 +303,7 @@ when test {
         },
     };
 
+    let tests : [:any];
     let tests = [
         test.case "integers, as the RFC's examples have them" $( test.eq! [[10, 1], [1337, 3], [42, 1]]
             [read_int (str.of_bytes [10]) 0 5, read_int (str.of_bytes [31, 154, 10]) 0 5, read_int (str.of_bytes [42]) 0 8] ),

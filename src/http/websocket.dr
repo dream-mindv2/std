@@ -351,14 +351,17 @@ when test {
 
     /// Every process a case started has ended: the runner's and the case's own
     /// are the two that remain.
+    let settled! : :unit -> :any;
     let settled! () = test.eq! 2 (test.eventually! (fn! () -> vm.processes! ()) (fn n -> n <= 2) test.patience);
 
+    let echo! : :any -> :any;
     let echo! socket = match recv! socket {
         [:text, t] => { send_text! socket ("echo " + t); echo! socket },
         [:binary, b] => { send_binary! socket b; echo! socket },
         _ => (),
     };
 
+    let tests : [:any];
     let tests = [
         test.case "the accept key, as the RFC's example has it"
             $( test.eq! "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" (accept_for "dGhlIHNhbXBsZSBub25jZQ==") ),

@@ -368,8 +368,10 @@ let read_to_end! : Reader -> :integer -> [:string, Reader];
 let read_to_end! r limit = read_body! r [] true limit;
 
 /// Test whether a header name contains only permitted token characters.
+priv let valid_header_name : :string -> :bool;
 priv let valid_header_name name = name != "" && str.span "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" 0 name == len name;
 /// Test whether a header value excludes prohibited control characters.
+priv let valid_header_value : :string -> :bool;
 priv let valid_header_value value = str.all (fn c -> { let n = _char_code c; n == 9 || (n >= 32 && n != 127) }) value;
 
 /// The start line and the headers up to the blank line: `[start, headers,
@@ -1032,8 +1034,10 @@ when test {
     import std.test;
 
     // A header's value, or () -- what the tests compare against.
+    let hdr : :string -> :any -> :any;
     let hdr name m = Option.or_unit (header name m);
 
+    let tests : [:any];
     let tests = [
         test.case "headers are case-insensitive" $( test.eq! ["a", ["a", "b"], ()]
             { let m = Response.new () |> with_header "X-Thing" "a" |> add_header "x-thing" "b";

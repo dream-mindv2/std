@@ -248,6 +248,7 @@ when test {
     let full : :any;
     let full = keeper.State.make %{} 2 [] 2 trunk.empty;
 
+    let tests : [:any];
     let tests = [
         test.case "an idle connection is handed out first"
             $( test.eq! [[:conn, :a], [:b]]

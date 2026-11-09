@@ -431,6 +431,7 @@ let parse_base base text = {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "to and from a float"  $( test.eq! [3.0, 3, 2.5] [to_float 3, to_int 3.9, to_float 2.5] ),
         test.case "toward zero"          $( test.eq! (0 - 3) (to_int (0.0 - 3.9)) ),

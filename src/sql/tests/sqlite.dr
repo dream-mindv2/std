@@ -3,6 +3,7 @@ import std.sql.sqlite;
 import std.error;
 import std.sql.tests.contract;
 import std.test;
+let main! : :any;
 let main! = test.main_of! [
     ["std.sql contract: SQLite", contract.tests sqlite.memory!],
     ["std.sql SQLite capabilities", [

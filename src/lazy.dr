@@ -38,6 +38,7 @@ when test {
     import std.test;
     import std.list;
 
+    let tests : [:any];
     let tests = [
         test.case "a settled value is forced all the way down"
             $( test.eq! true (settled [1, [2, %{ :a => 3 }], #[4]]) ),

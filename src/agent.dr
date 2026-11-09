@@ -125,6 +125,7 @@ when test {
         };
     }
 
+    let tests : [:any];
     let tests = [
         test.case "an agent holds what it was started with"
             $( {

@@ -186,15 +186,19 @@ when test {
     import std.math;
     import std.test;
 
+    let z : :tensor;
     let z = tensor.of_list [[2.0, -1.0, 0.5], [0.1, 0.2, 3.0]];
+    let classes : :tensor;
     let classes = tensor.of_list [0, 2];
 
     /// Whether `ad`'s gradient of `loss` at `z` agrees with central differences.
+    let checks : :any -> :tensor -> :bool;
     let checks l y = {
         let f v = l v y;
         tensor.maximum (tensor.abs (ad.grad f z - ad.numeric_grad f z 1.0e-5)) < 1.0e-6
     };
 
+    let tests : [:any];
     let tests = [
         test.case "mse keeps scalar values and gradients"
             $( {

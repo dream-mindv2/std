@@ -29,6 +29,7 @@ let command! input output handle! = Command.new () |> Command.set_input input
     |> Command.set_output output |> Command.set_handle handle!;
 
 /// The frame answering request `reply`: its value, or the error that stopped it.
+priv let response : :string -> :bool -> :any -> :map;
 priv let response reply ok value = %{
     "name" => reply, "key" => "", "payload" => json.encode (if ok {
         %{ "ok" => true, "value" => value }
@@ -78,6 +79,7 @@ struct Events {
 }
 
 /// The frame carrying event `name`.
+priv let event_frame : :string -> :any -> :map;
 priv let event_frame name value = %{ "name" => "event", "key" => name, "payload" => json.encode value };
 
 /// Send the frontend `value` as event `name`, heard by `ui.on_backend name`.
@@ -92,6 +94,7 @@ let emit! events name value = {
 /// `encoded` sent to the writer, or raised here, in the sender, when it is
 /// larger than the host takes: the writer is a process of its own, and a
 /// failure there would go unseen.
+priv let post! : :any -> :string -> :any;
 priv let post! writer encoded = {
     strict! encoded
     if str.byte_length encoded > 1048576 {
@@ -102,6 +105,7 @@ priv let post! writer encoded = {
 };
 
 /// The writer: each frame a line on standard output, until told to stop.
+priv let write_frames! : :any -> :any;
 priv let write_frames! output = {
     let rec loop! u = match recv! () {
         [:frame, encoded] => { streams.write_all! output (encoded + "\n"); loop! () },
@@ -144,7 +148,9 @@ let serve_with! make = {
 
 when test {
     import std.test;
+    let echo! : :any -> :any;
     let echo! value = value;
+    let tests : [:any];
     let tests = [
         test.case "commands are denied unless explicitly registered" $(test.eq!
             (response "answer" false "permission_denied")

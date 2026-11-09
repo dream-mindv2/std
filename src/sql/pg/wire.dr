@@ -312,6 +312,7 @@ when test {
     let columns_in : Message -> [:any];
     let columns_in m = match m { Message.row_description(cs) => cs, _ => [] };
 
+    let tests : [:any];
     let tests = [
         test.case "a frame's length counts itself and not its type"
             $( test.eq! ["Q", 13, "select 1\0"]

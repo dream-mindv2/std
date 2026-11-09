@@ -182,6 +182,7 @@ mapping Ngram {
 
 /// The contexts `seq` shows before position `i`, longest first: the last
 /// `order - 1` items, then fewer, then none; each as its key.
+priv let contexts : :integer -> [:any] -> :integer -> [:string];
 priv let contexts order seq i = list.map (fn n -> to_string (list.drop (i - n) (list.take i seq)))
     (list.reverse (list.range 0 (num.min order i + 1)));
 
@@ -227,6 +228,7 @@ let predict model history = {
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "tokens are words, lower case" $(test.eq! ["git", "commit", "m", "fix_it", "2"] (tokens "git commit -m 'Fix_it' 2")),
         test.case "character n-grams mark a word's ends" $(test.eq! [" ls", "ls "] (char_ngrams 3 "ls")),

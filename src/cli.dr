@@ -545,6 +545,7 @@ let shell_line argv = str.join_str " " (map shell_word argv);
 when test {
     import std.test;
 
+    let shell_tests : [:any];
     let shell_tests = [
         test.case "a shell word is quoted only when it must be"
             $( test.eq! ["-o", "a/b.c", "'a b'", "''", "'$HOME'", "'it'\\''s'"]
@@ -555,6 +556,7 @@ when test {
             $( test.eq! "cc -o 'my prog' 'x;y'" (shell_line ["cc", "-o", "my prog", "x;y"]) ),
     ];
 
+    let specs : [:any];
     let specs = [
         flag "q" "quiet" "say less",
         value "o" "output" "PATH" "write here",
@@ -562,9 +564,12 @@ when test {
         flag "" "version" "print the version",
     ];
 
+    let accepted : [:string] -> :any;
     let accepted args = unwrap_or () (parse specs args);
+    let why : [:string] -> :string;
     let why args = match parse specs args { Result.error(m) => m, _ => "" };
 
+    let rich : [:any];
     let rich = [
         value "f" "format" "FMT" "how to render"
             |> choices ["pretty", "json"]
@@ -573,25 +578,36 @@ when test {
         toggle "c" "color" "colorize output",
     ];
 
+    let rok : [:string] -> :any;
     let rok args = match parse rich args { Result.ok(c) => c, _ => () };
+    let rwhy : [:string] -> :string;
     let rwhy args = match parse rich args { Result.error(m) => m, _ => "" };
 
+    let req : [:any];
     let req = [value "o" "output" "PATH" "write here" |> required];
+    let qok : [:string] -> :any;
     let qok args = match parse req args { Result.ok(c) => c, _ => () };
+    let qwhy : [:string] -> :string;
     let qwhy args = match parse req args { Result.error(m) => m, _ => "" };
 
     // --- subcommand fixtures ---
+    let build_cmd : :any;
     let build_cmd = command "build" "compile the project"
                         [flag "c" "check" "check only"];
+    let run_cmd : :any;
     let run_cmd = command "run" "compile and run it"
                       [list_of "L" "libs" "DIR" "search here"];
+    let cmds : [:any];
     let cmds = [build_cmd, run_cmd];
 
+    let gok : [:string] -> :any;
     let gok args = match commands [value "d" "dir" "DIR" "the project"]
                               cmds args { Result.ok(c) => c, _ => () };
+    let gwhy : [:string] -> :string;
     let gwhy args = match commands [value "d" "dir" "DIR" "the project"]
                                 cmds args { Result.error(m) => m, _ => "" };
 
+    let tests : [:any];
     let tests = [
         // --- flags ---
         test.case "a long flag is set"

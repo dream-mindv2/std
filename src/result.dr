@@ -113,25 +113,32 @@ let error_as description reason = Result.error (types.check description reason);
 when test {
     import std.test;
 
+    let double : :integer -> Result :integer :atom;
     let double x = Result.ok (x * 2);
+    let fail : :any -> Result :integer :atom;
     let fail _ = Result.error :nope;
+    let half : :integer -> Option :integer;
     let half n = if n % 2 == 0 { Option.some (n / 2) } else { Option.none };
 
+    let quarter : :integer -> Option :integer;
     let quarter n = {
         let? h = half n;
         let? q = half h;
         Option.some q
     };
+    let need : :integer -> Result :integer :atom;
     let need n = {
         let? q = quarter n else Result.error :odd;
         let? d = double q;
         Result.ok (d + 1)
     };
+    let pair : :integer -> Result :integer :atom;
     let pair n = {
         let? [a, b] = Result.ok [n, n + 1];
         Result.ok (a * b)
     };
 
+    let tests : [:any];
     let tests = [
         test.case "is_ok"                   $( test.true! (Result.is_ok (Result.ok 1)) ),
         test.case "is_error"                $( test.true! (Result.is_error (Result.error :e)) ),

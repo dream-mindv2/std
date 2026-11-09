@@ -5,6 +5,7 @@ import std.num;
 import std.str;
 
 /// Extract the IEEE-754 binary64 bit representation of a floating-point value.
+priv let raw64 : :integer | :float -> :integer;
 priv let raw64 value = {
     let data = num.float_bytes value;
     let rec go !i !acc = if i < 0 { acc } else { go (i - 1) ((acc << 8) | str.byte i data) };
@@ -12,6 +13,7 @@ priv let raw64 value = {
 };
 
 /// Shift an integer right with round-to-nearest, ties-to-even; negative shifts shift left.
+priv let round_shift : :integer -> :integer -> :integer;
 priv let round_shift n shift = if shift <= 0 { n << (-shift) } else {
     let q = n >> shift;
     let remainder = n & ((1 << shift) - 1);
@@ -20,6 +22,7 @@ priv let round_shift n shift = if shift <= 0 { n << (-shift) } else {
 };
 
 /// Internal: eb/fb are (5,10) or (8,23).
+let to_bits : :integer -> :integer -> :any -> Result :integer :string;
 let to_bits eb fb value =
     if type_of value != :float && type_of value != :integer { err "expected a number" }
     else {
@@ -46,6 +49,7 @@ let to_bits eb fb value =
     };
 
 /// Decode an IEEE-style bit pattern using explicit exponent and fraction widths.
+let from_bits : :integer -> :integer -> :integer -> :float;
 let from_bits eb fb raw = {
     let sign = (raw >> (eb + fb)) << 63;
     let exponent = (raw >> fb) & ((1 << eb) - 1);

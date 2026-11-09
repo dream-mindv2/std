@@ -545,6 +545,7 @@ when test {
     // also what a `comp` bakes into a program. The sizes are the ones every
     // 64-bit ABI this VM is built for agrees on; dream/tests/ffi checks the
     // same layout against the C compiler's own `sizeof`.
+    let tests : [:any];
     let tests = [
         test.case "a field waits for its alignment, and the whole is padded to the widest"
             $( test.eq! [0, 8, 16, 24, 8]
@@ -572,6 +573,7 @@ when test {
             $( test.eq! [sizeof :i32, sizeof :size] [sizeof :int, sizeof :uintptr] ),
     ];
 
+    priv let with_shape : :map -> [:integer];
     priv let with_shape shape =
         list.map (fn name -> offset_of shape name) shape.[:order] + [shape.[:size], shape.[:align]];
 }

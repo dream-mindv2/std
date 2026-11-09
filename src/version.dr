@@ -330,11 +330,16 @@ let compatible a b = {
 when test {
     import std.test;
 
+    let v : :string -> :any;
     let v s = match parse s { Result.ok(x) => x, _ => () };
+    let ok : :any -> :any;
     let ok r = match r { Result.ok(x) => x, _ => () };
+    let sat : :string -> :string -> :any;
     let sat r s = ok (satisfies r s);
+    let shown : :any -> :any;
     let shown found = match found { Option.none => (), Option.some(w) => show w };
 
+    let tests : [:any];
     let tests = [
         test.case "a version may be short, or spelled as a tag"
             $( test.eq! ["1.0.0", "1.2.0", "1.2.3", "1.2.3-rc.1"]

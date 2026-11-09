@@ -12,17 +12,28 @@ when test {
 
     let value : Result :any :map -> :any;
     let value r = Result.unwrap_or :failed r;
+    let kind : :any -> :atom;
     let kind r = match r { Result.error(e) => e.[:kind], _ => :ok };
+    let path : :any -> [:any];
     let path r = match r { Result.error(e) => e.[:path], _ => [] };
+    let offset : :any -> [:integer];
     let offset r = match r { Result.error(e) => [e.[:offset], e.[:bit_offset]], _ => [] };
+    let hex : :map -> :any -> Result :string :map;
     let hex c v = Result.map crypto.hex (b.encode c v);
+    let trip : :map -> :any -> Result :any :map;
     let trip c v = Result.and_then (b.decode c) (b.encode c v);
+    let packet : :map;
     let packet = b.record [[:magic, b.magic "DB"], [:id, b.u32be], [:data, b.blob b.u16le 1024]];
+    let message : :map;
     let message = %{ :magic => (), :id => 4294967295, :data => "a\0b" };
+    let packed : :any;
     let packed = comp b.encode (b.tuple [b.u16be, b.uvarint]) [258, 300];
+    let bit_header : :map;
     let bit_header = b.tuple [b.bits :msb 3, b.flag, b.signed_bits :msb 9, b.byte_align 0, b.u8];
+    let section : :map;
     let section = b.sized b.u8 100 (b.tuple [b.u8, b.align 4 0, b.u8]);
 
+    let tests : [:any];
     let tests = [
         test.case "unsigned integer byte order"
             $( test.eq! [ok "010203", ok "030201"] [hex b.u24be 66051, hex b.u24le 66051] ),

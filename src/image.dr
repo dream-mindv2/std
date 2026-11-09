@@ -81,6 +81,7 @@ let locate! img = vm.locate_image! img;
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "an image is described as data, so a declaration's `from` is a value"
             $( test.eq! [[:installed, "fmt"], [:payload, "fmt"], [:any, ["a.dream", [:installed, "b"]]]]

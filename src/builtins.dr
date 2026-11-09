@@ -11,6 +11,7 @@
 // an impure function is itself an effect a pure value may not have.
 
 /// The builtins, by ID.
+let table! : :array;
 let table! = #[
     spawn!,
     join!,

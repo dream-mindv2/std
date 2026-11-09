@@ -713,10 +713,14 @@ priv let layers_of model = match Layer.children model { [] => [model], layers =>
 when test {
     import std.test;
 
+    let x : :tensor;
     let x = tensor.random 1 [4, 3];
+    let model : :any;
     let model = sequential [dense 5, relu, dropout 0.5, dense 2];
+    let p : :any;
     let p = init model 7 [3];
 
+    let tests : [:any];
     let tests = [
         test.case "shapes are inferred" $( test.eq! [2] (out_shape model [3]) ),
         test.case "a prediction" $( test.eq! [4, 2] (tensor.shape (apply model p x)) ),

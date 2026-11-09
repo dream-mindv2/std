@@ -93,6 +93,7 @@ let digit_value c = {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a character's code"   $( test.eq! [65, 955] [code 'A', code 'λ'] ),
         test.case "and back"             $( test.eq! ['A', 'λ'] [of_code 65, of_code 955] ),

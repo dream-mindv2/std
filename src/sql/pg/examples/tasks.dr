@@ -57,6 +57,7 @@ let triage! conn = {
     finish! "fix the flaky test" conn
 };
 
+let main! : :any;
 let main! = {
     let target = config.from_env! ();
     let conn = db.connect! target;

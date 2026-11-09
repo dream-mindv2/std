@@ -1063,10 +1063,14 @@ when test {
     import std.test;
 
     // 2026-10-04T18:21:07.512Z
+    let t : :integer;
     let t = datetime 2026 10 4 18 21 7 |> to_instant |> (fn i -> i + 512 * millisecond);
+    let denver_rule : :any;
     let denver_rule = Result.unwrap_or () (tz.parse_rule "MST7MDT,M3.2.0,M11.1.0");
+    let denver : :any;
     let denver = tz.Zone.make "America/Denver" #[] (tz.Rule.standard denver_rule) denver_rule;
 
+    let tests : [:any];
     let tests = [
         test.case "unix seconds round down, before 1970 too, and come back"
             $( test.eq! [1700000000, 0 - 1, 0, 1700000000]
@@ -1181,5 +1185,6 @@ when test {
         } ),
     ];
 
+    let array_list : DateTime -> [:any];
     let array_list a = list.map (fn i -> a.[i]) (list.range 0 8);
 }

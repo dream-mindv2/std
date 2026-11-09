@@ -972,10 +972,13 @@ when test {
     import std.test;
 
     // A header's value, or () -- what the tests compare against.
+    let hdr : :string -> :any -> :any;
     let hdr name m = Option.or_unit (http.header name m);
     import std.vm;
 
+    let hello : :any -> :any;
     let hello req = http.text ("hello, " + (match http.query_value "name" req { Option.none => "world", Option.some(n) => n }));
+    let app : :any;
     let app = router
         |> get "/" hello
         |> get "/users/:id" (fn req -> http.json %{ "id" => Option.or_unit (http.param "id" req) })
@@ -985,6 +988,7 @@ when test {
         |> get "/string" (fn req -> "just a string")
         |> mount "/api" (router |> get "/ping" (fn req -> http.text "pong"));
 
+    let raw! : :integer -> :string -> :string;
     let raw! port text = {
         let sock = net.connect! "127.0.0.1" port;
         streams.write_all! sock text
@@ -993,6 +997,7 @@ when test {
         out
     };
 
+    let tests : [:any];
     let tests = [
         test.case "routing and params" $( test.eq! ["{\"id\":\"42\"}", "a/b c", "pong"]
             [http.body (call! app (http.request "GET" "/" |> http.Request.set_path "/users/42")),

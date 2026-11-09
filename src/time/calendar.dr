@@ -131,6 +131,7 @@ when test {
     import std.test;
     import std.list;
 
+    let tests : [:any];
     let tests = [
         test.case "the epoch is day 0"       $( test.eq! 0 (days_from_civil 1970 1 1) ),
         test.case "and back"                 $( test.eq! [1970, 1, 1] (civil_from_days 0) ),

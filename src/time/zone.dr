@@ -425,12 +425,16 @@ priv let from_file_or_utc! name path = match file.read! path {
 when test {
     import std.test;
 
+    let denver : Result Rule :string;
     let denver = parse_rule "MST7MDT,M3.2.0,M11.1.0";
+    let sydney : Result Rule :string;
     let sydney = parse_rule "AEST-10AEDT,M10.1.0,M4.1.0/3";
+    let at : :integer -> :integer -> :integer -> :integer -> :integer;
     let at y m d h = calendar.days_from_civil y m d * 86400 + h * 3600;
     let off : Result Rule :string -> :integer -> :integer;
     let off r t = Period.offset (rule_period (Result.unwrap_or () r) t);
 
+    let tests : [:any];
     let tests = [
         test.case "a rule parses"           $( test.true! (Result.is_ok denver) ),
         test.case "winter in Denver"        $( test.eq! (0 - 25200) (off denver (at 2025 1 15 12)) ),

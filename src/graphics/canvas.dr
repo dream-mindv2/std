@@ -107,6 +107,7 @@ let alpha a drawing = group %{ "alpha" => a } drawing;
 when test {
     import std.test;
     import std.graphics;
+    let tests : [:any];
     let tests = [
         test.case "a canvas carries its drawing to the page" $({
             let w = graphics.describe (view [Attr.key "c"] 100 50 [clear "black", fill "red" (circle 5 5 2)]);

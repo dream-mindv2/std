@@ -335,6 +335,7 @@ when test {
     let none : %{:integer => :any};
     let none = %{};
 
+    let tests : [:any];
     let tests = [
         test.case "parameters by kind"
             $( test.eq! [(), "7", "1.5", "t", "x", "c", "active", "{1,\"a,b\",NULL}", "{\"k\":1}"]

@@ -209,6 +209,7 @@ let slice from until xs =
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         // --- from std.seq, over the derived fold ---
         test.case "seq sum"          $( test.eq! 6 (sum #[1, 2, 3]) ),

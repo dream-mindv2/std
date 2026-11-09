@@ -23,6 +23,7 @@ let existing name = Option.of (_to_existing_atom name);
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "an atom the program names" $( test.eq! (Option.some :ok) (existing "ok") ),
         test.case "one it never names"

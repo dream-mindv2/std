@@ -66,6 +66,7 @@ let open! options = {
 };
 
 /// Read the page's events from the bridge and deliver each to the UI loop, until the page closes.
+priv let forward! : :any -> :any;
 priv let rec forward! ui_process = {
     match input_of (bridge.next! ()) {
         Result.ok(input) => deliver! ui_process input,
@@ -91,6 +92,7 @@ let input_of text = {
 /// A reply is `ok` with a `value` or not with an `error`; the backend's
 /// arrives as JSON text in `payload`, so an integer JavaScript cannot hold
 /// exactly is still exact here.
+priv let answer_of : :map -> :any;
 priv let answer_of m = {
     let reply = match m.["payload" else ()] {
         () => m,
@@ -101,12 +103,15 @@ priv let answer_of m = {
 };
 
 /// A value as the text a service is given: a string as it is, anything else as JSON.
+priv let to_text : :any -> :string;
 priv let to_text v = if type_of v == :string { v } else { json.encode v };
 
 /// Send the page one message, as JSON.
+priv let post! : :any -> :any;
 priv let post! value = bridge.send! (json.encode value);
 
 /// Ask the page's `service` for something, the answer becoming `f answer`.
+priv let request! : :string -> :any -> :any -> :any;
 priv let request! service args f = {
     let id = vm.unique! ();
     expect! id (Handler.reading f)
@@ -114,6 +119,7 @@ priv let request! service args f = {
 };
 
 /// The same where no answer is wanted: request 0 is never answered.
+priv let tell! : :string -> :any -> :any;
 priv let tell! service args = post! %{ "type" => "request", "id" => 0, "service" => service, "args" => args };
 
 // --- the network ---------------------------------------------------------------
@@ -156,6 +162,7 @@ let post_json! url value f = fetch! (Request.new () |> Request.set_url url |> Re
     (fn r -> f (Result.and_then (fn body -> if body == "" { Result.ok () } else { json.decode body }) (body_of r)));
 
 /// A request body as text: a string as it is, any other value as JSON.
+priv let body_of : :any -> :any;
 priv let body_of r = match r {
     Result.ok(response) => if Response.ok response { Result.ok (Response.body response) }
         else { Result.error ("HTTP " + to_string (Response.status response)) },
@@ -263,6 +270,7 @@ let invoke! command value f = request! "backend" %{ "command" => command, "paylo
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "page events become inputs" $({
             test.eq! (Result.ok (Input.dom [0, "a"] "click" ())) (input_of "{\"type\":\"dom\",\"id\":[0,\"a\"],\"event\":\"click\",\"value\":null}")

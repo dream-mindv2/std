@@ -85,11 +85,13 @@ let classify m features = match probabilities m features {
 
 when test {
     import std.test;
+    let examples : [:any];
     let examples = [
         [["error", "cannot", "find", "symbol"], :error], [["fatal", "not", "a", "git", "repository"], :error],
         [["error", "no", "such", "file"], :error], [["warning", "unused", "variable"], :warning],
         [["warning", "deprecated", "function"], :warning], [["compiling", "foo"], :info], [["finished", "release"], :info],
     ];
+    let tests : [:any];
     let tests = [
         test.case "it classifies by the words a class uses" $({
             let m = fit examples;

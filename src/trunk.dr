@@ -167,11 +167,15 @@ let filter keep c = vm.trunk_of (list.filter keep (vm.trunk_to_list c));
 when test {
     import std.test;
 
+    let c3 : :any;
     let c3 = of [1, 2, 3];
     // An element that raises when it is evaluated, to show it never is.
+    let boom : :integer -> :integer;
     let boom n = 1 / n;
+    let pairs : :any;
     let pairs = of [["a", 1], ["b", 2]];
 
+    let tests : [:any];
     let tests = [
         test.case "of and to_list"          $( test.eq! [1, 2, 3] (to_list c3) ),
         test.case "length and len"          $( test.eq! [3, 3] [length c3, len c3] ),

@@ -60,6 +60,7 @@ let sheet : [:string] -> :string;
 let sheet rules = str.join_str "\n" rules;
 
 /// Declarations as CSS text, `name: value;` each.
+priv let declare : [[:string]] -> :string;
 priv let declare pairs = str.concat_all (list.map (fn pair -> match pair {
     [name, value] => name + ": " + value + "; ",
 }) pairs);
@@ -90,6 +91,7 @@ let hsl h s l = "hsl(" + to_string h + " " + to_string s + "% " + to_string l + 
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "a rule is its text" $(test.eq! ".a { color: red; margin: 0; }"
             (rule ".a" %{ "margin" => "0", "color" => "red" })),

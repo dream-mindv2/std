@@ -579,6 +579,7 @@ when test {
         :no_error
     } catch e { if sql.is_sql_error e { sql.error_code e } else { error.kind e } };
 
+    let schema : :any;
     let schema = sql.create_table "people" [
         sql.column "id" :integer |> sql.auto_increment,
         sql.column "name" :text |> sql.not_null |> sql.unique,
@@ -587,18 +588,21 @@ when test {
         sql.column "score" :float |> sql.default 1.5,
     ];
 
+    let people : [:map];
     let people = [
         %{ :name => "ada", :age => 36, :photo => sql.blob (str.of_bytes [0, 1, 255]) },
         %{ :name => "bob", :age => 17 },
         %{ :name => "cy", :age => sql.null, :photo => sql.blob "" },
     ];
 
+    let seeded! : :any -> :any;
     let seeded! db = {
         sql.exec! db schema
         sql.exec_many! db (list.map (fn p -> sql.insert_into "people" |> sql.values p) people)
         db
     };
 
+    let tests : [:any];
     let tests = [
         test.case "the library" $( {
             if available! () { () }

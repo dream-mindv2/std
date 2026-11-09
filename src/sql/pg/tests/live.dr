@@ -514,6 +514,7 @@ let pooled_tls! u = {
     :ok
 };
 
+let main! : :any;
 let main! = test.main_of! [
     ["std.sql contract: PostgreSQL", contract.tests (fn! () -> pg.open! (as! "postgres" ()))],
     ["pg live: std.sql", standard.tests (as! "postgres" ())],

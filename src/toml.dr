@@ -501,8 +501,10 @@ when test {
 
     let parsed : :string -> Document;
     let parsed text = parse_or %{} text;
+    let at : :string -> :string -> :string -> :any;
     let at text sec key = get () (parsed text) sec key;
 
+    let tests : [:any];
     let tests = [
         // scalars
         test.case "string"        $( test.eq! "x" (at "a = \"x\"" "" "a") ),

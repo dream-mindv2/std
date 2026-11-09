@@ -249,11 +249,14 @@ let examples! n gen = list.take n (random.values gen (random.new! ()));
 when test {
     import std.str;
 
+    let ints : :any;
     let ints = random.list_of (random.int (0 - 1000) 1000);
 
     /// The message a failing property raises.
+    let failure! : :any -> (:any -> :any) -> :string;
     let failure! gen holds = try! { for_all_with! (seeded 7) gen holds; "" } catch e { describe e };
 
+    let tests : [:any];
     let tests = [
         check "reversing twice changes nothing" ints (fn xs -> list.reverse (list.reverse xs) == xs),
         check_with (runs 300) "sorting is idempotent" ints (fn xs -> list.sort (list.sort xs) == list.sort xs),

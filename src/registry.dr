@@ -71,9 +71,11 @@ mod table {
     import std.proc;
 
     /// The name the registry's process is reported under.
+    let server_name : :any -> :string;
     let server_name u = "registry";
 
     /// Start with `names`, forced, and nothing monitored yet.
+    let init! : :map -> [:any];
     let init! names = {
         strict! names;
         [names, []]
@@ -82,6 +84,7 @@ mod table {
     /// `:value` answers the table, `[:get, f]` answers `f` of it, and
     /// `[:get_and_update, f]` takes `[answer, next]` from `f` and keeps `next`,
     /// monitoring whatever process it names for the first time.
+    let handle_call! : :any -> :any -> :any -> :any;
     let handle_call! request from state = {
         let [names, watched] = state;
         match request {
@@ -97,6 +100,7 @@ mod table {
     };
 
     /// A process that has ended takes its names with it.
+    let handle_info! : :any -> :any -> :any;
     let handle_info! message state = match message {
         [:down, p, _] => {
             let [names, watched] = state;
@@ -108,6 +112,7 @@ mod table {
     /// Monitor every process in `names` that is not watched yet, and answer
     /// the processes watched now. Forced as it goes: a monitor is an effect,
     /// and one left in a lazy list would be asked for by nobody.
+    let watch_new! : :map -> [:any] -> [:any];
     let watch_new! names watched = {
         let fresh = list.unique (filter (fn p -> not (list.contains p watched)) (map.values names));
         strict! (map (fn! p -> proc.monitor! p) fresh)
@@ -283,14 +288,17 @@ when test {
     mod counter {
         derive std.server;
 
+        let init! : :integer -> :integer;
         let init! n = n;
 
+        let handle_call! : :any -> :any -> :any -> :any;
         let handle_call! request from state = match request {
             :value    => reply state state,
             [:add, n] => reply (state + n) (state + n),
             _         => reply (err :unknown) state,
         };
 
+        let handle_cast! : :any -> :any -> :any;
         let handle_cast! message state = match message {
             :go_away  => stop :asked state,
             [:add, n] => noreply (state + n),
@@ -302,6 +310,7 @@ when test {
     /// use, and for the same reason: `try!` catches what is raised *inside* it,
     /// and a process is the one place a raise is certain to have happened
     /// rather than to have been suspended.
+    priv let caught! : :any -> :any;
     priv let caught! body = try! { join! (spawn! body); () } catch e { e };
 
     /// Ask for `name` until the answer is something other than `was`, or give
@@ -314,6 +323,7 @@ when test {
     /// by a count of asks, which a loaded machine used up before the restart.
     /// The name passes through `()` on the way: the registry drops it when the
     /// old process's death reaches it, and the new one registers after that.
+    priv let settle! : :any -> :string -> :any -> :any;
     priv let settle! reg name was = test.eventually! (fn! () -> whereis! reg name) (fn p -> p != was && p != ()) test.patience;
 
     /// A registry, a body run against it, and the registry stopped again.
@@ -321,6 +331,7 @@ when test {
     /// Every case has to undo what it did: a registry left running is a process
     /// parked on `recv!`, and a test program that ends with one of those is
     /// reported as deadlocked rather than as passing.
+    priv let with_registry! : (:any -> :any) -> :any;
     priv let with_registry! body! = {
         let reg = start! ();
         let answer = strict! (body! reg);
@@ -328,6 +339,7 @@ when test {
         answer
     };
 
+    let tests : [:any];
     let tests = [
         test.case "a name answers the process registered under it"
             $( test.true! (with_registry! (fn! reg -> {

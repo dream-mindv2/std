@@ -324,10 +324,14 @@ let add_query pairs u = {
 when test {
     import std.test;
 
+    let full : :any;
     let full = parse_or_raise "HTTPS://ada:pw@Example.COM:8443/a/b/c?x=1&y=two%20words#frag";
+    let base : :any;
     let base = parse_or_raise "http://a/b/c/d;p?q";
+    let r : :string -> :string;
     let r ref = to_text (resolve base ref);
 
+    let tests : [:any];
     let tests = [
         test.case "the parts" $( test.eq! ["https", "ada", "pw", "example.com", 8443, "/a/b/c", "x=1&y=two%20words", "frag"]
             [Url.scheme full, Url.user full, Url.password full, Url.host full, Url.port full, Url.path full, Url.query full, Url.fragment full] ),

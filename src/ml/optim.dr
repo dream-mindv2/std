@@ -248,8 +248,11 @@ when test {
     import std.test;
 
     // Minimizing (p - 3)^2 from 0: every optimizer should get close.
+    let target : :tensor;
     let target = tensor.fill [4] 3.0;
+    let grad_at : :tensor -> :tensor;
     let grad_at p = 2.0 * (p - target);
+    let run : :any -> :integer -> :tensor;
     let run opt n = {
         let rec go i p s = if i == n { p } else {
             let [p2, s2] = step opt (grad_at p) s p;
@@ -258,8 +261,10 @@ when test {
         let p0 = tensor.zeros [4];
         go 0 p0 (start opt p0)
     };
+    let near : :tensor -> :bool;
     let near p = tensor.maximum (tensor.abs (p - target)) < 0.05;
 
+    let tests : [:any];
     let tests = [
         test.case "sgd" $( test.true! (near (run (sgd 0.1) 100)) ),
         test.case "momentum" $( test.true! (near (run (sgd_with 0.05 (Sgd.new () |> Sgd.set_momentum 0.9)) 200)) ),

@@ -230,6 +230,7 @@ priv let labelled label v = match v { () => "", text => label + ": " + to_string
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a code is its condition, or its class's"
             $( test.eq! [:unique_violation, :integrity_constraint_violation, :unknown]

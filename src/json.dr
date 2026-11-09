@@ -447,11 +447,13 @@ let pretty v = write_indented 0 v;
 when test {
     import std.test;
 
+    let parsed : :string -> :any;
     let parsed text = unwrap_or_else (fn why -> [:not_parsed, why]) (parse text);
 
     struct Point { x, y }
     union Shape { circle(radius), empty }
 
+    let tests : [:any];
     let tests = [
         // A record is written as what it was built as before it was one
         // (`codec.as_written`), not as the text it prints as.

@@ -925,6 +925,7 @@ macro compile p = compile_grammar p;
 // tagged lists `dreams/src/ast.dr` defines.
 
 /// The span written syntax carries.
+priv let g_span : [:integer];
 priv let g_span = [0, 0];
 /// A name, as syntax.
 priv let g_name : :string -> :any;
@@ -939,6 +940,7 @@ priv let g_int n = [:int, n, g_span];
 priv let g_str : :string -> :any;
 priv let g_str t = [:str, t, g_span];
 /// `()`, as syntax.
+priv let g_unit : [:any];
 priv let g_unit = [:unit, g_span];
 /// A binary operator, as syntax.
 priv let g_bin : :atom -> :any -> :any -> :any;
@@ -959,6 +961,7 @@ priv let g_guarded pattern guard body = [pattern, guard, body, g_span];
 priv let g_bind : :string -> :any;
 priv let g_bind n = [:bind, n, g_span];
 /// The `_` pattern.
+priv let g_wild : [:any];
 priv let g_wild = [:wildcard, g_span];
 /// A block of statements.
 priv let g_block : [:any] -> :any;
@@ -1302,17 +1305,23 @@ priv let compile_grammar p = {
 when test {
     import std.test;
 
+    let pair : :any;
     let pair = succeed (fn a b -> [a, b]) |> keep integer |> skip (symbol ",") |> keep integer;
+    let expr : :any -> :any -> :any;
     let rec expr s at = operators (lexeme number |> or (parens (lazy (fn () -> expr))))
         [[:left, [["+", fn a b -> a + b], ["-", fn a b -> a - b]]],
          [:left, [["*", fn a b -> a * b], ["/", fn a b -> a / b]]],
          [:right, [["^", fn a b -> num.pow a b]]],
          [:prefix, [["-", fn a -> 0 - a]]]] s at;
+    let calc : :string -> :any;
     let calc t = run (then expr spaces) t;
+    let message : :any -> :string;
     let message r = match r { Result.error(e) => Error.message e, _ => "" };
+    let where : :any -> [:integer];
     let where r = match r { Result.error(e) => [Error.line e, Error.column e], _ => [] };
 
     // A JSON reader in a dozen lines: the test that the pieces compose.
+    let json_value : :any -> :any -> :any;
     let rec json_value s at = lexeme (choice [
         map (fn _ -> ()) (keyword "null"), to true (keyword "true"), to false (keyword "false"),
         number, quoted,
@@ -1358,7 +1367,9 @@ when test {
     let tg_maybe_c : Parser :any;
     let tg_maybe_c = expand compile (optional (char '!') |> then (default :none (to :some (text "x"))));
 
+    let agree : :any -> :any -> [:string] -> [:string];
     let agree p c inputs = list.filter (fn t -> run_text p t != run_text c t) inputs;
+    let tests : [:any];
     let tests = [
         test.case "a compiled grammar answers as its combinators do, errors included"
             $( test.eq! [[], [], [], []]

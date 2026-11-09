@@ -166,6 +166,7 @@ let rec shown node = if Node.tag node != "#lazy" { node } else {
 };
 
 /// Two lazy nodes that would make the same node.
+priv let same_memo : Node -> Node -> :bool;
 priv let same_memo old new = Node.tag old == "#lazy" && Node.tag new == "#lazy" && {
     let [f, value, _] = Node.memo old;
     let [g, given, _] = Node.memo new;
@@ -377,6 +378,7 @@ let open! options = Result.error :graphics_unavailable;
 /// key, `i` the id its events are reported by, `x` text, `a` attributes (its
 /// classes joined into `class`), `p` properties, `s` style, `e` event names,
 /// `d` a drawing, `c` children. `at` is the node's id, reversed.
+priv let fields : [:any] -> Node -> :map;
 priv let fields at node = {
     let classes = Node.classes node;
     let attrs = match classes {
@@ -393,6 +395,7 @@ priv let fields at node = {
 };
 
 /// A field is left out when it is empty, which is what the page assumes.
+priv let put : :string -> :any -> :map -> :map;
 priv let put name value m = if value == "" || value == [] || value == %{} { m } else { m.[name => value] };
 
 /// A node's id is the way to it from the root: each step the key of a keyed
@@ -401,6 +404,7 @@ priv let put name value m = if value == "" || value == [] || value == %{} { m } 
 /// it names (`target`), which looks at the siblings on the way and nothing
 /// else -- no table of every handler is built, a render at a time, for the
 /// one event that may come.
+priv let step : :integer -> Node -> :any;
 priv let step !i node = if Node.key node == "" { i } else { Node.key node };
 
 /// The whole of a tree, as the first render sends it.
@@ -408,10 +412,12 @@ let describe : Node -> json.Value;
 let describe node = describe_at [step 0 node] (shown node);
 
 /// A node and everything in it as the page reads it; `at` is its id, reversed.
+priv let describe_at : [:any] -> Node -> :map;
 priv let rec describe_at at node =
     fields at node |> put "c" (describe_children at 0 (live (Node.children node)) []);
 
 /// Each child described, in order, at the position it takes.
+priv let describe_children : [:any] -> :integer -> [Node] -> [:map] -> [:map];
 priv let rec describe_children at !i nodes !out = match nodes {
     [] => list.reverse out,
     [n, ..rest] => describe_children at (i + 1) rest (list.cons (describe_at (list.cons (step i n) at) (shown n)) out),
@@ -425,6 +431,7 @@ let target tree id = match id {
 };
 
 /// The node the rest of an id names below `node`, if it is there.
+priv let descend : Node -> [:any] -> Option Node;
 priv let rec descend node id = match id {
     [] => Option.some node,
     [s, ..rest] => {
@@ -463,6 +470,7 @@ let diff last next = if same_memo last next { Change.same } else {
 };
 
 /// Two nodes of the same tag and key compared: the same, or a patch of the old one.
+priv let diff_at : [:any] -> Node -> Node -> Change;
 priv let diff_at at old new = if old == new { Change.same } else {
     let own = fields at new;
     let olds = live (Node.children old);
@@ -477,21 +485,25 @@ priv let diff_at at old new = if old == new { Change.same } else {
 };
 
 /// Whether children entries keep every old child where it was and add none.
+priv let unchanged : [[:integer]] -> :integer -> :integer -> :bool;
 priv let unchanged entries n_old n_new = n_old == n_new && (n_old == 0 || entries == [[0, n_old]]);
 
 /// Children whose keys are where they were -- the usual case, a list that
 /// grew at its end aside -- are matched position by position; otherwise by key.
+priv let diff_children : [:any] -> [Node] -> [Node] -> [:any];
 priv let diff_children at olds news =
     if list.map Node.key olds == list.map Node.key news { in_place at 0 olds news [] }
     else { by_key at (key_index olds) (array.of_list olds) 0 news [] };
 
 /// Children matched position by position, since their keys are where they were.
+priv let in_place : [:any] -> :integer -> [Node] -> [Node] -> [:any] -> [:any];
 priv let rec in_place at !i olds news !out = match [olds, news] {
     [[o, ..os], [n, ..ns]] => in_place at (i + 1) os ns (child at i (Option.some [i, o]) n out),
     _ => list.reverse out,
 };
 
 /// Children matched by key, and an unkeyed one by position when the old child there has no key.
+priv let by_key : [:any] -> :map -> :array -> :integer -> [Node] -> [:any] -> [:any];
 priv let rec by_key at index olds !i news !out = match news {
     [] => list.reverse out,
     [n, ..ns] => {
@@ -505,12 +517,14 @@ priv let rec by_key at index olds !i news !out = match news {
 };
 
 /// The old children's positions by key.
+priv let key_index : [Node] -> :map;
 priv let key_index olds = list.fold (fn m entry -> {
     let [j, o] = entry;
     if Node.key o == "" { m } else { m.[Node.key o => j] }
 }) %{} (list.enumerate olds);
 
 /// One new child, given the old one it is matched to, if any.
+priv let child : [:any] -> :integer -> Option [:any] -> Node -> [:any] -> [:any];
 priv let child at i found n out = {
     let here = list.cons (step i n) at;
     match found {
@@ -533,6 +547,7 @@ priv let child at i found n out = {
 };
 
 /// Old child `j` kept, joined to the run before it when it follows it.
+priv let keep : :integer -> [[:integer]] -> [[:integer]];
 priv let keep j out = match out {
     [[from, n], ..rest] => if from + n == j { list.cons [from, n + 1] rest } else { list.cons [j, 1] out },
     _ => list.cons [j, 1] out,
@@ -540,6 +555,7 @@ priv let keep j out = match out {
 
 /// `nothing` is dropped where it stands, so it takes no position: a child
 /// shown sometimes does not move its siblings' identity.
+priv let live : [Node] -> [Node];
 priv let live nodes = list.filter (fn n -> Node.tag n != "#none") nodes;
 
 /// What a handler makes of an event's value; `()` is no message.
@@ -586,10 +602,12 @@ let run_with! driver app = {
 /// A stylesheet given as rules rather than text: each is already text by the
 /// time it gets here (`std.graphics.css.rule` answers a string), so this is a
 /// join, and `css` stays a module a program imports only when it wants it.
+priv let css_text : [:string] -> :string;
 priv let css_text rules = str.join_str "\n" rules;
 
 /// `state` is strict: everything in it was made by effects (a render, a
 /// subscription sent), which must have happened before the loop waits again.
+priv let loop! : Driver -> App -> Loop -> :any;
 priv let rec loop! driver app !state = {
     match recv! () {
         Expecting(id, handler) => loop! driver app (Loop.set_pending ((Loop.pending state).[id => handler]) state),
@@ -613,9 +631,11 @@ priv let rec loop! driver app !state = {
 /// pointer moving) is folded into one view rather than one per event, and the
 /// page would only draw the last anyway. A DOM event is routed by the tree the
 /// page last showed, since that is what the person acted on.
+priv let settle! : Driver -> App -> Loop -> Loop;
 priv let settle! driver app state = if vm.mailbox_size! () > 0 { state } else { render! driver app state };
 
 /// One input from the page routed to the message it means, and that message applied.
+priv let step! : Driver -> App -> Loop -> Input -> Loop;
 priv let rec step! driver app state input = match input {
     Input.dom(id, event, value) => match (handlers_at (Loop.tree state) id).[event else ()] {
         () => state,
@@ -634,6 +654,7 @@ priv let rec step! driver app state input = match input {
 };
 
 /// Every handler's message for one value applied in turn.
+priv let apply_all! : Driver -> App -> Loop -> [Handler] -> :any -> Loop;
 priv let rec apply_all! driver app !state handlers value = match handlers {
     [] => state,
     [h, ..rest] => apply_all! driver app (apply! driver app state (message_of h value)) rest value,
@@ -642,6 +663,7 @@ priv let rec apply_all! driver app !state handlers value = match handlers {
 /// One message, then the subscriptions of the model it made -- at once rather
 /// than at the next render, so a ticker the new model no longer asks for has
 /// stopped before the next tick is routed.
+priv let apply! : Driver -> App -> Loop -> :any -> Loop;
 priv let apply! driver app state message = if message == () { state } else {
     let update! = App.update app;
     let next = update! message (Loop.model state);
@@ -651,6 +673,7 @@ priv let apply! driver app state message = if message == () { state } else {
 
 /// Each kind of thing the page is sent is sent only when its text differs from
 /// what was sent last.
+priv let subscribe! : Driver -> App -> Loop -> Loop;
 priv let subscribe! driver app state = {
     let subscriptions = App.subscriptions app;
     let subs = subscriptions (Loop.model state);
@@ -665,6 +688,7 @@ priv let subscribe! driver app state = {
 };
 
 /// The view of the current model sent as what changed, then what waited for it run.
+priv let render! : Driver -> App -> Loop -> Loop;
 priv let render! driver app state = {
     let view = App.view app;
     let tree = view (Loop.model state);
@@ -680,12 +704,14 @@ priv let render! driver app state = {
 };
 
 /// The actions waiting for a render, run in the order they were asked for.
+priv let run_later! : [:any] -> :unit;
 priv let rec run_later! actions = match actions {
     [] => (),
     [action!, ..rest] => { action! (); run_later! rest },
 };
 
 /// Subscriptions and then the view brought up to the model.
+priv let show! : Driver -> App -> Loop -> Loop;
 priv let show! driver app state = render! driver app (subscribe! driver app state);
 
 when test {
@@ -693,18 +719,21 @@ when test {
 
     union Msg { add, named(text : :string) }
 
+    let row : :integer -> :string -> Node;
     let row i label = element "li" [Attr.key (to_string i)] [text label];
     let unmade : :integer -> Node;
     let unmade n = %{}.["made"];
 
     /// A driver whose page is this test: everything the loop sends the page
     /// comes back to `me` as `[:what, value]`.
+    let recording! : :any -> Driver;
     let recording! me = Driver.new ()
         |> Driver.set_open (fn! options -> { send! me [:opened, Window.title options]; Result.ok () })
         |> Driver.set_render (fn! tree -> send! me [:render, tree])
         |> Driver.set_subscribe (fn! subs -> send! me [:subscribe, subs])
         |> Driver.set_close (fn! u -> send! me [:closed, ()]);
 
+    let counter : App;
     let counter = App.new () |> title "Counter" |> App.set_init 0
         |> App.set_update (fn msg model -> match msg { Msg.add => model + 1, Msg.named(t) => model + len t })
         |> App.set_view (fn model -> element "div" [] [
@@ -713,6 +742,7 @@ when test {
            ]);
 
     /// Drive the loop in a process of its own, and collect what it sent.
+    let drive! : App -> [:any] -> :any;
     let drive! app inputs = {
         let me = self! ();
         let ui = spawn! $( { send! me [:done, run_with! (recording! me) app]; () } );
@@ -724,6 +754,7 @@ when test {
         collect! []
     };
 
+    let tests : [:any];
     let tests = [
         test.case "headless open is explicit and harmless" $(test.eq! (Result.error :graphics_unavailable)
             (open! (Window.new ()))),
@@ -856,5 +887,6 @@ when test {
 
     /// Wait until the loop in the test above has rendered once, so the close
     /// arrives after the message its `start!` sent itself.
+    let proc_wait! : :any -> :unit;
     let rec proc_wait! me = match recv! () { [:render, _] => (), _ => proc_wait! me };
 }

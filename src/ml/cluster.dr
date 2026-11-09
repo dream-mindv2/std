@@ -32,15 +32,18 @@ mapping Clusters {
 }
 
 /// The squared Euclidean distance between two points, as lists of numbers.
+priv let sq_dist : [:float] -> [:float] -> :float;
 priv let sq_dist a b = list.fold (fn acc p -> { let d = list.head p - list.nth 1 p; acc + d * d }) 0.0 (list.zip a b);
 
 /// The index of the centre `score` puts nearest to `x`: the least score wins.
+priv let nearest_by : (:any -> :any -> :float) -> [:any] -> :any -> :integer;
 priv let nearest_by score centres x = list.head (list.fold (fn best ic -> {
     let s = score (list.nth 1 ic) x;
     if best == () || s < list.nth 1 best { [list.head ic, s] } else { best }
 }) () (list.enumerate centres));
 
 /// k-means++: `k` starting centres from `points`, by `dist` (smaller is nearer).
+priv let seeds : (:any -> :any -> :float) -> :integer -> :any -> [:any] -> [:any];
 priv let seeds dist k rng points = {
     let [first, r1] = random.run (random.pick points) rng;
     let rec more chosen r = if len chosen >= k || len chosen >= len points { list.reverse chosen } else {
@@ -55,6 +58,7 @@ priv let seeds dist k rng points = {
 };
 
 /// Lloyd's rounds from `centres`, with `dist` to assign and `mean` to move.
+priv let lloyd : (:any -> :any -> :float) -> ([:any] -> :any) -> [:any] -> [:any] -> [:integer] | :unit -> :integer -> Clusters;
 priv let rec lloyd dist mean points centres last round = {
     let assignment = list.map (fn x -> nearest_by dist centres x) points;
     if assignment == last || round >= 100 { Clusters.new () |> Clusters.set_assignment assignment |> Clusters.set_centres centres |> Clusters.set_rounds round }
@@ -93,6 +97,7 @@ let members c xs = list.map (fn i -> list.map (fn p -> list.nth 1 p) (list.filte
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "two clear groups are found" $({
             let c = kmeans 2 7 [[0.0, 0.1], [0.2, 0.0], [5.0, 5.1], [5.2, 4.9], [0.1, 0.2]];

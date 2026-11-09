@@ -238,6 +238,7 @@ let rec xor_lists xs ys = match [xs, ys] {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "network order, both ways"
             $( test.eq! [[0, 0, 1, 2], 258, [255, 255, 255, 255], -1, 65535, -2]

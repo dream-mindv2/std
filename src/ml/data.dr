@@ -281,8 +281,10 @@ let linear_truth seed dim = tensor.random (seed + 2) [dim] * 4.0 - 2.0;
 when test {
     import std.test;
 
+    let ds : :any;
     let ds = of_lists [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]] [0, 1, 0, 1, 0];
 
+    let tests : [:any];
     let tests = [
         test.case "size" $( test.eq! 5 (size ds) ),
         test.case "rows keep x and y together"

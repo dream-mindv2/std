@@ -135,9 +135,12 @@ let flatten t = { let n = rows t; tensor.reshape [n, tensor.size t / n] t };
 when test {
     import std.test;
 
+    let m : :tensor;
     let m = tensor.of_list [[1, 2, 3], [1000, 1000, 1000]];
+    let close : :tensor -> :tensor -> :bool;
     let close a b = tensor.maximum (tensor.abs (a - b)) < 1.0e-9;
 
+    let tests : [:any];
     let tests = [
         test.case "softmax rows sum to one"
             $( test.true! (close (tensor.sum_axis 1 (softmax m)) (tensor.of_list [1, 1])) ),

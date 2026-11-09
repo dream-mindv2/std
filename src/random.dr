@@ -580,11 +580,14 @@ let hex! n = crypto.hex (crypto.random_bytes! n);
 when test {
     import std.test;
 
+    let rng : :any;
     let rng = seed 42;
+    let die : :any;
     let die = values (int 1 6) rng;
     let counts : [:any] -> :map;
     let counts xs = list.fold (fn m x -> m.[x => m.[x else 0] + 1]) %{} xs;
 
+    let tests : [:any];
     let tests = [
         test.case "a seed is a stream"           $( test.eq! (list.take 20 die) (list.take 20 (values (int 1 6) (seed 42))) ),
         test.case "different seeds differ"       $( test.ne! (list.take 20 die) (list.take 20 (values (int 1 6) (seed 43))) ),

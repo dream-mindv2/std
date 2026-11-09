@@ -159,8 +159,10 @@ when test {
         to_fields self = [host self, port self]
     }
 
+    let ada : User;
     let ada = User.make "ada" 36;
 
+    let record_tests : [:any];
     let record_tests = [
         // what a record already did, before any of this
         test.case "a record crosses std.wire as itself"
@@ -222,25 +224,32 @@ when test {
     ];
     // These schemas are built by Dream code while compiling this test runner.
     // If any compiled fixture violates one, there is no test image to run.
+    let options_for_types : [:any];
     let options_for_types = [
         cli.value "m" "mode" "MODE" "mode" |> cli.choices ["fast", "safe"] |> cli.default_to "safe",
         cli.list_of "I" "include" "PATH" "paths",
         cli.count "v" "verbose" "verbosity",
         cli.flag "q" "quiet" "quiet",
     ];
+    let option_schema : :any;
     let option_schema = comp cli.values_type options_for_types;
+    let compiled_options : :any;
     let compiled_options = comp cli.parse_as option_schema options_for_types ["--mode", "fast", "-vv"];
     type Port = types.all_of [:integer, types.range 1 65535];
     type UserData = types.record_with %{ "name" => types.sized 1 40 :string }
                                       %{ "port" => Port };
+    let compiled_user : :any;
     let compiled_user = comp json.decode_as UserData "{\"name\":\"Ada\",\"port\":443}";
+    let compiled_packet : :any;
     let compiled_packet = comp wire.frame_as (list.Of :integer) [2, 3, 5];
 
+    let mismatch_kind : :any -> :any;
     let mismatch_kind result = match result {
         Result.error(e) => error.kind e,
         _ => (),
     };
 
+    let typing_tests : [:any];
     let typing_tests = [
         test.case "core scalar types compose" $( test.eq! [true, false, true]
             [types.accepts types.Integer 2, types.accepts types.Integer 2.0,
@@ -323,5 +332,6 @@ when test {
             agent.stop! pid
         } ),
     ];
+    let tests : [:any];
     let tests = record_tests + typing_tests;
 }

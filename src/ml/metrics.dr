@@ -163,9 +163,12 @@ let of name = match name {
 when test {
     import std.test;
 
+    let scores : :tensor;
     let scores = tensor.of_list [[0.9, 0.1, 0.0], [0.2, 0.7, 0.1], [0.1, 0.2, 0.7], [0.6, 0.3, 0.1]];
+    let labels : :tensor;
     let labels = tensor.of_list [0, 1, 1, 2];
 
+    let tests : [:any];
     let tests = [
         test.case "accuracy of classes" $( test.near! 1.0e-12 0.5 (accuracy scores labels) ),
         test.case "accuracy of one-hot rows" $( test.near! 1.0e-12 0.5 (accuracy scores (tensor.one_hot 3 labels)) ),

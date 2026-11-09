@@ -282,6 +282,7 @@ let logf! level template values = log! level (format! template values);
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "format values, escapes, Unicode, and empty templates"
             $( test.eq! [ok "{雪}: 42", ok "", ok "[] () true"]

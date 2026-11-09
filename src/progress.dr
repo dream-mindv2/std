@@ -219,8 +219,10 @@ let elapsed! bar = vm.wall_ms! () - Bar.started bar;
 when test {
     import std.test;
 
+    let bar : Bar;
     let bar = Bar.new () |> Bar.set_label "docs" |> Bar.set_total 8;
 
+    let tests : [:any];
     let tests = [
         test.case "an empty bar"       $( test.eq! "docs [                        ] 0/8" (line bar 0 "" 80) ),
         test.case "half way"           $( test.eq! "docs [===========>            ] 4/8" (line bar 4 "" 80) ),

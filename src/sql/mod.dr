@@ -2244,16 +2244,21 @@ priv let rec exec_all! c xs = match xs {
 when test {
     import std.test;
 
+    let pg : :any -> :map;
     let pg x = render postgres x;
+    let lite : :any -> :map;
     let lite x = render sqlite x;
+    let text_of : :any -> :any -> :string;
     let text_of d x = (render d x).[:text];
 
     // What the checker cannot see into, to reach the checks made on rendering.
     let unseen : :any -> :any;
     let unseen x = x;
 
+    let users : :any;
     let users = select ["id", "name"] |> from "users";
 
+    let fragment_tests : [:any];
     let fragment_tests = [
         test.case "a hole takes a parameter"
             $( test.eq! %{ :text => "a = ?", :params => [1], :problems => [] } (lite (q "a = ?" [1])) ),
@@ -2303,6 +2308,7 @@ when test {
                                  (q "? = ?" [1, col "a"])) ),
     ];
 
+    let query_tests : [:any];
     let query_tests = [
         test.case "a select, whole"
             $( test.eq! "SELECT \"name\", COUNT(\"id\") AS \"n\" FROM \"users\" WHERE (\"age\" > $1) AND (\"active\" = $2) GROUP BY \"name\" HAVING COUNT(\"id\") > $3 ORDER BY \"n\" DESC LIMIT 10 OFFSET 20"
@@ -2338,6 +2344,7 @@ when test {
                                     |> where (in_query "b" (select ["b"] |> from "u" |> where (eq "c" 2))))).[:params] ),
     ];
 
+    let write_tests : [:any];
     let write_tests = [
         test.case "an insert, from maps with atom keys"
             $( test.eq! ["INSERT INTO \"users\" (\"age\", \"name\") VALUES ($1, $2), (DEFAULT, $3) RETURNING \"id\"",
@@ -2370,6 +2377,7 @@ when test {
                         [text_of sqlite (insert_into "t"), text_of mysql (insert_into "t")] ),
     ];
 
+    let people : :any;
     let people = create_table "people" [
         column "id" :integer |> auto_increment,
         column "name" [:varchar, 80] |> not_null |> unique,
@@ -2378,6 +2386,7 @@ when test {
         unique_on ["name", "team"],
     ] |> if_not_exists;
 
+    let schema_tests : [:any];
     let schema_tests = [
         test.case "a table in sqlite"
             $( test.eq! "CREATE TABLE IF NOT EXISTS \"people\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" VARCHAR(80) NOT NULL UNIQUE, \"ok\" BOOLEAN DEFAULT 1, \"team\" INTEGER REFERENCES \"teams\" (\"id\"), UNIQUE (\"name\", \"team\"))"
@@ -2399,6 +2408,7 @@ when test {
                         (text_of mssql (add_column "t" (column "c" :text |> not_null))) ),
     ];
 
+    let group_tests : [:any];
     let group_tests = [
         test.case "statements of one text run together"
             $( test.eq! [["a", [[1], [2]]], ["b", [[3]]], ["a", [[4]]]]
@@ -2406,6 +2416,7 @@ when test {
                                      %{ :text => "b", :params => [3] }, %{ :text => "a", :params => [4] }]) ),
     ];
 
+    let pg_tests : [:any];
     let pg_tests = [
         test.case "() in an insert is the default, and a column nobody gives is left out"
             $( test.eq! ["INSERT INTO \"t\" (\"a\") VALUES (?)", "INSERT INTO \"t\" DEFAULT VALUES"]
@@ -2456,5 +2467,6 @@ when test {
         begin_with options
     };
 
+    let tests : [:any];
     let tests = fragment_tests + query_tests + write_tests + schema_tests + group_tests + pg_tests;
 }

@@ -774,6 +774,7 @@ let find_program! program = match programs_on_path! program { [] => Option.none,
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         // --- POSIX ---
         test.case "posix: a path is absolute when it starts at the root"

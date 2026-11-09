@@ -238,8 +238,10 @@ let intersect other m = filter (fn k _ -> _map_has other k) m;
 when test {
     import std.test;
 
+    let m : :map;
     let m = from_pairs [[:a, 1], [:b, 2]];
 
+    let tests : [:any];
     let tests = [
         test.case "empty has nothing"      $( test.false! (has :a empty) ),
         test.case "from_pairs"             $( test.eq! 1 (get 0 :a m) ),

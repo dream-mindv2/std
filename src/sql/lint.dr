@@ -302,6 +302,7 @@ when test {
     let kinds : [:any] -> [:atom];
     let kinds ts = list.map (fn t -> t.[0]) ts;
 
+    let tests : [:any];
     let tests = [
         test.case "quotes, comments and dollar bodies are not code"
             $( test.eq! [:code, :literal, :code, :literal, :code, :literal, :code, :positional]

@@ -539,6 +539,7 @@ let terminal_probe : Terminal -> :string;
 let terminal_probe t = Terminal.key t + "-probe";
 
 /// One span, as an element only when it has a style of its own.
+priv let term_span : [:any] -> Node;
 priv let term_span span = {
     let [s, fg, bg, flags] = span;
     if fg == "" && bg == "" && flags == 0 { text_node s } else {
@@ -555,10 +556,12 @@ priv let term_span span = {
 };
 
 /// Lines a block of the grid holds.
+priv let block_size : :integer;
 priv let block_size = 64;
 
 /// The lines from number `n` on, as blocks: each the lines up to the next
 /// multiple of `block_size`, so a block keeps its place as lines scroll away.
+priv let term_blocks : :string -> :map -> :integer -> [[:any]] -> [Node] -> [Node];
 priv let rec term_blocks key marks !n lines !out = match lines {
     [] => list.reverse out,
     _ => {
@@ -571,6 +574,7 @@ priv let rec term_blocks key marks !n lines !out = match lines {
 };
 
 /// One block: its lines, each lazy and keyed by its number.
+priv let term_block : [:any] -> Node;
 priv let term_block parts = {
     let [key, n, these, ms] = parts;
     kit "div" "term-block" (list.zip_with (fn i pair -> lazy2 term_line (list.head pair) (list.nth 1 pair) |> Node.set_key (key + "-l" + to_string (n + i)))
@@ -578,12 +582,15 @@ priv let term_block parts = {
 };
 
 /// A line of the grid, with its mark.
+priv let term_line : [[:any]] -> :any -> Node;
 priv let term_line spans mark = kit "div" "term-line" (list.map term_span spans)
     |> with (if mark == () { Attr.none } else { Attr.class ("dw-term-mark dw-term-" + atom.name mark) });
 
 /// A handler reading the event, for a function that was given; nothing for `()`.
+priv let on_maybe : :string -> :any -> Attr;
 priv let on_maybe event f = if f == () { Attr.none } else { Attr.on event (Handler.reading f) };
 /// A handler sending `message`, for a message that was given; nothing for `()`.
+priv let tell_maybe : :string -> :any -> Attr;
 priv let tell_maybe event message = if message == () { Attr.none } else { Attr.on event (Handler.message message) };
 
 /// A terminal's screen: its lines in blocks, the cursor laid over them, and
@@ -749,6 +756,7 @@ let icon name = element "svg" [Attr.class "dw-icon", Attr.attribute "viewBox" "0
     Attr.attribute "aria-hidden" "true"] [element "path" [Attr.attribute "d" (icon_path name)] []];
 
 /// The SVG path an icon is drawn with, or `""` for a name the kit does not have.
+priv let icon_path : :string -> :string;
 priv let icon_path name = match name {
     "plus" => "M12 5v14M5 12h14",
     "minus" => "M5 12h14",
@@ -804,6 +812,7 @@ priv let icon_path name = match name {
 };
 
 /// The icon a notice or toast of this tone shows.
+priv let tone_icon : :atom -> :string;
 priv let tone_icon t = match t {
     :success => "check",
     :warning => "warning",
@@ -814,32 +823,42 @@ priv let tone_icon t = match t {
 // --- the parts -------------------------------------------------------------------
 
 /// An element with the kit's class for `name`.
+priv let kit : :string -> :string -> [Node] -> Node;
 priv let kit tag name children = element tag [Attr.class ("dw-" + name)] children;
 /// The kit's class for `name` added to a node.
+priv let class : :string -> Node -> Node;
 priv let class name node = with (Attr.class ("dw-" + name)) node;
 
 /// A label around a control: clicking the words focuses the control, and a
 /// screen reader reads them as its name, with no id to keep unique.
+priv let field : :string -> Node -> Node;
 priv let field label control_node = kit "label" "field" [kit "span" "field-label" [text_node label], control_node];
 /// An `<input>` of `kind` showing `value`, sending `f` of what is typed.
+priv let input_of : :string -> :string -> (:string -> :any) -> Node;
 priv let input_of kind value f = element "input" [Attr.class "dw-control", Attr.attribute "type" kind,
     Attr.attribute "value" value, Attr.on "input" (Handler.reading f)] [];
 
+priv let controls : [:string];
 priv let controls = ["input", "textarea", "select", "button"];
 /// `f` applied to every control in `node`, the node itself if it is one.
+priv let control : (Node -> Node) -> Node -> Node;
 priv let rec control f node = if list.contains (Node.tag node) controls { f node }
     else { Node.set_children (list.map (fn c -> control f c) (Node.children node)) node };
 
 /// Typed text as a number: an integer, a float, or `()` when it is neither.
+priv let number_of : :string -> :integer | :float | :unit;
 priv let number_of s = match num.parse_int s {
     Option.none => Option.or_unit (num.parse_float s),
     Option.some(n) => n,
 };
 /// A fraction held between 0 and 1.
+priv let clamp : :integer | :float -> :integer | :float;
 priv let clamp x = if x < 0 { 0 } else if x > 1 { 1 } else { x };
 /// A step of the spacing scale, 0 to 8, as the custom property that holds it.
+priv let space : :integer -> :string;
 priv let space n = "var(--dw-space-" + to_string (if n < 0 { 0 } else if n > 8 { 8 } else { n }) + ")";
 /// An alignment as CSS says it.
+priv let place : :atom -> :string;
 priv let place a = match a {
     :start => "flex-start",
     :end => "flex-end",
@@ -849,6 +868,7 @@ priv let place a = match a {
 };
 /// A name made of a label: lower case, a hyphen for anything that is not a
 /// letter or a digit.
+priv let slug : :string -> :string;
 priv let slug s = str.of_chars (list.map (fn c -> if char.is_alnum c { char.lower c } else { '-' }) (str.chars s));
 
 // --- the design ------------------------------------------------------------------
@@ -867,6 +887,7 @@ let styles theme = list.concat [
     applications,
 ];
 
+priv let light_palette : %{:string => :string};
 priv let light_palette = %{
     "--dw-bg" => "#f6f6f8", "--dw-surface" => "#ffffff", "--dw-sunken" => "#efeff3",
     "--dw-text" => "#1b1b22", "--dw-muted" => "#6a6a78", "--dw-border" => "#dedee6",
@@ -880,6 +901,7 @@ priv let light_palette = %{
 };
 
 /// The theme's colours for a light page.
+priv let light : Theme -> %{:string => :string};
 priv let light theme = map.merge light_palette %{
     "color-scheme" => if Theme.mode theme == :dark { "dark" } else if Theme.mode theme == :light { "light" } else { "light dark" },
     "--dw-accent" => Theme.accent theme, "--dw-danger" => Theme.danger theme,
@@ -891,6 +913,7 @@ priv let light theme = map.merge light_palette %{
     "--dw-space-8" => "4rem",
 };
 
+priv let dark : %{:string => :string};
 priv let dark = %{
     "--dw-bg" => "#111116", "--dw-surface" => "#1b1b22", "--dw-sunken" => "#15151b",
     "--dw-text" => "#ececf2", "--dw-muted" => "#9c9cab", "--dw-border" => "#2e2e38",
@@ -904,8 +927,10 @@ priv let dark = %{
 };
 
 /// A colour mixed toward transparent: what tints and rings are made of.
+priv let tint : :string -> :integer -> :string;
 priv let tint c pct = "color-mix(in srgb, " + c + " " + to_string pct + "%, transparent)";
 
+priv let base : [:string];
 priv let base = [
     css.rule "body" %{ "background" => "var(--dw-bg)", "color" => "var(--dw-text)", "font-family" => "var(--dw-font)",
         "font-size" => "15px", "line-height" => "1.5", "-webkit-font-smoothing" => "antialiased" },
@@ -1074,6 +1099,7 @@ priv let base = [
 ];
 
 /// The stylesheet of the application widgets: frames, tabs, palettes, terminals.
+priv let applications : [:string];
 priv let applications = [
     css.rule ".dw-frame" %{ "display" => "flex", "flex-direction" => "column", "height" => "100vh", "overflow" => "hidden",
         "background" => "var(--dw-bg)", "color" => "var(--dw-text)" },
@@ -1208,7 +1234,9 @@ priv let applications = [
 when test {
     import std.test;
     import std.graphics;
+    let classes_of : Node -> [:string];
     let classes_of n = Node.classes n;
+    let tests : [:any];
     let tests = [
         test.case "a widget is a node with the kit's class" $(test.eq! [["dw-button", "dw-primary"], "button"]
             [classes_of (button "Save" :save |> primary), Node.tag (button "Save" :save)]),

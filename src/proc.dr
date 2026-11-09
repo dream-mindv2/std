@@ -396,14 +396,17 @@ let is_shutdown m = m == shutdown;
 when test {
     import std.test;
 
+    let double : :integer -> :integer;
     let double x = x * 2;
 
     /// Never answers and never reads its mailbox: what `kill!` is for.
+    let spin : :integer -> :any;
     let rec spin !n = spin (n + 1);
 
     /// A worker that adds up what it is sent and answers its total when asked
     /// to stop. Every test below drives one of these, because a process that
     /// only ever answers is the only kind a test can wait for.
+    let adder! : :unit -> :any;
     let adder! () =
         serve! 0 (fn! total m ->
             if is_shutdown m { [:stop, total] }
@@ -413,6 +416,7 @@ when test {
             }
             else { [:go, total + m] });
 
+    let tests : [:any];
     let tests = [
         test.case "parallel! answers in order"
             $( test.eq! [1, 2, 3] (parallel! [$( 1 ), $( 2 ), $( 3 )]) ),

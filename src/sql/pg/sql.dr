@@ -504,6 +504,7 @@ when test {
     let kinds : [:any] -> [:atom];
     let kinds ts = list.map (fn t -> t.[0]) ts;
 
+    let tests : [:any];
     let tests = [
         test.case "a fragment renders its values as numbered parameters"
             $( test.eq! ["SELECT * FROM t WHERE a = $1 AND b = $2", [1, "x"]]

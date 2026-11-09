@@ -697,11 +697,15 @@ priv let replace path x t = match path {
 when test {
     import std.test;
 
+    let x : :tensor;
     let x = tensor.of_list [[0.5, -1.2, 2.0], [1.5, 0.3, -0.7]];
+    let w : :tensor;
     let w = tensor.of_list [[0.1, -0.4], [0.7, 0.2], [-0.3, 0.9]];
+    let b : :tensor;
     let b = tensor.of_list [0.05, -0.1];
 
     /// Whether the gradient of `f` agrees with central differences.
+    let checks : :any -> :any -> :bool;
     let checks f p = {
         let got = grad f p;
         let want = numeric_grad f p 1.0e-5;
@@ -709,6 +713,7 @@ when test {
         list.all (fn [path, g] -> diff g (tree.at path want) < 1.0e-6) (tree.paths got)
     };
 
+    let tests : [:any];
     let tests = [
         test.case "a constant is not a variable" $( test.false! (is_var (add x x)) ),
         test.case "value_and_grad of a sum" $( test.eq! (tensor.fill_like x 1.0) (grad sum x) ),

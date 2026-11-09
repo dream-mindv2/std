@@ -237,11 +237,14 @@ let zeros_like t = map_numeric (fn x -> if type_of x == :tensor { tensor.fill_li
 when test {
     import std.test;
 
+    let p : [:map];
     let p = [%{"w" => tensor.of_list [[1, 2], [3, 4]], "b" => tensor.of_list [1, 1], "act" => :relu}, %{}];
 
     struct Dense { w, b, act }
+    let r : [:any];
     let r = [Dense.make 2.0 3.0 :relu, 1.0];
 
+    let tests : [:any];
     let tests = [
         test.case "size counts numbers and skips settings" $( test.eq! 6 (size p) ),
         test.case "a record is a branch, and comes back the record it was"

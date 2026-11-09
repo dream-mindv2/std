@@ -344,8 +344,10 @@ when test {
         derive std.server;
         import std.map;
 
+        let init! : :any -> :any;
         let init! seed = seed;
 
+        let handle_call! : :any -> :any -> :any -> :any;
         let handle_call! request from state = match request {
             [:get, k]    => reply (map.get :missing k state) state,
             [:put, k, v] => reply :ok (map.put k v state),
@@ -353,6 +355,7 @@ when test {
             _            => reply (err :unknown) state,
         };
 
+        let handle_cast! : :any -> :any -> :any;
         let handle_cast! message state = match message {
             [:put, k, v] => noreply (map.put k v state),
             // A way to end this server on purpose, so that a supervisor can be
@@ -375,6 +378,7 @@ when test {
     /// The `strict!` matters for the same reason: an answer still holding an
     /// unforced read of a socket would be forced by the assertion, after this
     /// has closed it.
+    priv let with_store! : (:any -> :any) -> :any;
     priv let with_store! body! = {
         let s = store.start! %{};
         let l = serve! 0 s;
@@ -384,6 +388,7 @@ when test {
         answer
     };
 
+    priv let here! : :integer -> :any;
     priv let here! port = connect! "127.0.0.1" port;
 
     /// Ask the registry for `name` until it is bound to something other than
@@ -397,10 +402,12 @@ when test {
     /// registering, the registry has dropped the name, and `()` is not `was`
     /// -- accepting it sent the next call into that gap about one run in
     /// twenty-four, as "nothing is serving this listener now".
+    priv let settle! : :any -> :string -> :any -> :any;
     priv let settle! reg name was =
         test.eventually! (fn! () -> registry.whereis! reg name) (fn p -> p != was && p != ())
                          test.patience;
 
+    let tests : [:any];
     let tests = [
         test.case "a call goes out and an answer comes back"
             $( test.eq! :ok (with_store! (fn! port -> {

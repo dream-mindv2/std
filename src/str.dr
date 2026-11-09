@@ -275,6 +275,7 @@ let join_str sep parts =
 /// `sep` before each of `parts`: what `join_str` hands `_str_concat`. A cons
 /// at a time and lazily, where `flat_map` made a list of two for each part
 /// and joined them up -- a cost every JSON array and every rendered page paid.
+priv let between : :string -> [:string] -> [:string];
 priv let rec between sep parts = match parts {
     [] => [],
     [s, ..rest] => _list_cons sep (_list_cons s (between sep rest)),
@@ -699,6 +700,7 @@ let trim s = {
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         // --- from std.seq, over characters ---
         test.case "seq count"        $( test.eq! 3 (count (fn c -> c == 'l') "Hello, World") ),

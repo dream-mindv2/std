@@ -913,6 +913,7 @@ let of_array a = _array_to_list a;
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "length of empty"     $( test.eq! 0 (length []) ),
         test.case "length"              $( test.eq! 3 (length [1, 2, 3]) ),

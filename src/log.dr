@@ -399,9 +399,12 @@ let release! lg = match Logger.sink lg { [:agent, pid] => { agent.stop! pid; () 
 when test {
     import std.test;
 
+    let at_noon : :integer;
     let at_noon = time.to_instant (time.datetime 2026 10 4 12 0 0);
+    let event : Level -> :string -> :string -> :map -> Event;
     let event l name msg fields = Event.make at_noon l name msg fields;
 
+    let tests : [:any];
     let tests = [
         test.case "a text line" $( test.eq! "2026-10-04T12:00:00Z WARN  db: slow query sql=\"SELECT 1\" took=340ms"
             (render new (event :warn "db" "slow query" %{ :took => "340ms", :sql => "SELECT 1" }) false) ),

@@ -48,6 +48,7 @@ let licenses u = text "licenses";
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "an image built for tests carries none" $( test.eq! 0 (count ()) ),
         test.case "nothing is found by a name it does not carry" $( test.eq! [Option.none, Option.none, Option.none] [index "logo", named "logo", text "logo"] ),

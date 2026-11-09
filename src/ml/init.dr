@@ -127,6 +127,7 @@ let seed_for seed i = (seed * 1000003 + i * 7919 + 17) % 2305843009213693951;
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "fans of a matrix" $( test.eq! [3, 4] (fans [3, 4]) ),
         test.case "fans of a kernel" $( test.eq! [27, 144] (fans [3, 3, 3, 16]) ),

@@ -245,8 +245,10 @@ let walk! dir = match io.stat! dir {
 when test {
     import std.test;
 
+    let scratch! : :unit -> :string;
     let scratch! () = "dream-file-test-" + to_string (os.pid! ());
 
+    let tests : [:any];
     let tests = [
         test.case "the parent of a path"
             $( test.eq! ["a/b", "", "/", "/a", "a", "."]
