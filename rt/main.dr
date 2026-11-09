@@ -136,7 +136,7 @@ let ctx_seg_ran = 808;
 let ctx_frames_floor = 816;
 /// 1 during a minor collection: only what is in the nursery is copied (`in_nursery!`).
 let ctx_minor = 824;
-/// Freed chunks of the nursery too large for a size class, to be given out again (`young_get!`).
+/// Unused: the nursery's free chunks are the world's now (`young_get!`).
 let ctx_young_spare = 832;
 /// The token of the map a loop writes in place, during one of its sets (`map_assoc_owned!`).
 let ctx_token = 840;
@@ -293,7 +293,17 @@ let chunk_get! !p !size =
 
 let in_nursery! !v = prim.ult (v - prim.load64! (world_at! w_young_lo)) (prim.load64! (world_at! w_young_size));
 
-let young_class_head! !p !size = prim.load64! (p + ctx_classes) + (small_class_count + class_of size 0) * class_words * word;
+// The nursery's free chunks are the world's, not a worker's: a chunk goes back where any worker
+// may take it again. A list per worker filled on the worker that freed a chunk and stayed empty on
+// the one that wanted one, which carved new address space instead, and every page carved stays in
+// memory: a native self-compile used up two gigabytes of the nursery in nine seconds with half a
+// gigabyte live, and passed twenty in a minute and a half. Chunk sizes are powers of two, so each
+// has a list of its own (`young_class!`), large ones too, and one taken is one of exactly its size.
+
+/// The list of free nursery chunks of `size`, a power of two: one word each, in the world's table.
+let young_class! !size = prim.load64! (world_at! w_young_classes) + young_log! size 0 * word;
+
+let young_log! !size !k = if size <= 1 { k } else { young_log! (prim.ushr size 1) (k + 1) };
 
 /// `bytes` of the nursery's address space, never handed out before.
 let nursery_take! !bytes = {
@@ -304,35 +314,27 @@ let nursery_take! !bytes = {
 };
 
 /// A chunk of the nursery, as `chunk_get!` is one of the old.
-let young_get! !p !size =
-    if size > slab_bytes / 2 {
-        let c = spare_fit! (p + ctx_young_spare) (prim.load64! (p + ctx_young_spare)) size;
-        if c != 0 { c } else { nursery_take! size }
-    } else {
-        let head = young_class_head! p size;
-        let csize = small_chunk << class_of size 0;
-        let c = prim.load64! head;
-        if c != 0 {
-            prim.store64! head (prim.load64! c);
-            c
-        } else {
-            if prim.load64! (head + word) + csize > prim.load64! (head + 2 * word) {
-                let slab = nursery_take! slab_bytes;
-                prim.store64! (head + word) slab;
-                prim.store64! (head + 2 * word) (slab + slab_bytes);
-            };
-            let fresh_ = prim.load64! (head + word);
-            prim.store64! (head + word) (fresh_ + csize);
-            prim.store64! (fresh_ + word) csize;
-            fresh_
-        }
-    };
+let young_get! !p !size = {
+    let lock = world_at! w_young_lock;
+    spin_lock! lock;
+    let head = young_class! size;
+    let c = prim.load64! head;
+    let chunk = if c != 0 { prim.store64! head (prim.load64! c); c } else { 0 };
+    spin_unlock! lock;
+    if chunk != 0 { chunk } else {
+        let fresh_ = nursery_take! size;
+        prim.store64! (fresh_ + word) size;
+        fresh_
+    }
+};
 
 let young_put! !p !c = {
-    let size = prim.load64! (c + word);
-    let head = if size > slab_bytes / 2 { p + ctx_young_spare } else { young_class_head! p size };
+    let lock = world_at! w_young_lock;
+    spin_lock! lock;
+    let head = young_class! (prim.load64! (c + word));
     prim.store64! c (prim.load64! head);
     prim.store64! head c;
+    spin_unlock! lock;
     0
 };
 
@@ -353,6 +355,7 @@ let nursery_init! () = {
     let want = if want0 > room { room } else { want0 };
     let at = nursery_reserve! (if want < 268435456 { 268435456 } else { want });
     prim.store64! (world_at! w_young_next) at;
+    prim.store64! (world_at! w_young_classes) (prim.c2! "calloc" 64 word);
     let most = prim.c1! "getenv" "DREAM_NURSERY_MAX_MB";
     prim.store64! (world_at! w_nursery_max) (if most != 0 { prim.c1! "atol" most * 1048576 } else { nursery_max });
     0
@@ -647,6 +650,9 @@ let w_young_next = 672;
 let w_nursery_max = 680;
 /// The last token given a loop that writes a map in place (`fresh_token!`).
 let w_tokens = 688;
+/// The nursery's free chunks, a list for each power of two (`young_get!`), and the lock on them.
+let w_young_classes = 704;
+let w_young_lock = 712;
 /// The least the shared region grows by before a census is begun: `census_min`, or
 /// `DREAM_CENSUS_MIN_MB`.
 let w_census_min = 696;
@@ -1388,7 +1394,10 @@ let object_words! !o !info = {
         2 + (prim.load64! (o + word) + word) / word
     } else if kind == kind_array || kind == kind_pap || kind == kind_map || kind == kind_tensor {
         2 + untag_fix (prim.load64! (o + word))
-    } else if kind == kind_record || kind == kind_big || kind == kind_record_f {
+    } else if kind == kind_record || kind == kind_record_f {
+        // The fields, then the identity word (`record_identity!`).
+        4 + untag_fix (prim.load64! (o + word))
+    } else if kind == kind_big {
         3 + untag_fix (prim.load64! (o + word))
     } else if kind == kind_hole || kind == kind_ind {
         2
@@ -1978,13 +1987,23 @@ let collect! !p !sp = {
         let old_bytes = (if minor { prim.load64! (pcb + pcb_old_bytes) } else { 0 }) + live;
         prim.store64! (pcb + pcb_old) (joined_chunks! to (prim.load64! (pcb + pcb_old)));
         prim.store64! (pcb + pcb_old_bytes) old_bytes;
-        if not minor { prim.store64! (pcb + pcb_major_at) (if 3 * live > min_chunk { 3 * live } else { min_chunk }); };
+        // Three times what survived for a heap under a gigabyte, half as much again above: at three
+        // times, a compile's four live gigabytes could leave twelve of old before a major, and the
+        // copy on top -- the native self-compile passed twenty.
         // A kept chunk goes back where it was: the nursery's to the nursery, and an old one -- a
         // major collection pins in old chunks too -- to the old, or the next minor collection would
         // free it with what is pinned in it.
         prim.store64! (p + ctx_chunks) 0;
         kept_chunks! p pcb (prim.load64! (p + ctx_pinned));
         prim.store64! (p + ctx_pinned) 0;
+        // Spaced from all that is old now, what pins kept included: measured from what was copied
+        // alone, the compiler's two gigabytes pinned in place were more than the room left, and every
+        // collection after the first major was another -- five thousand of them, a gigabyte each.
+        if not minor {
+            let old_now = prim.load64! (pcb + pcb_old_bytes);
+            let spaced = if old_now > 1073741824 { old_now + old_now / 2 } else { 3 * old_now };
+            prim.store64! (pcb + pcb_major_at) (if spaced > min_chunk { spaced } else { min_chunk });
+        };
     } else {
         prim.store64! (p + ctx_chunks) to;
         unpin! p to;
@@ -2014,12 +2033,16 @@ let collect! !p !sp = {
     // since what is made to last is copied once however often the nursery fills, and half as
     // large while a sixteenth or less does, to stay where the caches are. `maps` and `tree` want
     // a small one and `strs` and `sorts`, whose lists live, a large one; 8 MB to start
-    // (`DREAM_NURSERY_MAX_MB`), between 2 MB and 256 MB.
+    // (`DREAM_NURSERY_MAX_MB`), from 2 MB.
     let was = prim.load64! (pcb + pcb_nursery);
     let size_now = if was == 0 { prim.load64! (world_at! w_nursery_max) } else { was };
+    // The most it grows to: 256 MB for the first process, where a program's own work is, and 32 MB
+    // for any other. A process each, two hundred parts of a compile each at 256 MB was past the
+    // machine's memory, where one at 32 MB is a fraction of it.
+    let largest = if prim.load64! (pcb + pcb_id) == 1 { 268435456 } else { 33554432 };
     let resized = if not minor || made == 0 { size_now }
-        else if live * 2 > made && size_now < 268435456 { size_now * 4 }
-        else if live * 4 > made && size_now < 268435456 { size_now * 2 }
+        else if live * 2 > made && size_now < largest { if size_now * 4 > largest { largest } else { size_now * 4 } }
+        else if live * 4 > made && size_now < largest { if size_now * 2 > largest { largest } else { size_now * 2 } }
         else if live * 16 < made && size_now > 2097152 { size_now / 2 }
         else { size_now };
     prim.store64! (pcb + pcb_nursery) resized;
@@ -3739,10 +3762,11 @@ let list_of_words! !p !at !n !tail = if n == 0 { tail } else {
 let array_to_list! !p !a = list_of_words! p (a + 2 * word) (untag_fix (prim.load64! (a + word))) nil_word;
 
 let new_record! !p !id !n = {
-    let o = alloc! p ((3 + n) * word);
+    let o = alloc! p ((4 + n) * word);
     prim.store64! o (prim.info "record");
     prim.store64! (o + word) (tag_fix n);
     prim.store64! (o + 2 * word) id;
+    prim.store64! (o + (3 + n) * word) 0;
     o
 };
 
@@ -3911,8 +3935,9 @@ let is_error! !v = is_kind! v kind_error;
 // next]`, the hash tagged and so short of its top bit, which is why the level of a key
 // is worked out from those 63 bits everywhere. The hash of a string or an integer is
 // the VM's, so that a map of them iterates in the order programs have been printing;
-// a structure hashes by kind alone, since it moves and has no room for an identity, and
-// is found by a walk of the chain. Nothing here forces, and the key has been.
+// a record by the identity it carries (`record_identity!`), and any other structure by
+// kind alone, since it moves and has no room for an identity, and is found by a walk of
+// the chain. Nothing here forces, and the key has been.
 
 let fnv_prime = 1099511628211;
 let fnv_start = 1469598103934665603;
@@ -3927,6 +3952,25 @@ let mix !h = {
     b ^ prim.ushr b 33
 };
 
+/// A record's identity hash, which `key_hash!` gives a record a map compares by identity: the
+/// word after its fields, set from where the record lies the first time anything asks, and
+/// carried by every copy the collector or a message makes, so it is the same wherever the record
+/// has moved since. Fifteen bits would do, as on the VM (`identity_hash` in dream/src/heap.hpp):
+/// equality is still by identity, and a collision is a longer chain, not a wrong answer. Only
+/// the record's own process asks, and an integer needs no barrier; a record outside every
+/// process's heap does not move, and is hashed where it lies.
+let record_identity! !v = {
+    let at = v + (3 + untag_fix (prim.load64! (v + word))) * word;
+    let had = prim.load64! at;
+    if had != 0 { had }
+    else if not (is_heap_object! v) { tag_fix (mix v & 1099511627775) }
+    else {
+        let made = tag_fix (mix v & 1099511627775);
+        prim.store64! at made;
+        made
+    }
+};
+
 let key_hash! !v = {
     let h =
         if is_string! v { bytes_hash! (string_bytes v) (string_len! v) 0 fnv_start }
@@ -3934,6 +3978,7 @@ let key_hash! !v = {
         else if is_big! v { mix (prim.load64! (limb_at v 0)) }
         else if is_object v {
             if is_record! v && prim.load64! (v + word) == tag_fix 0 { mix (prim.load64! (v + 2 * word)) }
+            else if is_record! v { mix (record_identity! v) }
             else { mix (kind_of! v) }
         }
         else { mix v };
@@ -4334,8 +4379,12 @@ let index_set! !p !c !k !v =
             // A raw record stays one while what is set is a float; anything else makes it boxed.
             let keeps = raw && is_object v && prim.load64! v == prim.info "float";
             let from = if raw && not keeps { boxed_record! p c } else { c };
-            let o = alloc! p ((off + n) * word);
+            // A record has its identity word after the fields, and a changed record is
+            // another one: it starts without an identity of its own.
+            let ident = if is_record! c { 1 } else { 0 };
+            let o = alloc! p ((off + n + ident) * word);
             copy_words! from o (off + n);
+            if ident == 1 { prim.store64! (o + (off + n) * word) 0; };
             prim.store64! (o + (off + i) * word) (if keeps { prim.load64! (v + word) } else { v });
             o
         }
@@ -5881,6 +5930,22 @@ let entry_d! !p !sp !a !b !c !d = {
             yield_now! p (sp - word) unit_word 0 0 0
         } else { unit_word }
     }
+};
+
+/// A direct function's entry when its guard was passed, its whole stop path (`machine.dsafepoint`):
+/// `entry_d!`, and then the function again from the top -- nothing has happened in it yet but the
+/// reading of its arguments -- unless that ran it on a segment of its own, which is then its
+/// answer. Written once here, it was twenty lines in every function, a sixth of a program's IR.
+/// Which function and where its stack stood were stored by the caller (`ctx_retry`), and are read
+/// before the call: the process may go on on another worker, whose context is another.
+let stop_d! !p !sp !a !b !c !d = {
+    let code = prim.load64! (p + ctx_retry);
+    let sp0 = prim.load64! (p + ctx_retry_stack);
+    let r = entry_d! p sp a b c d;
+    let q = if prim.arch () == arch_aarch64 { p } else { prim.ctx_here! () };
+    if r == 0 { 0 }
+    else if prim.load64! (q + ctx_seg_ran) != 0 { prim.store64! (q + ctx_seg_ran) 0; r }
+    else { prim.call! code q sp0 a b c d }
 };
 
 // A machine stack in direct style is a chain of segments. A process starts on one; a function

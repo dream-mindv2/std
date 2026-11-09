@@ -153,28 +153,52 @@ let join_all! label ps = {
 /// a self-compile's longest parts each sat 100 to 280 ms in a queue. Longest
 /// first is the classic cure (Graham's rule for scheduling a list of jobs).
 let join_heaviest_first! : :string -> (a -> :integer) -> (a -> :process) -> [a] -> [:any];
-let join_heaviest_first! label weight start! items = {
+///
+/// At most as many run at once as there are workers to run them (`window`), each next one started
+/// as the oldest still running is joined: all started at once, two hundred parts of a compile each
+/// held a heap of its own while a dozen cores went through them, and a native self-compile passed
+/// twenty gigabytes.
+let join_heaviest_first! label weight launch! items = {
     let order = list.sort_on (fn ix -> 0 - weight (list.nth 1 ix)) (list.enumerate items);
-    let started = started_each! start! order [];
-    join_all! label (list.map (fn ip -> list.nth 1 ip) (list.sort_on list.head started))
+    let bar = start! label (len items);
+    show! bar 0 ""
+    let answered = windowed! bar launch! (window! ()) order [] 0 [];
+    finish! bar
+    list.map (fn iv -> list.nth 1 iv) (list.sort_on list.head answered)
 };
 
-/// `join_heaviest_first!`'s starts, one at a time and in order, each with
-/// the position its item had.
-priv let started_each! : (a -> :process) -> [[:integer, a]] -> [[:integer, :process]] -> [[:integer, :process]];
-priv let rec started_each! start! ixs !acc = match ixs {
-    [] => acc,
-    [[i, x], ..rest] => {
+/// How many parts run at once: twice the workers the VM has, or 16 where it says none.
+let window! : :unit -> :integer;
+let window! () = match vm.scheduler! () {
+    () => 16,
+    info => {
+        let workers = info.[:workers else 0];
+        if workers > 0 { 2 * workers } else { 16 }
+    },
+};
+
+/// The loop of `join_heaviest_first!`: start while fewer than `width` are running, and otherwise
+/// join the oldest running, `[position, process]` each, answering `[position, value]`s.
+priv let windowed! : Bar -> (a -> :process) -> :integer -> [[:integer, a]] -> [[:integer, :process]] -> :integer -> [[:integer, :any]] -> [[:integer, :any]];
+priv let rec windowed! bar launch! width todo running !done !acc = match [todo, running] {
+    [[], []] => acc,
+    [[[i, x], ..rest], _] if list.length running < width => {
         // Forced before it is started: numbered by `list.enumerate`, an item
         // is a suspension of the zip that numbered it, holding every item
-        // after it, and `start!` handing it to `spawn!` copied them all into
+        // after it, and `launch!` handing it to `spawn!` copied them all into
         // each process -- a self-compile went from 4.4 s to 19, and 2.4 GB
         // to 9.
         strict! x
-        let p = start! x;
+        let p = launch! x;
         strict! p
-        started_each! start! rest (list.cons [i, p] acc)
+        windowed! bar launch! width rest (list.append running [[i, p]]) done acc
     },
+    [_, [[i, p], ..still]] => {
+        let v = join! p;
+        show! bar (done + 1) ""
+        windowed! bar launch! width todo still (done + 1) (list.cons [i, v] acc)
+    },
+    _ => acc,
 };
 
 /// `join_all!`'s loop: each value forced as it is joined, the bar moved on.
