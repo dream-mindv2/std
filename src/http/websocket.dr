@@ -284,7 +284,7 @@ priv let u16 b = str.byte 0 b * 256 + str.byte 1 b;
 /// The next frame: `[fin, opcode, payload, reader]`, the payload unmasked,
 /// or `()` at the end of the stream. A server's reader (`must_mask`)
 /// refuses an unmasked frame.
-priv let read_frame! : :any -> :bool -> :integer -> :any;
+priv let read_frame! : :any -> :bool -> :integer -> [:bool, :any, :any, :any];
 priv let read_frame! r must_mask limit = {
     let [head, r1] = http.read_exact! r 2;
     let b0 = str.byte 0 head;

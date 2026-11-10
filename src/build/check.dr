@@ -22,7 +22,7 @@ import std.map;
 import std.str;
 
 /// An input a check reads without naming it on its command line.
-let reads : :any -> :any;
+let reads : :any -> [:reads, :any];
 let reads i = [:reads, build.input i];
 
 /// Test whether an argument denotes a file, tree or build artifact input.

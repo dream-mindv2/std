@@ -33,62 +33,62 @@ let view attrs width height drawing =
 // --- shapes --------------------------------------------------------------------
 
 /// A rectangle at `x`, `y`, `w` wide and `h` high.
-let rect : :any -> :any -> :any -> :any -> :any;
+let rect : :any -> :any -> :any -> :any -> %{"kind" => :string, "x" => :any, "y" => :any, "w" => :any, "h" => :any};
 let rect x y w h = %{ "kind" => "rect", "x" => x, "y" => y, "w" => w, "h" => h };
 /// A rectangle whose corners are rounded by `r`.
-let rounded : :any -> :any -> :any -> :any -> :any -> :any;
+let rounded : :any -> :any -> :any -> :any -> :any -> %{"kind" => :string, "x" => :any, "y" => :any, "w" => :any, "h" => :any, "r" => :any};
 let rounded x y w h r = %{ "kind" => "rounded", "x" => x, "y" => y, "w" => w, "h" => h, "r" => r };
 /// A circle centred at `x`, `y` with radius `r`.
-let circle : :any -> :any -> :any -> :any;
+let circle : :any -> :any -> :any -> %{"kind" => :string, "x" => :any, "y" => :any, "rx" => :any, "ry" => :any};
 let circle x y r = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => r, "ry" => r };
 /// An ellipse centred at `x`, `y` with radii `rx` and `ry`.
-let ellipse : :any -> :any -> :any -> :any -> :any;
+let ellipse : :any -> :any -> :any -> :any -> %{"kind" => :string, "x" => :any, "y" => :any, "rx" => :any, "ry" => :any};
 let ellipse x y rx ry = %{ "kind" => "ellipse", "x" => x, "y" => y, "rx" => rx, "ry" => ry };
 /// An arc of the circle at `x`, `y`, from angle `from` to `to`, in radians.
-let arc : :any -> :any -> :any -> :any -> :any -> :any;
+let arc : :any -> :any -> :any -> :any -> :any -> %{"kind" => :string, "x" => :any, "y" => :any, "r" => :any, "from" => :any, "to" => :any};
 let arc x y r from to = %{ "kind" => "arc", "x" => x, "y" => y, "r" => r, "from" => from, "to" => to };
 /// A straight line from `x1`, `y1` to `x2`, `y2`.
-let line : :any -> :any -> :any -> :any -> :any;
+let line : :any -> :any -> :any -> :any -> %{"kind" => :string, "points" => [[:any, :any], [:any, :any]]};
 let line x1 y1 x2 y2 = %{ "kind" => "polyline", "points" => [[x1, y1], [x2, y2]] };
 /// Points joined in order, `[[x, y], ..]`, left open.
-let polyline : [[:any]] -> :any;
+let polyline : [[:any]] -> %{"kind" => :string, "points" => [[:any]]};
 let polyline points = %{ "kind" => "polyline", "points" => points };
 /// Points joined in order and closed.
-let polygon : [[:any]] -> :any;
+let polygon : [[:any]] -> %{"kind" => :string, "points" => [[:any]]};
 let polygon points = %{ "kind" => "polygon", "points" => points };
 /// SVG path data: `path "M 0 0 L 10 10 Z"`.
-let path : :string -> :any;
+let path : :string -> %{"kind" => :string, "d" => :string};
 let path d = %{ "kind" => "path", "d" => d };
 
 // --- operations ----------------------------------------------------------------
 
 /// Paint the whole canvas `color`.
-let clear : :string -> :any;
+let clear : :string -> %{"op" => :string, "color" => :string};
 let clear color = %{ "op" => "clear", "color" => color };
 /// A shape filled with `color`.
-let fill : :string -> :any -> :any;
+let fill : :string -> :any -> %{"op" => :string, "color" => :string, "shape" => :any};
 let fill color shape = %{ "op" => "fill", "color" => color, "shape" => shape };
 /// Outline `shape` with a line `width` pixels wide.
-let stroke : :string -> :any -> :any -> :any;
+let stroke : :string -> :any -> :any -> %{"op" => :string, "color" => :string, "width" => :any, "shape" => :any};
 let stroke color width shape = %{ "op" => "stroke", "color" => color, "width" => width, "shape" => shape };
 /// Fill, then outline.
-let paint : :string -> :string -> :any -> :any -> :any;
+let paint : :string -> :string -> :any -> :any -> %{"op" => :string, "fill" => :string, "color" => :string, "width" => :any, "shape" => :any};
 let paint fill_color stroke_color width shape = %{ "op" => "paint", "fill" => fill_color,
     "color" => stroke_color, "width" => width, "shape" => shape };
 /// Text at `x`, `y` (its baseline's start), in 16px system-ui.
 let text : :any -> :any -> :string -> :any;
 let text x y s = text_with "16px system-ui" "currentColor" "left" x y s;
 /// Text in a CSS `font`, a colour, aligned `left`, `center` or `right` of `x`.
-let text_with : :string -> :string -> :string -> :any -> :any -> :string -> :any;
+let text_with : :string -> :string -> :string -> :any -> :any -> :string -> %{"op" => :string, "font" => :string, "color" => :string, "align" => :string, "x" => :any, "y" => :any, "text" => :string};
 let text_with font color align x y s = %{ "op" => "text", "font" => font, "color" => color,
     "align" => align, "x" => x, "y" => y, "text" => s };
 /// An image the application ships (`[graphics] assets`), by its path, drawn
 /// into `w` by `h` at `x`, `y`. It appears once it has loaded.
-let image : :string -> :any -> :any -> :any -> :any -> :any;
+let image : :string -> :any -> :any -> :any -> :any -> %{"op" => :string, "src" => :string, "x" => :any, "y" => :any, "w" => :any, "h" => :any};
 let image src x y w h = %{ "op" => "image", "src" => src, "x" => x, "y" => y, "w" => w, "h" => h };
 
 /// `drawing`, under any of `translate`, `rotate`, `scale` and `alpha` together.
-let group : %{:string => :any} -> [:any] -> :any;
+let group : %{:string => :any} -> [:any] -> %{"op" => :string, "settings" => %{:string => :any}, "drawing" => [:any]};
 let group settings drawing = %{ "op" => "group", "settings" => settings, "drawing" => drawing };
 /// A drawing moved by `x` across and `y` down.
 let translate : :any -> :any -> [:any] -> :any;

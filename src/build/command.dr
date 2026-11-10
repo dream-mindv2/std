@@ -14,7 +14,7 @@ import std.build;
 import std.list;
 
 /// An output of the command, passed to it by name.
-let out : :string -> :any;
+let out : :string -> [:out, :string];
 let out name = [:out, name];
 
 /// A file of the package, passed to the command as its path.

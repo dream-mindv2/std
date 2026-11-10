@@ -98,7 +98,7 @@ priv let log_of v = if type_of v == :tensor { tensor.log v } else { math.log v }
 
 /// `a` where `mask` is 1 and `b` where it is 0, for a mask of ones and zeros
 /// as the comparisons (`tensor.gt` and the rest) answer.
-let where : :tensor -> :any -> :any -> :any;
+let where : :tensor -> :any -> :any -> :tensor;
 let where mask a b = mask * a + (1.0 - mask) * b;
 
 /// `x` held to `[lo, hi]`.

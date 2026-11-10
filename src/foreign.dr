@@ -508,7 +508,7 @@ mod server {
 
     /// The server holds no state of its own; what it owns are the resources
     /// made by the work it runs, and the VM releases those with the process.
-    let init! : :any -> :any;
+    let init! : :any -> :serving;
     let init! u = :serving;
 
     /// Every request is run inside `try!`, and the answer is forced before it
