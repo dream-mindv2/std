@@ -84,7 +84,7 @@ let show_record r = {
 // --- lengths and forcing -------------------------------------------------------------
 
 let length_from : :any -> :any -> :any;
-let length_from !xs !n = if is_cons_of xs { length_from (native.list_tail xs) (n + 1) } else { n };
+let length_from !xs !n = match xs { _ :: rest => length_from rest (n + 1), _ => n };
 
 let length : :any -> :any;
 let length v = match type_of v {
@@ -103,9 +103,10 @@ let deep! v = if settle v { v } else { v };
 // first, and a native compile spent most of its time here and in collecting what that made.
 
 let settle_list : :any -> :any;
-let settle_list !xs = if is_cons_of xs {
-    if settle_walk (native.list_head xs) { settle_list (native.list_tail xs) } else { false }
-} else { true };
+let settle_list !xs = match xs {
+    x :: rest => if settle_walk x { settle_list rest } else { false },
+    _ => true,
+};
 
 let settle_items : :any -> :any -> :any -> :any;
 let settle_items !a !i !n = if i >= n { true }
@@ -136,19 +137,22 @@ let forced v = { let t = type_of v; true };
 // --- strings and arrays from lists ----------------------------------------------------
 
 // A list made an array, the spine walked through strict parameters and each element stored as the
-// cell holds it: taken apart by a pattern, each element was a thunk of reading it and so was the
-// rest, and `array.of_list`, which a compiler calls everywhere, was half of a native compile.
+// cell holds it (`array_store_head`), not read first: a pattern's name for it would be the element
+// asked for. The rest is a pattern's, which is a read of the cell the test has just looked at;
+// asked of `is_cons_of` and `list_tail`, each cell was two calls.
 let array_fill : :any -> :any -> :any -> :any;
-let array_fill !a !xs !i = if is_cons_of xs {
-    array_fill (native.array_store_head a i xs) (native.list_tail xs) (i + 1)
-} else { a };
+let array_fill !a !xs !i = match xs {
+    _ :: rest => array_fill (native.array_store_head a i xs) rest (i + 1),
+    _ => a,
+};
 
 let array_of_list : :any -> :any;
 let array_of_list xs = array_fill (native.array_new (length_from xs 0) ()) xs 0;
 
-/// Each element evaluated where it lies.
+/// Each element evaluated where it lies. The array is strict as the index is: left to be asked
+/// for, each step's was a suspension of the store before it, a million deep for a million keys.
 let array_forced : :any -> :any -> :any -> :any;
-let array_forced a !i !n =
+let array_forced !a !i !n =
     if i >= n { a }
     else { array_forced (native.array_force_store a i (native.match_at a i)) (i + 1) n };
 
@@ -269,7 +273,7 @@ let compare_values a b = match native.flat_compare a b {
 // --- positions in a list ---------------------------------------------------------------
 
 let list_at : :any -> :any -> :any -> :any -> :any;
-let list_at xs i !walked fallback = match xs {
+let list_at xs !i !walked fallback = match xs {
     [] => fallback walked,
     [x, ..rest] => if i == walked { x } else { list_at rest i (walked + 1) fallback },
 };
@@ -371,6 +375,25 @@ let error_trace! e = native.error_where e;
 
 let json_encode : :any -> :any;
 let json_encode v = json.encode_value v;
+
+// What a producer's form for a whole list came to that it had not made itself (dreams/src/aot/
+// core.dr, "a whole list asked for"): a list someone else made, walked as far as was asked --
+// its spine, or each element too, the element before the cell after it -- and answered.
+
+let whole_spine : :any -> :any;
+let whole_spine !xs = if length_from xs 0 >= 0 { xs } else { xs };
+
+let whole_each : :any -> :bool;
+let whole_each !xs = match xs {
+    x :: rest => whole_one x rest,
+    _ => true,
+};
+
+let whole_one : :any -> :any -> :bool;
+let whole_one !x rest = whole_each rest;
+
+let whole_list : :any -> :any;
+let whole_list !xs = if whole_each xs { xs } else { xs };
 
 let raise_any! : :any -> :any;
 let raise_any! v = native.raise_or_wrap v;

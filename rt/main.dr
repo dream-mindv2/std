@@ -209,14 +209,17 @@ let ctx_frames_floor = 816;
 /// 1 during a minor collection: only what is in the nursery is copied (`in_nursery!`).
 let ctx_minor : :integer;
 let ctx_minor = 824;
-/// Unused: the nursery's free chunks are the world's now (`young_get!`).
+/// A few free nursery chunks of the size code allocates in, this worker's own, and how many
+/// (`young_get!`).
 let ctx_young_spare : :integer;
 let ctx_young_spare = 832;
-/// The token of the map a loop writes in place, during one of its sets (`map_assoc_owned!`).
+/// The token of the map a loop writes in place, during one of its sets (`map_assoc!`), and 0 otherwise.
 let ctx_token : :integer;
 let ctx_token = 840;
+let ctx_young_count : :integer;
+let ctx_young_count = 848;
 let ctx_size : :integer;
-let ctx_size = 848;
+let ctx_size = 856;
 
 let kind_thunk : :integer;
 let kind_thunk = 0;
@@ -449,41 +452,106 @@ let nursery_take! !bytes = {
     } else { at }
 };
 
+// One lock for all of them was taken for every sixteen kilobytes anything allocated and again
+// for each chunk a collection freed, by every worker: a native self-compile on twelve cores spent
+// a twentieth of its time waiting for it. So a worker keeps a few chunks of that one size to
+// itself -- at most twice `young_own`, two megabytes, which is what bounds what a worker that
+// frees and never allocates can sit on -- and goes to the world's lists for several at a time
+// when it has none, and with half of what it has when it has that many.
+
+let young_own : :integer;
+let young_own = 64;
+let young_batch : :integer;
+let young_batch = 16;
+
+/// The link `n` chunks along the list at `link`, or the one holding 0 if it is shorter.
+let young_along! : :integer -> :integer -> :integer;
+let young_along! !link !n = if n == 0 || prim.load64! link == 0 { link } else { young_along! (prim.load64! link) (n - 1) };
+
+let young_counted! : :integer -> :integer -> :integer;
+let young_counted! !c !n = if c == 0 { n } else { young_counted! (prim.load64! c) (n + 1) };
+
 /// A chunk of the nursery, as `chunk_get!` is one of the old: the last put back of its size, which
 /// is still resident, or one given back to the system (`young_trim!`), or address space never
 /// handed out before.
 let young_get! : :integer -> :integer -> :integer;
 let young_get! !p !size = {
-    let lock = world_at! w_young_lock;
-    spin_lock! lock;
-    let head = young_class! size;
-    let c = prim.load64! head;
-    let chunk = if c != 0 {
-        prim.store64! head (prim.load64! c);
-        prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) - prim.load64! (c + word));
-        c
+    let own = prim.load64! (p + ctx_young_spare);
+    if size == direct_chunk && own != 0 {
+        prim.store64! (p + ctx_young_spare) (prim.load64! own);
+        prim.store64! (p + ctx_young_count) (prim.load64! (p + ctx_young_count) - 1);
+        own
     } else {
-        let cold = head + young_cold;
-        let d = prim.load64! cold;
-        if d != 0 { prim.store64! cold (prim.load64! d); };
-        d
-    };
-    spin_unlock! lock;
-    if chunk != 0 { chunk } else {
-        let fresh_ = nursery_take! size;
-        prim.store64! (fresh_ + word) size;
-        fresh_
+        let lock = world_at! w_young_lock;
+        spin_lock! lock;
+        let head = young_class! size;
+        let c = prim.load64! head;
+        let chunk = if c != 0 {
+            if size == direct_chunk {
+                // This one and the next few, which become the worker's own.
+                let last = young_along! c (young_batch - 1);
+                prim.store64! head (prim.load64! last);
+                prim.store64! last 0;
+                let more = prim.load64! c;
+                let n = young_counted! more 0;
+                prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) - (n + 1) * size);
+                prim.store64! (p + ctx_young_spare) more;
+                prim.store64! (p + ctx_young_count) n;
+            } else {
+                prim.store64! head (prim.load64! c);
+                prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) - prim.load64! (c + word));
+            };
+            c
+        } else {
+            let cold = head + young_cold;
+            let d = prim.load64! cold;
+            if d != 0 { prim.store64! cold (prim.load64! d); };
+            d
+        };
+        spin_unlock! lock;
+        if chunk != 0 { chunk } else {
+            let fresh_ = nursery_take! size;
+            prim.store64! (fresh_ + word) size;
+            fresh_
+        }
     }
 };
 
 let young_put! : :integer -> :integer -> :integer;
-let young_put! !p !c = {
+let young_put! !p !c = if prim.load64! (c + word) == direct_chunk {
+    let n = prim.load64! (p + ctx_young_count) + 1;
+    prim.store64! c (prim.load64! (p + ctx_young_spare));
+    prim.store64! (p + ctx_young_spare) c;
+    prim.store64! (p + ctx_young_count) n;
+    if n >= 2 * young_own { young_spill! p } else { 0 }
+} else {
     let lock = world_at! w_young_lock;
     spin_lock! lock;
     let head = young_class! (prim.load64! (c + word));
     prim.store64! c (prim.load64! head);
     prim.store64! head c;
     prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) + prim.load64! (c + word));
+    spin_unlock! lock;
+    0
+};
+
+/// The older half of a worker's own chunks handed to the world, all at once: a collection frees
+/// a nursery's worth, thousands, and one at a time each was the lock taken and given up while
+/// every worker allocating waited its turn behind it.
+let young_spill! : :integer -> :integer;
+let young_spill! !p = {
+    let kept = young_along! (p + ctx_young_spare) young_own;
+    let first = prim.load64! kept;
+    prim.store64! kept 0;
+    let n = prim.load64! (p + ctx_young_count) - young_own;
+    prim.store64! (p + ctx_young_count) young_own;
+    let last = young_along! first (n - 1);
+    let lock = world_at! w_young_lock;
+    spin_lock! lock;
+    let head = young_class! direct_chunk;
+    prim.store64! last (prim.load64! head);
+    prim.store64! head first;
+    prim.store64! (world_at! w_young_free) (prim.load64! (world_at! w_young_free) + n * direct_chunk);
     spin_unlock! lock;
     0
 };
@@ -2124,11 +2192,20 @@ let word_at! : :integer -> :integer -> :integer;
 let word_at! !a !i = prim.load64! (prim.load64! a + i * word);
 
 /// The `n` words from `a` in ascending order: by Shell's sort when they are few, and otherwise by
-/// a radix sort, sixteen bits a pass. A stack's candidates are a few thousand, until a collection
-/// lands in a deep recursion: 1.3 million in `strs`, which Shell's sort took most of a run over.
+/// a radix sort, a byte a pass or sixteen bits a pass. A stack's candidates are a few thousand,
+/// until a collection lands in a deep recursion: 1.3 million in `strs`, which Shell's sort took
+/// most of a run over, and which are any words at all, so that every byte of them differs.
 /// The dialect has no `qsort` to hand a comparison to.
 let sort_words! : :integer -> :integer -> :integer;
-let sort_words! !a !n = if n < 1024 { shell_gaps! a n (n / 2) } else {
+let sort_words! !a !n = if n < 1024 { shell_gaps! a n (n / 2) } else if n < 65536 {
+    let buf = prim.c1! "malloc" (n * word);
+    let counts = prim.c1! "malloc" (256 * word);
+    let answer = bytes_all! a buf n (words_differ! a n 1 (prim.load64! a) 0) 0 counts;
+    if answer != a { copy_words! buf a n; };
+    prim.c1! "free" counts;
+    prim.c1! "free" buf;
+    0
+} else {
     let buf = prim.c1! "malloc" (n * word);
     let counts = prim.c1! "malloc" (65536 * word);
     radix_pass! a buf n counts 0;
@@ -2176,6 +2253,48 @@ let scatter_digits! !from !to !n !c !shift !i = if i >= n { 0 } else {
     prim.store64! (c + d * word) (at + 1);
     scatter_digits! from to n c shift (i + 1)
 };
+
+
+// A few thousand go by their bytes, least significant first, and no pass for a byte they all
+// agree on: these are mostly addresses in a few chunks, so of eight bytes three or four differ.
+// Sixteen bits at a time is four passes whatever the words are, each one clearing and summing
+// 65,536 counts, which to place the few thousand words a collection usually has was a fiftieth
+// of a native self-compile; it is still the way for the many.
+
+/// Every bit in which some word differs from the first.
+let words_differ! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let words_differ! !a !n !i !first !acc = if i >= n { acc } else {
+    words_differ! a n (i + 1) first (acc | (prim.load64! (a + i * word) ^ first))
+};
+
+let byte_count! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let byte_count! !from !n !i !shift !c = if i >= n { 0 } else {
+    let at = c + (prim.ushr (prim.load64! (from + i * word)) shift & 255) * word;
+    prim.store64! at (prim.load64! at + 1);
+    byte_count! from n (i + 1) shift c
+};
+
+let byte_scatter! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let byte_scatter! !from !to !n !i !shift !c = if i >= n { 0 } else {
+    let w = prim.load64! (from + i * word);
+    let at = c + (prim.ushr w shift & 255) * word;
+    let place = prim.load64! at;
+    prim.store64! at (place + 1);
+    prim.store64! (to + place * word) w;
+    byte_scatter! from to n (i + 1) shift c
+};
+
+/// Which of the two holds the words in order.
+let bytes_all! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let bytes_all! !src !dst !n !differs !shift !counts = if shift >= 64 { src }
+    else if prim.ushr differs shift & 255 == 0 { bytes_all! src dst n differs (shift + 8) counts }
+    else {
+        prim.c3! "memset" counts 0 (256 * word);
+        byte_count! src n 0 shift counts;
+        radix_starts! counts 0 0;
+        byte_scatter! src dst n 0 shift counts;
+        bytes_all! dst src n differs (shift + 8) counts
+    };
 
 let shell_gaps! : :integer -> :integer -> :integer -> :integer;
 let shell_gaps! !a !n !gap = if gap == 0 { 0 } else { shell_pass! a n gap gap; shell_gaps! a n (gap / 2) };
@@ -4474,7 +4593,8 @@ let all_in! !at !n !functions = if n <= 0 { 1 }
 let map_evaluated! : :integer -> :integer -> :integer;
 let map_evaluated! !v !functions = if walked_info! (prim.load64! v) functions { 1 }
     else if kind_of! v == kind_leaf { leaf_evaluated! v functions }
-    else if map_children! v 0 (popcount (branch_bitmap! v)) functions == 0 { 0 }
+    else if all_in! (branch_slot v 0) (2 * popcount (branch_datas! v)) functions == 0 { 0 }
+    else if map_children! v (2 * popcount (branch_datas! v)) (branch_words! v) functions == 0 { 0 }
     else { mark_settled! v kind_map functions };
 
 let map_children! : :integer -> :integer -> :integer -> :integer -> :integer;
@@ -4702,10 +4822,17 @@ let is_error! !v = is_kind! v kind_error;
 
 // --- maps ---------------------------------------------------------------------------
 //
-// A hash trie, five bits a level. A branch is `[info, n, count, bitmap, slots..]`, `n`
-// counting what follows it, and everything tagged; a leaf is `[info, hash, key, value,
-// next]`, the hash tagged and so short of its top bit, which is why the level of a key
-// is worked out from those 63 bits everywhere. The hash of a string or an integer is
+// A hash trie, five bits a level. A branch is `[info, n, count, nodes, entries, words..]`, `n`
+// counting what follows it, and everything tagged. Each of its 32 positions holds nothing, or an
+// entry -- a key and its value, two words, in the branch itself -- or a node, one word: the
+// branch a level down, or a chain of leaves for keys of one whole hash. The two bitmaps say
+// which, the entries' words come first and the nodes' after, each in the order of their
+// positions. An entry was a leaf of its own once, five words behind a pointer: a lookup read the
+// branch and then the leaf, somewhere else in memory, and a collection copied an object for
+// every key of every map. A leaf is `[info, hash, key, value, next]`, the hash tagged and so
+// short of its top bit, which is why the level of a key is worked out from those 63 bits
+// everywhere; an entry's hash is not kept, and is worked out again from its key the one time it
+// is wanted, when another key arrives where it is. The hash of a string or an integer is
 // the VM's, so that a map of them iterates in the order programs have been printing;
 // a record by the identity it carries (`record_identity!`), and any other structure by
 // kind alone, since it moves and has no room for an identity, and is found by a walk of
@@ -4785,23 +4912,36 @@ let popcount !x = prim.popcount x;
 
 let branch_count! : :integer -> :integer;
 let branch_count! !b = untag_fix (prim.load64! (b + 2 * word));
-let branch_bitmap! : :integer -> :integer;
-let branch_bitmap! !b = untag_fix (prim.load64! (b + 3 * word));
+/// Which of a branch's 32 positions hold a branch below it or a chain, and which an entry.
+let branch_nodes! : :integer -> :integer;
+let branch_nodes! !b = untag_fix (prim.load64! (b + 3 * word));
+let branch_datas! : :integer -> :integer;
+let branch_datas! !b = untag_fix (prim.load64! (b + 4 * word));
 let branch_slot : :integer -> :integer -> :integer;
-let branch_slot !b !i = b + (4 + i) * word;
+let branch_slot !b !i = b + (5 + i) * word;
+/// The words after a branch's bitmaps: two for each entry, one for each node.
+let branch_words! : :integer -> :integer;
+let branch_words! !b = 2 * popcount (branch_datas! b) + popcount (branch_nodes! b);
 
-let new_branch! : :integer -> :integer -> :integer -> :integer -> :integer;
-let new_branch! !p !slots !count !bitmap = {
-    let o = alloc! p ((4 + slots) * word);
+/// A branch of `words` words to be filled in, carrying token `t` when it is one (see "maps
+/// written in place").
+let new_branch_t! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let new_branch_t! !p !words !count !nodes !datas !t = {
+    let o = alloc! p ((5 + words + (if t == 0 { 0 } else { 1 })) * word);
     prim.store64! o (prim.info "map");
-    prim.store64! (o + word) (tag_fix (slots + 2));
+    prim.store64! (o + word) (tag_fix (words + (if t == 0 { 3 } else { 4 })));
     prim.store64! (o + 2 * word) (tag_fix count);
-    prim.store64! (o + 3 * word) (tag_fix bitmap);
+    prim.store64! (o + 3 * word) (tag_fix nodes);
+    prim.store64! (o + 4 * word) (tag_fix datas);
+    if t != 0 { prim.store64! (branch_slot o words) t; };
     o
 };
 
+let new_branch! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let new_branch! !p !words !count !nodes !datas = new_branch_t! p words count nodes datas 0;
+
 let map_empty! : :integer -> :integer;
-let map_empty! !p = new_branch! p 0 0 0;
+let map_empty! !p = new_branch! p 0 0 0 0;
 
 /// `native.map_new ()`, for the library: `map_empty!` is what a map literal is made from and takes
 /// nothing, so called from Dream with `()` it answered the map and then had it applied to `()` --
@@ -4830,14 +4970,23 @@ let chain_find! !l !k = if l == nil_word { 0 }
     else if key_equal! (prim.load64! (l + 2 * word)) k { l }
     else { chain_find! (prim.load64! (l + 4 * word)) k };
 
-/// The leaf holding `k`, or 0.
+/// Where the value of `k` is held -- the word, in a branch or in a leaf of a chain -- or 0.
 let map_find! : :integer -> :integer -> :integer -> :integer -> :integer;
 let map_find! !node !h !k !shift = {
     let bit = 1 << (prim.ushr h shift & 31);
-    let bitmap = branch_bitmap! node;
-    if bitmap & bit == 0 { 0 } else {
-        let child = prim.load64! (branch_slot node (popcount (bitmap & (bit - 1))));
-        if is_leaf! child { chain_find! child k } else { map_find! child h k (shift + 5) }
+    let datas = branch_datas! node;
+    if datas & bit != 0 {
+        let at = branch_slot node (2 * popcount (datas & (bit - 1)));
+        if key_equal! (prim.load64! at) k { at + word } else { 0 }
+    } else {
+        let nodes = branch_nodes! node;
+        if nodes & bit == 0 { 0 } else {
+            let child = prim.load64! (branch_slot node (2 * popcount datas + popcount (nodes & (bit - 1))));
+            if is_leaf! child {
+                let l = chain_find! child k;
+                if l == 0 { 0 } else { l + 3 * word }
+            } else { map_find! child h k (shift + 5) }
+        }
     }
 };
 
@@ -4849,47 +4998,136 @@ let chain_replace! !p !l !k !v = if key_equal! (prim.load64! (l + 2 * word)) k {
         (chain_replace! p (prim.load64! (l + 4 * word)) k v)
 };
 
-/// Two leaves of different hashes, under a new branch at `shift`.
-let split_leaves! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let split_leaves! !p !a !b !count !shift = {
-    let ia = prim.ushr (leaf_hash! a) shift & 31;
-    let ib = prim.ushr (leaf_hash! b) shift & 31;
-    if ia == ib {
-        let inner = split_leaves! p a b count (shift + 5);
-        let o = new_branch! p 1 count (1 << ia);
-        prim.store64! (branch_slot o 0) inner;
-        o
-    } else {
-        let o = new_branch! p 2 count ((1 << ia) | (1 << ib));
-        prim.store64! (branch_slot o (if ia < ib { 0 } else { 1 })) a;
-        prim.store64! (branch_slot o (if ia < ib { 1 } else { 0 })) b;
-        o
-    }
-};
-
 let chain_length! : :integer -> :integer;
 let chain_length! !l = if l == nil_word { 0 } else { 1 + chain_length! (prim.load64! (l + 4 * word)) };
 
-/// `node` with `k` set. Whether it was added is left in the context, since the counts
-/// on the way back up depend on it.
+/// `node` copied as it is, carrying `t`.
+let branch_same! : :integer -> :integer -> :integer -> :integer;
+let branch_same! !p !node !t = {
+    let words = branch_words! node;
+    let o = new_branch_t! p words (branch_count! node) (branch_nodes! node) (branch_datas! node) t;
+    copy_words! (branch_slot node 0) (branch_slot o 0) words;
+    o
+};
+
+/// `node` with an entry more, at a position that held nothing.
+let branch_more_data! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let branch_more_data! !p !node !bit !k !v !t = {
+    let datas = branch_datas! node;
+    let words = branch_words! node;
+    let at = 2 * popcount (datas & (bit - 1));
+    let o = new_branch_t! p (words + 2) (branch_count! node + 1) (branch_nodes! node) (datas | bit) t;
+    copy_words! (branch_slot node 0) (branch_slot o 0) at;
+    prim.store64! (branch_slot o at) k;
+    prim.store64! (branch_slot o (at + 1)) v;
+    copy_words! (branch_slot node at) (branch_slot o (at + 2)) (words - at);
+    o
+};
+
+/// `node` with the entry at `bit` gone down into `child`, which holds it and one more.
+let branch_data_to_node! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let branch_data_to_node! !p !node !bit !child !t = {
+    let datas = branch_datas! node;
+    let nodes = branch_nodes! node;
+    let pairs = 2 * popcount datas;
+    let words = pairs + popcount nodes;
+    let di = 2 * popcount (datas & (bit - 1));
+    let ni = popcount (nodes & (bit - 1));
+    let o = new_branch_t! p (words - 1) (branch_count! node + 1) (nodes | bit) (datas ^ bit) t;
+    copy_words! (branch_slot node 0) (branch_slot o 0) di;
+    // The entries after it, and the nodes before where the new one goes.
+    copy_words! (branch_slot node (di + 2)) (branch_slot o di) (pairs - di - 2 + ni);
+    prim.store64! (branch_slot o (pairs - 2 + ni)) child;
+    copy_words! (branch_slot node (pairs + ni)) (branch_slot o (pairs - 1 + ni)) (words - pairs - ni);
+    o
+};
+
+/// Two entries under a new branch, at the positions `at` packs: the first's, and the second's
+/// five bits up. They differ.
+let pair_branch! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let pair_branch! !p !k0 !v0 !k !v !at = {
+    let ia = at & 31;
+    let ib = prim.ushr at 5;
+    let o = new_branch_t! p 4 2 0 ((1 << ia) | (1 << ib)) (prim.load64! (p + ctx_token));
+    let first = if ia < ib { 0 } else { 2 };
+    prim.store64! (branch_slot o first) k0;
+    prim.store64! (branch_slot o (first + 1)) v0;
+    prim.store64! (branch_slot o (2 - first)) k;
+    prim.store64! (branch_slot o (3 - first)) v;
+    o
+};
+
+/// A chain and an entry of another hash under a new branch, their positions packed as
+/// `pair_branch!`'s are.
+let chain_branch! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let chain_branch! !p !chain !k !v !at = {
+    let o = new_branch_t! p 3 (chain_length! chain + 1) (1 << (at & 31)) (1 << prim.ushr at 5) (prim.load64! (p + ctx_token));
+    prim.store64! (branch_slot o 0) k;
+    prim.store64! (branch_slot o 1) v;
+    prim.store64! (branch_slot o 2) chain;
+    o
+};
+
+/// The first level from `shift` at which hashes `a` and `b` part. They differ.
+let parting! : :integer -> :integer -> :integer -> :integer;
+let parting! !a !b !shift =
+    if prim.ushr a shift & 31 != prim.ushr b shift & 31 { shift } else { parting! a b (shift + 5) };
+
+/// Both positions at level `shift`, packed for `pair_branch!`.
+let packed_at : :integer -> :integer -> :integer -> :integer;
+let packed_at !a !b !shift = (prim.ushr a shift & 31) | ((prim.ushr b shift & 31) << 5);
+
+/// `inner` under a branch of one node for each level from `shift` up to `stop`, on `h`'s path.
+let wrapped! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let wrapped! !p !inner !h !shift !stop = if shift < stop { inner } else {
+    let o = new_branch_t! p 1 (branch_count! inner) (1 << (prim.ushr h shift & 31)) 0 (prim.load64! (p + ctx_token));
+    prim.store64! (branch_slot o 0) inner;
+    wrapped! p o h (shift - 5) stop
+};
+
+/// `node` with `k` set. Whether it was added is left in the context, since the counts on the way
+/// back up depend on it. A branch carrying the token in `ctx_token`, when there is one, is the
+/// caller's to change (see "maps written in place"): a value or a node replaced in it is written
+/// where it is, and every branch made on the way carries the token.
 let map_assoc! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
 let map_assoc! !p !node !h !k !v !shift = {
+    let t = prim.load64! (p + ctx_token);
     let bit = 1 << (prim.ushr h shift & 31);
-    let bitmap = branch_bitmap! node;
-    let at = popcount (bitmap & (bit - 1));
-    let slots = popcount bitmap;
-    if bitmap & bit == 0 {
-        prim.store64! (p + ctx_scratch) 1;
-        let o = new_branch! p (slots + 1) (branch_count! node + 1) (bitmap | bit);
-        copy_words! (branch_slot node 0) (branch_slot o 0) at;
-        prim.store64! (branch_slot o at) (new_leaf! p h k v nil_word);
-        copy_words! (branch_slot node at) (branch_slot o (at + 1)) (slots - at);
-        o
-    } else {
-        let child = prim.load64! (branch_slot node at);
+    let datas = branch_datas! node;
+    let nodes = branch_nodes! node;
+    if datas & bit != 0 {
+        let at = branch_slot node (2 * popcount (datas & (bit - 1)));
+        let k0 = prim.load64! at;
+        if key_equal! k0 k {
+            prim.store64! (p + ctx_scratch) 0;
+            if t != 0 && branch_token! node == t {
+                prim.store64! (at + word) v;
+                remember_value! p (at + word) v;
+                node
+            } else {
+                let o = branch_same! p node t;
+                prim.store64! (o + (at - node) + word) v;
+                o
+            }
+        } else {
+            // Another key where one entry was: both go a level down, or as far as their hashes
+            // agree, and two keys of one hash are a chain, the new one first.
+            prim.store64! (p + ctx_scratch) 1;
+            let h0 = key_hash! k0;
+            let v0 = prim.load64! (at + word);
+            let child = if h0 == h { new_leaf! p h k v (new_leaf! p h0 k0 v0 nil_word) } else {
+                let s = parting! h0 h (shift + 5);
+                wrapped! p (pair_branch! p k0 v0 k v (packed_at h0 h s)) h (s - 5) (shift + 5)
+            };
+            branch_data_to_node! p node bit child t
+        }
+    } else if nodes & bit != 0 {
+        let at = branch_slot node (2 * popcount datas + popcount (nodes & (bit - 1)));
+        let child = prim.load64! at;
         let replaced =
             if is_leaf! child {
-                if leaf_hash! child == h {
+                let hc = leaf_hash! child;
+                if hc == h {
                     if chain_find! child k != 0 {
                         prim.store64! (p + ctx_scratch) 0;
                         chain_replace! p child k v
@@ -4899,18 +5137,33 @@ let map_assoc! !p !node !h !k !v !shift = {
                     }
                 } else {
                     prim.store64! (p + ctx_scratch) 1;
-                    split_leaves! p child (new_leaf! p h k v nil_word) (chain_length! child + 1) (shift + 5)
+                    let s = parting! hc h (shift + 5);
+                    wrapped! p (chain_branch! p child k v (packed_at hc h s)) h (s - 5) (shift + 5)
                 }
             } else { map_assoc! p child h k v (shift + 5) };
-        let o = new_branch! p slots (branch_count! node + prim.load64! (p + ctx_scratch)) bitmap;
-        copy_words! (branch_slot node 0) (branch_slot o 0) slots;
-        prim.store64! (branch_slot o at) replaced;
-        o
+        let count = branch_count! node + prim.load64! (p + ctx_scratch);
+        if t != 0 && branch_token! node == t {
+            prim.store64! at replaced;
+            remember_value! p at replaced;
+            prim.store64! (node + 2 * word) (tag_fix count);
+            node
+        } else {
+            let o = branch_same! p node t;
+            prim.store64! (o + (at - node)) replaced;
+            prim.store64! (o + 2 * word) (tag_fix count);
+            o
+        }
+    } else {
+        prim.store64! (p + ctx_scratch) 1;
+        branch_more_data! p node bit k v t
     }
 };
 
 let map_put! : :integer -> :integer -> :integer -> :integer -> :integer;
-let map_put! !p !m !k !v = map_assoc! p m (key_hash! k) k v 0;
+let map_put! !p !m !k !v = {
+    prim.store64! (p + ctx_token) 0;
+    map_assoc! p m (key_hash! k) k v 0
+};
 
 // --- maps written in place ----------------------------------------------------------------
 //
@@ -4918,96 +5171,18 @@ let map_put! !p !m !k !v = map_assoc! p m (key_hash! k) k v 0;
 // -- `go (m.[k => v]) ..` and nothing else reading `m` -- need not copy the path to every key it
 // sets: no one can see the version it would be keeping (dreams/src/aot/core.dr, "Linear
 // accumulators"). The compiler proves that much of a function and no more, and the map proves
-// the rest: a branch the loop made carries the loop's token, one word past its slots, and a set
-// writes in place only into a branch carrying the root's. Every entry into such a loop sets its
-// first key with a token never given before (`index_set_fresh!`), so a map that came from
-// anywhere else -- the caller's, or what an earlier run of the loop answered -- is copied on the
-// way down as it always was, and only what this run made is ever written. A branch without a
-// token is the ordinary layout: `n` is the slots and two, and a token is a third.
+// the rest: a branch the loop made carries the loop's token, one word past its entries and
+// nodes, and a set writes in place only into a branch carrying the root's. Every entry into such
+// a loop sets its first key with a token never given before (`index_set_fresh!`), so a map that
+// came from anywhere else -- the caller's, or what an earlier run of the loop answered -- is
+// copied on the way down as it always was, and only what this run made is ever written. A branch
+// without a token is the ordinary layout: `n` is its words and three, and a token is a fourth.
 
 /// The token of branch `b`, or 0.
 let branch_token! : :integer -> :integer;
 let branch_token! !b = {
-    let slots = popcount (branch_bitmap! b);
-    if untag_fix (prim.load64! (b + word)) == slots + 3 { prim.load64! (branch_slot b slots) } else { 0 };
-};
-
-/// A branch as `new_branch!`, carrying token `t` when it is one.
-let new_branch_t! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let new_branch_t! !p !slots !count !bitmap !t = if t == 0 { new_branch! p slots count bitmap } else {
-    let o = alloc! p ((5 + slots) * word);
-    prim.store64! o (prim.info "map");
-    prim.store64! (o + word) (tag_fix (slots + 3));
-    prim.store64! (o + 2 * word) (tag_fix count);
-    prim.store64! (o + 3 * word) (tag_fix bitmap);
-    prim.store64! (branch_slot o slots) t;
-    o
-};
-
-/// `map_assoc!` where a branch carrying the token in `ctx_token` is the caller's to change: the
-/// slot set in it, and its count, in place. Every branch made on the way carries the token.
-let map_assoc_owned! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let map_assoc_owned! !p !node !h !k !v !shift = {
-    let t = prim.load64! (p + ctx_token);
-    let bit = 1 << (prim.ushr h shift & 31);
-    let bitmap = branch_bitmap! node;
-    let at = popcount (bitmap & (bit - 1));
-    let slots = popcount bitmap;
-    if bitmap & bit == 0 {
-        prim.store64! (p + ctx_scratch) 1;
-        let o = new_branch_t! p (slots + 1) (branch_count! node + 1) (bitmap | bit) t;
-        copy_words! (branch_slot node 0) (branch_slot o 0) at;
-        prim.store64! (branch_slot o at) (new_leaf! p h k v nil_word);
-        copy_words! (branch_slot node at) (branch_slot o (at + 1)) (slots - at);
-        o
-    } else {
-        let child = prim.load64! (branch_slot node at);
-        let replaced =
-            if is_leaf! child {
-                if leaf_hash! child == h {
-                    if chain_find! child k != 0 {
-                        prim.store64! (p + ctx_scratch) 0;
-                        chain_replace! p child k v
-                    } else {
-                        prim.store64! (p + ctx_scratch) 1;
-                        new_leaf! p h k v child
-                    }
-                } else {
-                    prim.store64! (p + ctx_scratch) 1;
-                    split_leaves_t! p child (new_leaf! p h k v nil_word) (chain_length! child + 1) (shift + 5) t
-                }
-            } else { map_assoc_owned! p child h k v (shift + 5) };
-        let count = branch_count! node + prim.load64! (p + ctx_scratch);
-        if branch_token! node == t {
-            prim.store64! (branch_slot node at) replaced;
-            remember_value! p (branch_slot node at) replaced;
-            prim.store64! (node + 2 * word) (tag_fix count);
-            node
-        } else {
-            let o = new_branch_t! p slots count bitmap t;
-            copy_words! (branch_slot node 0) (branch_slot o 0) slots;
-            prim.store64! (branch_slot o at) replaced;
-            o
-        }
-    }
-};
-
-/// `split_leaves!`, its branches carrying `t`.
-let split_leaves_t! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let split_leaves_t! !p !a !b !count !shift !t = {
-    let ia = prim.ushr (leaf_hash! a) shift & 31;
-    let ib = prim.ushr (leaf_hash! b) shift & 31;
-    if ia == ib {
-        let inner = split_leaves_t! p a b count (shift + 5) t;
-        let o = new_branch_t! p 1 count (1 << ia) t;
-        prim.store64! (branch_slot o 0) inner;
-        o
-    } else {
-        let o = new_branch_t! p 2 count ((1 << ia) | (1 << ib)) t;
-        prim.store64! (branch_slot o (if ia < ib { 0 } else { 1 })) a;
-        prim.store64! (branch_slot o (if ia < ib { 1 } else { 0 })) b;
-        o
-    }
+    let words = branch_words! b;
+    if untag_fix (prim.load64! (b + word)) == words + 4 { prim.load64! (branch_slot b words) } else { 0 };
 };
 
 /// A token never given before.
@@ -5019,7 +5194,7 @@ let index_set_fresh! : :integer -> :integer -> :integer -> :integer -> :integer;
 let index_set_fresh! !p !c !k !v =
     if is_kind! c kind_map {
         prim.store64! (p + ctx_token) (fresh_token! ());
-        map_assoc_owned! p c (key_hash! k) k v 0
+        map_assoc! p c (key_hash! k) k v 0
     } else { index_set! p c k v };
 
 /// `c.[k => v]` inside one: in place where the root's token says the loop made it. A root without
@@ -5029,7 +5204,7 @@ let index_set_linear! !p !c !k !v =
     if is_kind! c kind_map {
         let t = branch_token! c;
         prim.store64! (p + ctx_token) (if t == 0 { fresh_token! () } else { t });
-        map_assoc_owned! p c (key_hash! k) k v 0
+        map_assoc! p c (key_hash! k) k v 0
     } else { index_set! p c k v };
 
 let map_has! : :integer -> :integer -> :integer -> :integer;
@@ -5040,34 +5215,46 @@ let chain_without! !p !l !k = if key_equal! (prim.load64! (l + 2 * word)) k { pr
     new_leaf! p (leaf_hash! l) (prim.load64! (l + 2 * word)) (prim.load64! (l + 3 * word)) (chain_without! p (prim.load64! (l + 4 * word)) k)
 };
 
-/// A branch without slot `at`, or with it replaced when `child` is not `nil_word`.
-let branch_changed! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let branch_changed! !p !node !at !bit !child !count = {
-    let slots = popcount (branch_bitmap! node);
-    if child == nil_word {
-        let o = new_branch! p (slots - 1) count (branch_bitmap! node ^ bit);
-        copy_words! (branch_slot node 0) (branch_slot o 0) at;
-        copy_words! (branch_slot node (at + 1)) (branch_slot o at) (slots - at - 1);
-        o
-    } else {
-        let o = new_branch! p slots count (branch_bitmap! node);
-        copy_words! (branch_slot node 0) (branch_slot o 0) slots;
-        prim.store64! (branch_slot o at) child;
-        o
-    }
+/// `node` without the entry at `bit`.
+let branch_less_data! : :integer -> :integer -> :integer -> :integer;
+let branch_less_data! !p !node !bit = {
+    let datas = branch_datas! node;
+    let words = branch_words! node;
+    let at = 2 * popcount (datas & (bit - 1));
+    let o = new_branch! p (words - 2) (branch_count! node - 1) (branch_nodes! node) (datas ^ bit);
+    copy_words! (branch_slot node 0) (branch_slot o 0) at;
+    copy_words! (branch_slot node (at + 2)) (branch_slot o at) (words - at - 2);
+    o
 };
 
+/// `node` without the node at `bit`, which held one key.
+let branch_less_node! : :integer -> :integer -> :integer -> :integer;
+let branch_less_node! !p !node !bit = {
+    let nodes = branch_nodes! node;
+    let words = branch_words! node;
+    let at = 2 * popcount (branch_datas! node) + popcount (nodes & (bit - 1));
+    let o = new_branch! p (words - 1) (branch_count! node - 1) (nodes ^ bit) (branch_datas! node);
+    copy_words! (branch_slot node 0) (branch_slot o 0) at;
+    copy_words! (branch_slot node (at + 1)) (branch_slot o at) (words - at - 1);
+    o
+};
+
+/// `node` without `k`, which it has.
 let map_without! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
 let map_without! !p !node !h !k !shift = {
     let bit = 1 << (prim.ushr h shift & 31);
-    let bitmap = branch_bitmap! node;
-    let at = popcount (bitmap & (bit - 1));
-    let child = prim.load64! (branch_slot node at);
-    if is_leaf! child {
-        branch_changed! p node at bit (chain_without! p child k) (branch_count! node - 1)
-    } else {
-        let inner = map_without! p child h k (shift + 5);
-        branch_changed! p node at bit (if popcount (branch_bitmap! inner) == 0 { nil_word } else { inner }) (branch_count! node - 1)
+    let datas = branch_datas! node;
+    if datas & bit != 0 { branch_less_data! p node bit } else {
+        let at = branch_slot node (2 * popcount datas + popcount (branch_nodes! node & (bit - 1)));
+        let child = prim.load64! at;
+        let inner = if is_leaf! child { chain_without! p child k } else { map_without! p child h k (shift + 5) };
+        let gone = if is_leaf! child { inner == nil_word } else { branch_datas! inner == 0 && branch_nodes! inner == 0 };
+        if gone { branch_less_node! p node bit } else {
+            let o = branch_same! p node 0;
+            prim.store64! (o + (at - node)) inner;
+            prim.store64! (o + 2 * word) (tag_fix (branch_count! node - 1));
+            o
+        }
     }
 };
 
@@ -5086,18 +5273,28 @@ let chain_pairs! !p !l !tail = if l == nil_word { tail } else {
         (chain_pairs! p (prim.load64! (l + 4 * word)) tail)
 };
 
+/// The pairs under `node` from position `i` down, in front of `tail`: the positions in order,
+/// whichever of an entry, a chain or a branch each holds, which is the order the VM's map has.
 let node_pairs! : :integer -> :integer -> :integer -> :integer -> :integer;
 let node_pairs! !p !node !i !tail = if i < 0 { tail } else {
-    let child = prim.load64! (branch_slot node i);
-    let with_child = if is_leaf! child { chain_pairs! p child tail }
-                     else { node_pairs! p child (popcount (branch_bitmap! child) - 1) tail };
-    node_pairs! p node (i - 1) with_child
+    let bit = 1 << i;
+    let datas = branch_datas! node;
+    let nodes = branch_nodes! node;
+    let with_this =
+        if datas & bit != 0 {
+            let at = branch_slot node (2 * popcount (datas & (bit - 1)));
+            new_cons! p (pair_of! p (prim.load64! at) (prim.load64! (at + word))) tail
+        } else if nodes & bit != 0 {
+            let child = prim.load64! (branch_slot node (2 * popcount datas + popcount (nodes & (bit - 1))));
+            if is_leaf! child { chain_pairs! p child tail } else { node_pairs! p child 31 tail }
+        } else { tail };
+    node_pairs! p node (i - 1) with_this
 };
 
 let map_pairs! : :integer -> :integer -> :integer;
-let map_pairs! !p !m = if is_kind! m kind_map { node_pairs! p m (popcount (branch_bitmap! m) - 1) nil_word } else { type_fail! p "map_pairs needs a map" };
+let map_pairs! !p !m = if is_kind! m kind_map { node_pairs! p m 31 nil_word } else { type_fail! p "map_pairs needs a map" };
 
-/// `_unshared_parts`: the keys and values of `m`, one after another in a list, from every leaf
+/// `_unshared_parts`: the keys and values of `m`, one after another in a list, from every entry
 /// not under a branch already marked shareable: what `share_check` walks of a map (rt/lib.dr).
 /// A map is copied along one path for each change, so a new version shares nearly every branch
 /// with the last one shared, and walking all of its pairs again made each share of a compiler's
@@ -5105,16 +5302,25 @@ let map_pairs! !p !m = if is_kind! m kind_map { node_pairs! p m (popcount (branc
 let unshared_parts! : :integer -> :integer -> :integer;
 let unshared_parts! !p !m = if not (is_kind! m kind_map) { type_fail! p "unshared_parts needs a map" }
     else if shareable_info! (prim.load64! m) { nil_word }
-    else { unshared_from! p m (popcount (branch_bitmap! m) - 1) nil_word };
+    else { unshared_from! p m 31 nil_word };
 
 let unshared_from! : :integer -> :integer -> :integer -> :integer -> :integer;
 let unshared_from! !p !node !i !tail = if i < 0 { tail } else {
-    let child = prim.load64! (branch_slot node i);
-    let with_child = if not (is_object child) { tail }
-                     else if is_leaf! child { leaf_parts! p child tail }
-                     else if shareable_info! (prim.load64! child) { tail }
-                     else { unshared_from! p child (popcount (branch_bitmap! child) - 1) tail };
-    unshared_from! p node (i - 1) with_child
+    let bit = 1 << i;
+    let datas = branch_datas! node;
+    let nodes = branch_nodes! node;
+    let with_this =
+        if datas & bit != 0 {
+            let at = branch_slot node (2 * popcount (datas & (bit - 1)));
+            new_cons! p (prim.load64! at) (new_cons! p (prim.load64! (at + word)) tail)
+        } else if nodes & bit != 0 {
+            let child = prim.load64! (branch_slot node (2 * popcount datas + popcount (nodes & (bit - 1))));
+            if not (is_object child) { tail }
+            else if is_leaf! child { leaf_parts! p child tail }
+            else if shareable_info! (prim.load64! child) { tail }
+            else { unshared_from! p child 31 tail }
+        } else { tail };
+    unshared_from! p node (i - 1) with_this
 };
 
 let leaf_parts! : :integer -> :integer -> :integer -> :integer;
@@ -5128,8 +5334,8 @@ let map_size! !p !m = tag_fix (branch_count! m);
 /// `_match_key`: `[value]` or `[]`, the value unforced.
 let match_key! : :integer -> :integer -> :integer -> :integer;
 let match_key! !p !m !k = {
-    let l = if is_kind! m kind_map { map_find! m (key_hash! k) k 0 } else { 0 };
-    if l == 0 { nil_word } else { new_cons! p (prim.load64! (l + 3 * word)) nil_word }
+    let at = if is_kind! m kind_map { map_find! m (key_hash! k) k 0 } else { 0 };
+    if at == 0 { nil_word } else { new_cons! p (prim.load64! at) nil_word }
 };
 
 // --- c.[k] and c.[k => v] -----------------------------------------------------------
@@ -5138,7 +5344,7 @@ let match_key! !p !m !k = {
 /// walking one forces it, and is told apart before this.
 let peek! : :integer -> :integer -> :integer -> :integer;
 let peek! !p !c !k =
-    if is_kind! c kind_map { let l = map_find! c (key_hash! k) k 0; if l == 0 { 0 } else { prim.load64! (l + 3 * word) } }
+    if is_kind! c kind_map { let at = map_find! c (key_hash! k) k 0; if at == 0 { 0 } else { prim.load64! at } }
     else if is_trunk! c {
         if is_fix k && untag_fix k >= 0 && untag_fix k < trunk_size! c { trunk_read! p k c } else { 0 }
     }
@@ -9336,7 +9542,7 @@ let trunk_read! !p !i !t = {
         fail! p atom_out_of_bounds "trunk.at: no element at that position"
     } else {
         let k = tag_fix (trunk_first! t + untag_fix i);
-        prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0 + 3 * word)
+        prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0)
     }
 };
 
@@ -9378,7 +9584,7 @@ let trunk_slice! !p !a !b !t = {
 let trunk_list_from! : :integer -> :integer -> :integer -> :integer -> :integer;
 let trunk_list_from! !p !t !i !tail = if i < 0 { tail } else {
     let k = tag_fix (trunk_first! t + i);
-    trunk_list_from! p t (i - 1) (new_cons! p (prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0 + 3 * word)) tail)
+    trunk_list_from! p t (i - 1) (new_cons! p (prim.load64! (map_find! (trunk_map! t) (key_hash! k) k 0)) tail)
 };
 
 let trunk_to_list! : :integer -> :integer -> :integer;
@@ -10776,13 +10982,13 @@ let member_of! : :integer -> :integer -> :any -> :integer;
 let member_of! !p !o !name = {
     if is_kind! o kind_module {
         let m = prim.load64! (o + word);
-        let l = map_find! m (key_hash! name) name 0;
-        if l != 0 { prim.load64! (l + 3 * word) }
+        let at = map_find! m (key_hash! name) name 0;
+        if at != 0 { prim.load64! at }
         else {
             let n = string_len! name;
             let bare = if n > 0 && prim.load8! (string_bytes name + n - 1) == 33 { str_slice_any! p name (tag_fix 0) (tag_fix (n - 1)) } else { concat2! p name (text_of! p "!") };
             let twin = map_find! m (key_hash! bare) bare 0;
-            if twin != 0 { prim.load64! (twin + 3 * word) }
+            if twin != 0 { prim.load64! twin }
             else { fail_value! p (prim.atom "no_such_member") (concat3! p (text_of! p "this module has no member `") name (text_of! p "`")) }
         }
     }
@@ -12158,9 +12364,9 @@ let note_context! !p = {
 
 // --- sorting what needs no calling out ------------------------------------------------------------
 //
-// A stable bottom-up merge over `[key, index]` pairs in memory of its own, for `sort_keyed`. Keys are
-// words here, so a collection could not move them anyway: none can run, as nothing allocates until
-// the answer is built.
+// A stable sort of `[key, index]` pairs in memory of its own, for `sort_keyed`: a bottom-up merge,
+// or by their bytes when the keys are many integers. Keys are words here, so a collection could
+// not move them anyway: none can run, as nothing allocates until the answer is built.
 
 let sort_key_at! : :integer -> :integer -> :integer;
 let sort_key_at! !t !i = prim.load64! (t + i * 2 * word);
@@ -12173,48 +12379,120 @@ let text_below! !a !b = {
     c < 0 || (c == 0 && la < lb)
 };
 
-/// Whether `b` goes before `a`, which is all stability lets it ask.
-let sort_before! : :bool -> :integer -> :integer -> :any;
-let sort_before! !texts !b !a = if texts { text_below! b a } else { b < a };
-
-/// `run` is five words: whether keys are strings, the source, the destination, where the first
-/// half stops and where the second does, since a dialect function has six parameters at most.
-let merge_run! : :integer -> :integer -> :integer -> :integer -> :integer;
-let merge_run! !run !i !j !out = {
-    let texts = prim.load64! run != 0;
-    let src = prim.load64! (run + word);
-    let dst = prim.load64! (run + 2 * word);
-    let mid = prim.load64! (run + 3 * word);
-    let stop = prim.load64! (run + 4 * word);
+/// One merge of `src[i..mid)` and `src[j..stop)` into `dst`, the keys small integers: a tagged
+/// integer orders as its word does. Where the next pair goes is `i + j - mid`, since the two runs
+/// are adjacent, and so everything the loop reads is a parameter and stays in a register: read
+/// from a record each time round -- a store to `dst` might have changed it, for all the machine
+/// could tell -- this was half of sorting a million integers.
+let merge_ints! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let merge_ints! !src !dst !i !j !mid !stop = {
+    let out = dst + (i + j - mid) * 2 * word;
     if i >= mid && j >= stop { 0 }
-    else if i < mid && (j >= stop || not (sort_before! texts (sort_key_at! src j) (sort_key_at! src i))) {
-        prim.store64! (dst + out * 2 * word) (sort_key_at! src i);
-        prim.store64! (dst + out * 2 * word + word) (prim.load64! (src + i * 2 * word + word));
-        merge_run! run (i + 1) j (out + 1)
+    else if i < mid && (j >= stop || not (sort_key_at! src j < sort_key_at! src i)) {
+        prim.store64! out (sort_key_at! src i);
+        prim.store64! (out + word) (prim.load64! (src + i * 2 * word + word));
+        merge_ints! src dst (i + 1) j mid stop
     } else {
-        prim.store64! (dst + out * 2 * word) (sort_key_at! src j);
-        prim.store64! (dst + out * 2 * word + word) (prim.load64! (src + j * 2 * word + word));
-        merge_run! run i (j + 1) (out + 1)
+        prim.store64! out (sort_key_at! src j);
+        prim.store64! (out + word) (prim.load64! (src + j * 2 * word + word));
+        merge_ints! src dst i (j + 1) mid stop
     }
 };
 
-let merge_width! : :integer -> :integer -> :integer -> :integer -> :integer;
-let merge_width! !run !n !width !at = if at >= n { 0 } else {
+/// The same, the keys strings.
+let merge_texts! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let merge_texts! !src !dst !i !j !mid !stop = {
+    let out = dst + (i + j - mid) * 2 * word;
+    if i >= mid && j >= stop { 0 }
+    else if i < mid && (j >= stop || not (text_below! (sort_key_at! src j) (sort_key_at! src i))) {
+        prim.store64! out (sort_key_at! src i);
+        prim.store64! (out + word) (prim.load64! (src + i * 2 * word + word));
+        merge_texts! src dst (i + 1) j mid stop
+    } else {
+        prim.store64! out (sort_key_at! src j);
+        prim.store64! (out + word) (prim.load64! (src + j * 2 * word + word));
+        merge_texts! src dst i (j + 1) mid stop
+    }
+};
+
+let merge_width! : :bool -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let merge_width! !texts !src !dst !n !width !at = if at >= n { 0 } else {
     let mid = if at + width < n { at + width } else { n };
     let stop = if at + 2 * width < n { at + 2 * width } else { n };
-    prim.store64! (run + 3 * word) mid;
-    prim.store64! (run + 4 * word) stop;
-    merge_run! run at mid at;
-    merge_width! run n width stop
+    if texts { merge_texts! src dst at mid mid stop } else { merge_ints! src dst at mid mid stop };
+    merge_width! texts src dst n width stop
 };
 
 /// Which table holds the answer.
-let merge_all! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
-let merge_all! !run !src !dst !n !width = if width >= n { src } else {
-    prim.store64! (run + word) src;
-    prim.store64! (run + 2 * word) dst;
-    merge_width! run n width 0;
-    merge_all! run dst src n (width * 2)
+let merge_all! : :bool -> :integer -> :integer -> :integer -> :integer -> :integer;
+let merge_all! !texts !src !dst !n !width = if width >= n { src } else {
+    merge_width! texts src dst n width 0;
+    merge_all! texts dst src n (width * 2)
+};
+
+// Many integers are sorted by their bytes instead, least significant first, each pass counting
+// how many keys have each value of one byte and then moving every pair to where its count puts
+// it: stable, as the merge is, and with no comparison to mispredict -- on a million random keys a
+// merge mispredicts every other one of its twenty million. A byte every key agrees on is no pass
+// at all, so keys below 2^31 are four passes, not eight. The top byte is read with its sign
+// bit turned over, which is the whole of what a signed order asks.
+
+let radix_least : :integer;
+let radix_least = 64;
+
+/// Every bit in which some key differs from the first.
+let radix_differs! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let radix_differs! !t !n !i !first !acc = if i >= n { acc } else {
+    radix_differs! t n (i + 1) first (acc | (sort_key_at! t i ^ first))
+};
+
+let radix_digit : :integer -> :integer -> :integer;
+let radix_digit !k !shift = (prim.ushr k shift & 255) ^ (if shift == 56 { 128 } else { 0 });
+
+let radix_count! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let radix_count! !t !n !i !shift !counts = if i >= n { 0 } else {
+    let at = counts + radix_digit (sort_key_at! t i) shift * word;
+    prim.store64! at (prim.load64! at + 1);
+    radix_count! t n (i + 1) shift counts
+};
+
+/// Each count made where its first pair goes.
+let radix_starts! : :integer -> :integer -> :integer -> :integer;
+let radix_starts! !counts !d !sum = if d >= 256 { 0 } else {
+    let c = prim.load64! (counts + d * word);
+    prim.store64! (counts + d * word) sum;
+    radix_starts! counts (d + 1) (sum + c)
+};
+
+let radix_move! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let radix_move! !src !dst !n !i !shift !counts = if i >= n { 0 } else {
+    let k = sort_key_at! src i;
+    let at = counts + radix_digit k shift * word;
+    let to = prim.load64! at;
+    prim.store64! at (to + 1);
+    prim.store64! (dst + to * 2 * word) k;
+    prim.store64! (dst + to * 2 * word + word) (prim.load64! (src + i * 2 * word + word));
+    radix_move! src dst n (i + 1) shift counts
+};
+
+/// Which table holds the answer.
+let radix_all! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let radix_all! !src !dst !n !differs !shift !counts = if shift >= 64 { src }
+    else if prim.ushr differs shift & 255 == 0 { radix_all! src dst n differs (shift + 8) counts }
+    else {
+        prim.c3! "memset" counts 0 (256 * word);
+        radix_count! src n 0 shift counts;
+        radix_starts! counts 0 0;
+        radix_move! src dst n 0 shift counts;
+        radix_all! dst src n differs (shift + 8) counts
+    };
+
+let radix_sort! : :integer -> :integer -> :integer -> :integer;
+let radix_sort! !a !b !n = {
+    let counts = prim.c1! "malloc" (256 * word);
+    let answer = radix_all! a b n (radix_differs! a n 1 (sort_key_at! a 0) 0) 0 counts;
+    prim.c1! "free" counts;
+    answer
 };
 
 let sort_class! : :integer -> :integer -> :integer -> :any -> :any -> :integer;
@@ -12244,10 +12522,7 @@ let sort_prim! !p !keys !items = {
         let a = prim.c1! "malloc" (2 * word * n);
         let b = prim.c1! "malloc" (2 * word * n);
         sort_fill! keys a 0 n;
-        let run = prim.c1! "malloc" (5 * word);
-        prim.store64! run (if class == 2 { 1 } else { 0 });
-        let answer = merge_all! run a b n 1;
-        prim.c1! "free" run;
+        let answer = if class == 1 && n >= radix_least { radix_sort! a b n } else { merge_all! (class == 2) a b n 1 };
         let out = sorted_list! p items answer (n - 1) nil_word;
         prim.c1! "free" a;
         prim.c1! "free" b;

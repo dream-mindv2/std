@@ -72,10 +72,10 @@ let values : %{ k => v } -> [v];
 let values m = map (fn p -> list.nth 1 p) (_map_pairs m);
 /// Count the entries in the map.
 let size : %{ k => v } -> :integer;
-let size m = list.length (_map_pairs m);
+let size m = len m;
 /// Test whether the map contains no entries.
 let is_empty : %{ k => v } -> :bool;
-let is_empty m = list.is_empty (_map_pairs m);
+let is_empty m = len m == 0;
 
 /// The keys in order. The only operation here that imposes one, and it costs a
 /// sort every time it is asked -- a map does not remember it.
