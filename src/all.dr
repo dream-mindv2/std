@@ -42,6 +42,8 @@ import std.graphics.css;
 import std.graphics.html;
 import std.graphics.widgets;
 import std.http;
+import std.http.api;
+import std.http.client;
 import std.http.h2;
 import std.http.hpack;
 import std.http.pool as http_pool;
@@ -113,7 +115,7 @@ let modules = ["std.agent", "std.array", "std.trunk", "std.atom", "std.binary", 
                "std.build.cc.gnu", "std.build.cc.msvc", "std.build.cc.steps", "std.build.check",
                "std.build.command", "std.build.dream", "std.build.fetch", "std.build.probe",
                "std.build.run", "std.build.tool", "std.char", "std.cli",
-               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.h2", "std.http.hpack", "std.http.pool", "std.http.reader", "std.http.server", "std.http.stream", "std.http.url", "std.http.websocket",
+               "std.codec", "std.console", "std.error", "std.file", "std.http", "std.http.api", "std.http.client", "std.http.h2", "std.http.hpack", "std.http.pool", "std.http.reader", "std.http.server", "std.http.stream", "std.http.url", "std.http.websocket",
                "std.json", "std.lazy", "std.list", "std.log", "std.map", "std.macros", "std.ml", "std.ml.ad", "std.ml.data", "std.ml.init", "std.ml.loss",
                "std.ml.metrics", "std.ml.nn", "std.ml.ops", "std.ml.optim", "std.ml.tree", "std.ml.text", "std.ml.bayes", "std.ml.cluster", "std.num", "std.parse", "std.path", "std.payload", "std.proc", "std.pty",
                "std.property", "std.random", "std.record", "std.regex", "std.registry", "std.remote",

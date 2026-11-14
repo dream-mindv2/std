@@ -235,6 +235,85 @@ let intersect other m = filter (fn k _ -> _map_has other k) m;
 
 // --- tests -------------------------------------------------------------------
 
+// --- more of what a table is asked for --------------------------------------------
+
+/// The map with each key replaced by what `f` makes of it. Two keys made the
+/// same are one entry, and which of their values it holds is unspecified.
+let map_keys : (k -> j) -> %{ k => v } -> %{ j => v };
+let map_keys f m = list.fold (fn acc p -> acc.[(f (list.nth 0 p)) => (list.nth 1 p)]) empty (_map_pairs m);
+
+/// What `f` makes of each key and value, as a list; its order is unspecified.
+let map_pairs : (k -> v -> a) -> %{ k => v } -> [a];
+let map_pairs f m = list.map (fn p -> f (list.nth 0 p) (list.nth 1 p)) (_map_pairs m);
+
+/// The entries whose key satisfies `pred`.
+let filter_keys : (k -> :bool) -> %{ k => v } -> %{ k => v };
+let filter_keys pred m = filter (fn k _ -> pred k) m;
+
+/// The entries whose value satisfies `pred`.
+let filter_values : (v -> :bool) -> %{ k => v } -> %{ k => v };
+let filter_values pred m = filter (fn _ v -> pred v) m;
+
+/// `[those that satisfy pred, those that do not]`.
+let partition : (k -> v -> :bool) -> %{ k => v } -> [%{ k => v }];
+let partition pred m = [filter pred m, filter (fn k v -> not (pred k v)) m];
+
+/// Each value as a key and its key as the value. Two keys with one value are
+/// one entry, and which key it holds is unspecified.
+let invert : %{ k => v } -> %{ v => k };
+let invert m = fold (fn acc k v -> acc.[v => k]) empty m;
+
+/// The entries of both, and for a key in both, what `f` makes of the first's
+/// value and the second's: `merge_with (fn a b -> a + b)` adds two tallies.
+let merge_with : (v -> v -> v) -> %{ k => v } -> %{ k => v } -> %{ k => v };
+let merge_with f a b =
+    fold (fn acc k v -> if _map_has acc k { acc.[k => (f (acc.[k]) v)] } else { acc.[k => v] }) a b;
+
+/// The maps of a list merged, a later one winning where they overlap.
+let merge_all : [%{ k => v }] -> %{ k => v };
+let merge_all ms = list.fold merge empty ms;
+
+/// An entry satisfying `pred`, as `[key, value]`, or `none`. Which one, when
+/// there are several, is unspecified.
+let find : (k -> v -> :bool) -> %{ k => v } -> Option [k, v];
+let find pred m = list.find (fn p -> pred (list.nth 0 p) (list.nth 1 p)) (_map_pairs m);
+
+/// Test whether any entry satisfies `pred`.
+let any : (k -> v -> :bool) -> %{ k => v } -> :bool;
+let any pred m = list.any (fn p -> pred (list.nth 0 p) (list.nth 1 p)) (_map_pairs m);
+
+/// Test whether every entry satisfies `pred`. True of an empty map.
+let all : (k -> v -> :bool) -> %{ k => v } -> :bool;
+let all pred m = list.all (fn p -> pred (list.nth 0 p) (list.nth 1 p)) (_map_pairs m);
+
+/// How many entries satisfy `pred`.
+let count : (k -> v -> :bool) -> %{ k => v } -> :integer;
+let count pred m = list.count (fn p -> pred (list.nth 0 p) (list.nth 1 p)) (_map_pairs m);
+
+/// The entries under the keys in `ks`, those of them the map has.
+let pick : [k] -> %{ k => v } -> %{ k => v };
+let pick ks m = list.fold (fn acc k -> if _map_has m k { acc.[k => (m.[k])] } else { acc }) empty ks;
+
+/// The map without the keys in `ks`.
+let omit : [k] -> %{ k => v } -> %{ k => v };
+let omit ks m = list.fold (fn acc k -> _map_remove acc k) m ks;
+
+/// Keys and values paired off in order, as far as the shorter list goes.
+let zip : [k] -> [v] -> %{ k => v };
+let zip ks vs = from_pairs (list.zip ks vs);
+
+/// A map of one entry.
+let singleton : k -> v -> %{ k => v };
+let singleton k v = empty.[k => v];
+
+/// The keys whose entries satisfy `pred`; their order is unspecified.
+let keys_where : (k -> v -> :bool) -> %{ k => v } -> [k];
+let keys_where pred m = keys (filter pred m);
+
+/// The sum of the values.
+let sum_values : %{ k => (:integer | :float) } -> (:integer | :float);
+let sum_values m = list.sum (values m);
+
 when test {
     import std.test;
 
@@ -243,6 +322,25 @@ when test {
 
     let tests : [:any];
     let tests = [
+        test.case "map_keys and map_pairs"
+            $( test.eq! [[["a!", 1], ["b!", 2]], ["a1", "b2"]]
+                        [sorted_pairs (map_keys (fn k -> k + "!") %{"a" => 1, "b" => 2}), list.sort (map_pairs (fn k v -> k + to_string v) %{"a" => 1, "b" => 2})] ),
+        test.case "filter_keys, filter_values and partition"
+            $( test.eq! [[[2, :b]], [[1, :a]], [[[1, :a]], [[2, :b]]]]
+                        [sorted_pairs (filter_keys (fn k -> k > 1) %{1 => :a, 2 => :b}), sorted_pairs (filter_values (fn v -> v == :a) %{1 => :a, 2 => :b}),
+                         list.map sorted_pairs (partition (fn k _ -> k == 1) %{1 => :a, 2 => :b})] ),
+        test.case "invert"                  $( test.eq! [[:a, 1], [:b, 2]] (sorted_pairs (invert %{1 => :a, 2 => :b})) ),
+        test.case "merge_with and merge_all"
+            $( test.eq! [[[:a, 1], [:b, 5], [:c, 4]], [[:a, 2], [:b, 3]]]
+                        [sorted_pairs (merge_with (fn x y -> x + y) %{:a => 1, :b => 2} %{:b => 3, :c => 4}), sorted_pairs (merge_all [%{:a => 1}, %{:a => 2, :b => 3}])] ),
+        test.case "find, any, all and count"
+            $( test.eq! [Option.some [2, :b], Option.none, true, false, 1]
+                        [find (fn k _ -> k == 2) %{1 => :a, 2 => :b}, find (fn k _ -> k == 9) %{1 => :a}, any (fn _ v -> v == :b) %{1 => :a, 2 => :b},
+                         all (fn k _ -> k > 1) %{1 => :a, 2 => :b}, count (fn k _ -> k > 1) %{1 => :a, 2 => :b}] ),
+        test.case "pick and omit"
+            $( test.eq! [[[:a, 1]], [[:b, 2]]] [sorted_pairs (pick [:a, :z] %{:a => 1, :b => 2}), sorted_pairs (omit [:a, :z] %{:a => 1, :b => 2})] ),
+        test.case "zip and singleton"       $( test.eq! [[[:a, 1], [:b, 2]], [[:k, 0]]] [sorted_pairs (zip [:a, :b, :c] [1, 2]), sorted_pairs (singleton :k 0)] ),
+        test.case "keys_where and sum_values" $( test.eq! [[:b], 3] [keys_where (fn _ v -> v > 1) %{:a => 1, :b => 2}, sum_values %{:a => 1, :b => 2}] ),
         test.case "empty has nothing"      $( test.false! (has :a empty) ),
         test.case "from_pairs"             $( test.eq! 1 (get 0 :a m) ),
         test.case "a later pair wins"

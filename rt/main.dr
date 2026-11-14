@@ -346,8 +346,19 @@ let is_object !v = v & 7 == 0 && v != 0;
 let map_memory! : :integer -> :integer;
 let map_memory! !bytes = {
     let at = prim.c6! "mmap" 0 bytes 3 16418 (0 - 1) 0;
-    if at == 0 - 1 { fatal! "dream: out of memory\n" } else { at }
+    if at == 0 - 1 { fatal! "dream: out of memory\n" } else {
+        if bytes >= huge_page { prim.c3! "madvise" at bytes 14; };
+        at
+    }
 };
+
+/// What the kernel is asked to back with pages of two megabytes (MADV_HUGEPAGE), where it gives
+/// them: every mapping at least that large. The nursery was, and nothing else: the old chunks a
+/// collection copies into and a program's long-lived data is read from were pages of four
+/// kilobytes, each a fault the first time a survivor was written into it -- 400,000 faults in a
+/// native self-compile, a second of the kernel's time out of twelve.
+let huge_page : :integer;
+let huge_page = 2097152;
 
 let fatal! : :any -> :integer;
 let fatal! s = {
@@ -460,9 +471,9 @@ let nursery_take! !bytes = {
 // when it has none, and with half of what it has when it has that many.
 
 let young_own : :integer;
-let young_own = 64;
+let young_own = 256;
 let young_batch : :integer;
-let young_batch = 16;
+let young_batch = 64;
 
 /// The link `n` chunks along the list at `link`, or the one holding 0 if it is shorter.
 let young_along! : :integer -> :integer -> :integer;
@@ -1061,6 +1072,10 @@ let w_young_free : :integer;
 let w_young_free = 720;
 let w_young_scratch : :integer;
 let w_young_scratch = 728;
+/// What a heap's room is balanced by (`major_room!`), in bytes: `balance`, or `DREAM_GC_BALANCE_MB`,
+/// and 0 for three times what a major collection kept, as it was.
+let w_gc_balance : :integer;
+let w_gc_balance = 744;
 /// The least the shared region grows by before a census is begun: `census_min`, or
 /// `DREAM_CENSUS_MIN_MB`.
 let w_census_min : :integer;
@@ -2061,16 +2076,22 @@ let evacuate_heap! !p !v =
         else if prim.load64! (info + info_kind) == kind_ind { evacuate! p (prim.load64! (v + word)) }
         else {
             if prim.load64! (p + ctx_reporting) != 0 { census_heap_object! p v info; };
-            let n = object_words! v info;
-            let at = prim.load64! (p + ctx_to);
-            let to = if prim.ugt (at + n * word) (prim.load64! (p + ctx_to_limit)) { to_more! p (n * word) } else { at };
-            copy_words! v to n;
-            prim.store64! (p + ctx_to) (to + n * word);
-            prim.store64! (p + ctx_copied) (prim.load64! (p + ctx_copied) + n * word);
-            prim.store64! v (to + 1);
-            to
+            moved! p v info
         }
     };
+
+/// `v`, whose first word is `info`, copied to to-space and left pointing at its copy.
+let moved! : :integer -> :integer -> :integer -> :integer;
+let moved! !p !v !info = {
+    let n = object_words! v info;
+    let at = prim.load64! (p + ctx_to);
+    let to = if prim.ugt (at + n * word) (prim.load64! (p + ctx_to_limit)) { to_more! p (n * word) } else { at };
+    copy_words! v to n;
+    prim.store64! (p + ctx_to) (to + n * word);
+    prim.store64! (p + ctx_copied) (prim.load64! (p + ctx_copied) + n * word);
+    prim.store64! v (to + 1);
+    to
+};
 
 let evacuate_at! : :integer -> :integer -> :integer;
 let evacuate_at! !p !at = prim.store64! at (evacuate! p (prim.load64! at));
@@ -2500,6 +2521,89 @@ let gc_said! !id !live !kept !pins !cands = {
     0
 };
 
+// --- how much room a heap is given ----------------------------------------------------------
+//
+// A major collection copies everything a process has that is old, and the next one comes when
+// the old chunks have grown by some amount past what this one kept. That amount was twice what
+// was kept, whatever the heap: a rule that gives a heap of two megabytes four more, to be
+// copied again a moment later, and a heap of two gigabytes four more gigabytes -- for which a
+// second rule had to be written by hand, half as much above one gigabyte. Both are one curve.
+// A program here is many heaps, one a process, sharing the machine's memory, and the room worth
+// giving each is not in proportion to its size. A byte of room saves a heap the more collecting
+// the faster the heap grows and the more there is in it to copy, and each further byte saves
+// less than the one before; given to whichever heap it saves most, memory ends up where
+//
+//     room = sqrt(kept * growth / speed * balance)
+//
+// for every heap (Kirisame, Shenoy and Panchekha, "Optimal heap limits for reducing browser
+// memory use", OOPSLA 2022, where it is called MemBalancer): `kept` what the collection left,
+// `growth` how fast the old chunks have been growing and `speed` how fast a collection copies,
+// both in bytes a second and so a ratio between them, and `balance` the one number that says how
+// much memory is worth how much time, the same for every heap. A small heap that is growing
+// fast gets several times its size and is not copied again for a while; a large one gets a
+// fraction of its size; and one that has stopped growing gets almost nothing, and holds almost
+// nothing it does not use. The rates are measured, at each major collection, from the clock
+// and from what the heap did since the one before, and averaged with what they were, since
+// one collection that landed in a burst says little.
+//
+// It is bounded on both sides, which the paper's is not: at least a quarter of what was kept,
+// so that a heap measured in a quiet moment is not collected again at once, and at most four
+// times it and 64 MB, so that one measured in a burst does not take the machine. The first
+// major collection of a process has nothing to go by and gets twice what it kept.
+
+/// What `room` is balanced by, in bytes: at 2.5 GB a heap of 100 MB that grows a third as fast
+/// as it is copied is given 290 MB, one of 10 MB 90 MB, and one of a gigabyte 920 MB. Measured on
+/// a native self-compile against the rule as it was, the median of five: 526 MB copied by major
+/// collections where there were 849, 3.62 s where there were 3.81, and no more memory; half of
+/// this and twice it both did less. `DREAM_GC_BALANCE_MB` sets it, and 0 is the rule as it was.
+let balance : :integer;
+let balance = 2684354560;
+
+/// The whole part of the square root of `n`, by Newton's steps from above.
+let isqrt! : :integer -> :integer;
+let isqrt! !n = if n < 2 { n } else { isqrt_from! n n };
+
+let isqrt_from! : :integer -> :integer -> :integer;
+let isqrt_from! !n !x = {
+    let next = (x + n / x) / 2;
+    if next >= x { x } else { isqrt_from! n next }
+};
+
+/// Two rates averaged, the first time being the rate itself.
+let averaged : :integer -> :integer -> :integer;
+let averaged !was !now = if was == 0 { now } else { (was + now) / 2 };
+
+/// How far the old chunks may grow past `kept` before the next major collection, after one that
+/// began at `began` with `before` bytes old and copied `copied`; and what the one after it will
+/// want of this one, noted.
+let major_room! : :integer -> :integer -> :integer -> :integer -> :integer -> :integer -> :integer;
+let major_room! !p !pcb !kept !before !copied !began = {
+    let now = now_ns! p;
+    let last = prim.load64! (pcb + pcb_major_time);
+    let weight = prim.load64! (world_at! w_gc_balance);
+    // Nanoseconds, and never none: a collection of nothing takes no time the clock can see.
+    let took = if now - began < 1000 { 1000 } else { now - began };
+    let since = if began - last < 1000 { 1000 } else { began - last };
+    let grown = if before > prim.load64! (pcb + pcb_major_kept) { before - prim.load64! (pcb + pcb_major_kept) } else { 0 };
+    let speed = averaged (prim.load64! (pcb + pcb_major_speed)) (copied * 1000000 / (took / 1000) + 1);
+    let growth = if last == 0 { 0 } else { averaged (prim.load64! (pcb + pcb_major_growth)) (grown * 1000000 / (since / 1000)) };
+    prim.store64! (pcb + pcb_major_time) now;
+    prim.store64! (pcb + pcb_major_kept) kept;
+    prim.store64! (pcb + pcb_major_speed) speed;
+    prim.store64! (pcb + pcb_major_growth) growth;
+    if weight == 0 { if kept > 1073741824 { kept / 2 } else { 2 * kept } }
+    else if last == 0 { 2 * kept }
+    else {
+        // The ratio in 1024ths, and the root taken of two factors apart: the product of a heap's
+        // size and the balance does not fit a word.
+        let ratio = growth * 1024 / speed;
+        let room = isqrt! kept * isqrt! (ratio * (weight / 1024));
+        let least = kept / 4;
+        let most = 4 * kept + 67108864;
+        if room < least { least } else if room > most { most } else { room }
+    }
+};
+
 let spare_count! : :integer -> :integer -> :integer;
 let spare_count! !c !n = if c == 0 { n } else { spare_count! (prim.load64! c) (n + 1) };
 
@@ -2520,6 +2624,10 @@ let collect! !p !sp = {
     // and `DREAM_GC_FULL` always copy everything.
     let minor = direct && not reporting && prim.load64! (world_at! w_gc_full) == 0
         && prim.load64! (pcb + pcb_old) != 0 && prim.load64! (pcb + pcb_old_bytes) < prim.load64! (pcb + pcb_major_at);
+    // What a major collection is paced by afterwards (`major_room!`): what was old as it began,
+    // and when.
+    let old_before = prim.load64! (pcb + pcb_old_bytes);
+    let began = if minor { 0 } else { now_ns! p };
     if not minor {
         // Everything is from-space: the old chunks join the nursery's.
         prim.store64! (p + ctx_chunks) (joined_chunks! (prim.load64! (p + ctx_chunks)) (prim.load64! (pcb + pcb_old)));
@@ -2597,7 +2705,7 @@ let collect! !p !sp = {
         // collection after the first major was another -- five thousand of them, a gigabyte each.
         if not minor {
             let old_now = prim.load64! (pcb + pcb_old_bytes);
-            let spaced = if old_now > 1073741824 { old_now + old_now / 2 } else { 3 * old_now };
+            let spaced = old_now + major_room! p pcb old_now old_before live began;
             prim.store64! (pcb + pcb_major_at) (if spaced > min_chunk { spaced } else { min_chunk });
             young_trim! p;
         };
@@ -2943,6 +3051,8 @@ let init! () = {
     if prim.c1! "getenv" "DREAM_GC_PIN_TEST" != 0 { prim.store64! (world_at! w_pin_test) 1; };
     if prim.c1! "getenv" "DREAM_GC_TRACE" != 0 { prim.store64! (world_at! w_gc_trace) 1; };
     if prim.c1! "getenv" "DREAM_GC_FULL" != 0 { prim.store64! (world_at! w_gc_full) 1; };
+    let balanced = prim.c1! "getenv" "DREAM_GC_BALANCE_MB";
+    prim.store64! (world_at! w_gc_balance) (if balanced != 0 { prim.c1! "atol" balanced * 1048576 } else { balance });
     if prim.c1! "getenv" "DREAM_GC_VERIFY" != 0 { prim.store64! (world_at! w_gc_verify) 1; };
     let census_floor = prim.c1! "getenv" "DREAM_CENSUS_MIN_MB";
     prim.store64! (world_at! w_census_min) (if census_floor != 0 { prim.c1! "atol" census_floor * 1048576 } else { census_min });
@@ -5600,8 +5710,19 @@ let pcb_ssb = 352;
 /// The nursery's size for this process, which a minor collection moves by what survived it.
 let pcb_nursery : :integer;
 let pcb_nursery = 376;
+/// What the last major collection left to pace the next by (`major_room!`): when it ended, what
+/// the old chunks came to before it, how fast they had been growing, and how fast it copied --
+/// the two rates in bytes a second, each averaged with the ones before.
+let pcb_major_time : :integer;
+let pcb_major_time = 384;
+let pcb_major_kept : :integer;
+let pcb_major_kept = 392;
+let pcb_major_growth : :integer;
+let pcb_major_growth = 400;
+let pcb_major_speed : :integer;
+let pcb_major_speed = 408;
 let pcb_size : :integer;
-let pcb_size = 384;
+let pcb_size = 416;
 
 // A message waiting: `[next, value, segments, bytes]`. Until its receiver takes its segments into
 // its heap (`take_mail!`) they are nobody's, and the value is only in them.

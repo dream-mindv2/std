@@ -1,0 +1,602 @@
+// An API client, as data: what every client of somebody's HTTP API writes
+// again, written once.
+//
+//     import std.http.api;
+//
+//     let github = api.Settings.new ()
+//         |> api.Settings.set_base "https://api.github.com"
+//         |> api.Settings.set_auth (api.Auth.bearer token);
+//
+//     let repo owner name = api.get "/repos/{owner}/{repo}"
+//         |> api.with_param "owner" owner
+//         |> api.with_param "repo" name;
+//
+//     api.run! github (repo "dream-mindv2" "dream")      // Result.ok %{ "name" => "dream", .. }
+//
+// Three kinds of value, and one function that puts them together.
+//
+// **`Settings` is what is true of every request to one API**: where it is,
+// who is asking (`Auth`), the headers and query it always wants, how long to
+// wait, how often to try again. A mapping with a default for every field, so
+// a client is the two or three it changes.
+//
+// **A `Command` is one request, not yet sent**: a method and a path with
+// `{names}` in it, what fills the names, the query, the body, and what to
+// make of the answer. It is a value, so an endpoint is a pure function that
+// answers one -- `repo owner name` above -- which can be tested, listed and
+// paged without a socket, and the function that sends is the only impure one.
+//
+// **A `Failure` says which of three things went wrong**: nothing came back
+// (`transport`), what came back was not a success (`status`, with the body
+// read as far as it can be, since that is where an API says why), or it was
+// a success that could not be read (`decode`).
+//
+// `run!` does the rest: the URL from the base, the path and every query; the
+// headers and the credentials; the body as JSON or a form; the request, again
+// after a pause when the server says it is busy (429, 502, 503, 504, a
+// `Retry-After` honoured) or the connection failed on a request that is safe
+// to repeat; the status checked; the body read as JSON when it is JSON; and
+// the command's own `decode` over that. `pages!` follows an API that answers
+// in pieces, by whichever of the three ways it says where the next piece is
+// (`next_cursor`, `next_link`, `next_number`).
+//
+// A client of a particular API is usually a module of its own, with a value
+// of its own that knows its token: `std.http.client` is this module as
+// something to `derive`, which gives that module `run!`, `get!`, `post!`,
+// `pages!` and the rest for the price of saying what its settings are.
+//
+// Nothing here opens a connection in a test: `Settings.transport` is a
+// function from request to response that stands in for the network.
+
+import std.error;
+import std.http;
+import std.http.url;
+import std.json;
+import std.list;
+import std.map;
+import std.num;
+import std.proc;
+import std.str;
+
+// --- what is true of every request -------------------------------------------------
+
+/// Who is asking, in the ways APIs want to be told.
+union Auth {
+    /// Nobody in particular.
+    none
+    /// `Authorization: Bearer token`: OAuth, and most APIs with a token.
+    bearer(token : :string)
+    /// `Authorization: Basic`, a name and a password.
+    basic(user : :string, password : :string)
+    /// A header of the API's own: `X-Api-Key: ..`.
+    header(name : :string, value : :string)
+    /// A key in the query of every request: `?api_key=..`.
+    query(name : :string, value : :string)
+}
+
+/// One API: every field has a default, so a client sets the few it needs.
+mapping Settings {
+    /// What every path is added to: `"https://api.example.com/v1"`.
+    base : :string = ""
+    auth : Auth = Auth.none
+    /// Headers every request carries, as `[name, value]` pairs.
+    headers : [[:string]] = []
+    /// Query every request carries, as `[name, value]` pairs.
+    query : [[:any]] = []
+    /// Many APIs refuse a request that does not say who is calling.
+    user_agent : :string = "dream-std-api"
+    /// How long one try may take, in nanoseconds (`time.seconds 30`).
+    timeout : :integer = 30000000000
+    /// How many times a request is sent again after the first.
+    retries : :integer = 2
+    /// The pause before the first retry, in milliseconds; each one after is
+    /// twice the one before, unless the server said how long (`Retry-After`).
+    backoff : :integer = 500
+    /// The statuses that mean "not now" rather than "no".
+    retry_on : [:integer] = [429, 502, 503, 504]
+    /// The most pages `pages!` asks for, whatever the API says is left.
+    max_pages : :integer = 100
+    /// A `http.client!` to keep connections in, or `()` for one each.
+    client : :any = ()
+    /// A function from request to `Result response error` that is used
+    /// instead of the network, or `()`: how a client is tested.
+    transport : :any = ()
+}
+
+// --- one request ----------------------------------------------------------------------
+
+/// What a request sends.
+union Body {
+    none
+    /// Written as JSON, with the content type that says so.
+    json(value : :any)
+    /// Written as a form, from a map or a list of pairs.
+    form(fields : :any)
+    /// Sent as it is, as the content type `kind`.
+    text(content : :string, kind : :string)
+}
+
+/// One request, not yet sent.
+mapping Command {
+    method : :string = "GET"
+    /// Added to the settings' base; `{name}` is filled from `params`. One
+    /// that starts `http://` or `https://` is used as it stands.
+    path : :string = ""
+    /// What fills the path's names, by name. Each value is percent-encoded.
+    params : :map = %{}
+    /// `[name, value]` pairs, after the settings' own.
+    query : [[:any]] = []
+    /// `[name, value]` pairs, replacing the settings' where they agree.
+    headers : [[:string]] = []
+    body : Body = Body.none
+    /// A function from the answer, read, to what the caller wants of it; or
+    /// `()` for the answer as it was read.
+    decode : :any = ()
+}
+
+/// Why there is no answer.
+union Failure {
+    /// Nothing came back: the error `http.send!` answered, whose
+    /// `error.kind` is `:timeout`, `:connection_refused` and the rest.
+    transport(reason : :any)
+    /// The server answered, and not with a success. `body` is what it said,
+    /// read as JSON when it is.
+    status(code : :integer, body : :any, response : :map)
+    /// A success whose body said it was JSON and was not.
+    decode(reason : :string, body : :string)
+}
+
+/// A failure in a sentence, for a log or a person.
+let describe : Failure -> :string;
+let describe f = match f {
+    Failure.transport(reason) => "no answer: " + to_string reason,
+    Failure.status(code, body, _) => str.concat_all ["status ", to_string code, " ", http.reason code, ": ", text_of body],
+    Failure.decode(reason, _) => "an answer that could not be read: " + reason,
+};
+
+/// Whether trying again later might work: nothing came back, or the server
+/// said it was busy.
+let is_temporary : Failure -> :bool;
+let is_temporary f = match f {
+    Failure.transport(_) => true,
+    Failure.status(code, _, _) => code == 429 || code >= 500,
+    Failure.decode(_, _) => false,
+};
+
+// --- writing a command ----------------------------------------------------------------
+
+/// A request of `method` to `path`.
+let command : :string -> :string -> Command;
+let command method path = Command.new () |> Command.set_method method |> Command.set_path path;
+
+/// `GET path`: read something.
+let get : :string -> Command;
+let get path = command "GET" path;
+
+/// `POST path`: make something, or do something.
+let post : :string -> Command;
+let post path = command "POST" path;
+
+/// `PUT path`: put something there, whole.
+let put : :string -> Command;
+let put path = command "PUT" path;
+
+/// `PATCH path`: change part of something.
+let patch : :string -> Command;
+let patch path = command "PATCH" path;
+
+/// `DELETE path`: remove something.
+let delete : :string -> Command;
+let delete path = command "DELETE" path;
+
+/// `{name}` in the path filled with `value`.
+let with_param : :string -> :any -> Command -> Command;
+let with_param name value c = Command.set_params ((Command.params c).[name => value]) c;
+
+/// `name=value` in the query, replacing one of that name. A `value` of `()`
+/// or `Option.none` adds nothing and `Option.some v` adds `v`, so an optional
+/// argument is passed straight through.
+let with_query : :string -> :any -> Command -> Command;
+let with_query name value c = match value {
+    () => c,
+    Option.none => c,
+    Option.some(v) => Command.set_query (list.append (without_name name (Command.query c)) [[name, v]]) c,
+    v => Command.set_query (list.append (without_name name (Command.query c)) [[name, v]]) c,
+};
+
+/// Each pair of a map, or of a list of pairs, as `with_query` adds one.
+let with_queries : :any -> Command -> Command;
+let with_queries pairs c =
+    list.fold (fn acc p -> with_query (list.nth 0 p) (list.nth 1 p) acc) c
+              (if type_of pairs == :map { map.sorted_pairs pairs } else { pairs });
+
+/// The pairs not named `name`.
+priv let without_name : :string -> [[:any]] -> [[:any]];
+priv let without_name name pairs = list.filter (fn p -> list.nth 0 p != name) pairs;
+
+/// A header on this request.
+let with_header : :string -> :string -> Command -> Command;
+let with_header name value c = Command.set_headers (list.append (Command.headers c) [[name, value]]) c;
+
+/// `value` as the body, in JSON.
+let with_json : :any -> Command -> Command;
+let with_json value c = Command.set_body (Body.json value) c;
+
+/// A map or a list of pairs as the body, as a form.
+let with_form : :any -> Command -> Command;
+let with_form fields c = Command.set_body (Body.form fields) c;
+
+/// `content` as the body, as the content type `kind`.
+let with_text : :string -> :string -> Command -> Command;
+let with_text kind content c = Command.set_body (Body.text content kind) c;
+
+/// What to make of the answer: `f` is given the body as it was read -- a
+/// map or a list for JSON -- and what it answers is what `run!` answers.
+let decoding : :any -> Command -> Command;
+let decoding f c = Command.set_decode f c;
+
+// --- from a command to a request ------------------------------------------------------
+
+/// A value as text: a string as it is, anything else as it prints.
+priv let text_of : :any -> :string;
+priv let text_of v = if type_of v == :string { v } else { to_string v };
+
+/// `path` with each `{name}` replaced by its value, percent-encoded so that a
+/// value with a `/` or a space in it is still one piece of the path.
+let filled : :map -> :string -> :string;
+let filled params path =
+    list.fold (fn p [name, value] -> str.replace (str.concat_all ["{", text_of name, "}"]) (url.encode (text_of value)) p)
+              path (map.sorted_pairs params);
+
+/// The URL a command is sent to under these settings.
+let target : Settings -> Command -> :string;
+let target s c = {
+    let path = filled (Command.params c) (Command.path c);
+    let whole = if str.starts_with "http://" path || str.starts_with "https://" path { path }
+                else { str.concat_all [str.trim_suffix "/" (Settings.base s), if str.starts_with "/" path || path == "" { "" } else { "/" }, path] };
+    let key = match Settings.auth s {
+        Auth.query(name, value) => [[name, value]],
+        _ => [],
+    };
+    let pairs = list.concat [Settings.query s, key, Command.query c];
+    if list.is_empty pairs { whole }
+    else { str.concat_all [whole, if str.contains_str "?" whole { "&" } else { "?" }, url.encode_query pairs] }
+};
+
+/// The request a command is under these settings, before any hook has seen it.
+let request_of : Settings -> Command -> :map;
+let request_of s c = {
+    let started = http.request (Command.method c) (target s c)
+        |> http.with_header "user-agent" (Settings.user_agent s)
+        |> http.with_header "accept" "application/json"
+        |> http.with_timeout (Settings.timeout s);
+    let signed = match Settings.auth s {
+        Auth.bearer(token) => http.with_bearer token started,
+        Auth.basic(user, password) => http.with_basic_auth user password started,
+        Auth.header(name, value) => http.with_header name value started,
+        _ => started,
+    };
+    let headed = list.fold (fn r [name, value] -> http.with_header name value r) signed
+                           (list.append (Settings.headers s) (Command.headers c));
+    match Command.body c {
+        Body.none => headed,
+        Body.json(value) => http.with_json value headed,
+        Body.form(fields) => http.with_form fields headed,
+        Body.text(content, kind) => http.with_header "content-type" kind (http.with_body content headed),
+    }
+};
+
+// --- sending ---------------------------------------------------------------------------
+
+/// One try: by the settings' stand-in, their client, or a connection of its own.
+priv let deliver! : Settings -> :map -> Result :map :any;
+priv let deliver! s request = match Settings.transport s {
+    () => match Settings.client s {
+        () => http.send! request,
+        client => http.call! client request,
+    },
+    stand_in => stand_in request,
+};
+
+/// Whether a request that got no answer may be sent again: one that changes
+/// nothing by being repeated, and a failure that another try could get past.
+priv let repeatable : :map -> :any -> :bool;
+priv let repeatable request reason =
+    list.contains (http.Request.method request) ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"]
+        && not (list.contains (error.kind reason) [:bad_url, :certificate_untrusted, :too_many_redirects]);
+
+/// How long to wait before try `n + 1`, in milliseconds: what the server
+/// asked for, in seconds, when it asked, and otherwise the backoff doubled
+/// for each try so far.
+priv let pause_before : Settings -> :integer -> :any -> :integer;
+priv let pause_before s n response = {
+    let asked = match response {
+        () => Option.none,
+        r => match http.header "retry-after" r {
+            Option.some(text) => num.parse_int (str.trim text),
+            Option.none => Option.none,
+        },
+    };
+    match asked {
+        Option.some(seconds) => seconds * 1000,
+        Option.none => Settings.backoff s * num.pow 2 n,
+    }
+};
+
+/// Wait that many milliseconds, when it is any.
+priv let pause! : :integer -> :unit;
+priv let pause! ms = if ms > 0 { proc.sleep! ms; () } else { () };
+
+/// The request sent, and again as the settings allow.
+priv let attempt! : Settings -> :map -> :integer -> Result :map :any;
+priv let rec attempt! s request !n = match deliver! s request {
+    Result.ok(response) =>
+        if n < Settings.retries s && list.contains (http.status response) (Settings.retry_on s) {
+            pause! (pause_before s n response);
+            attempt! s request (n + 1)
+        } else { Result.ok response },
+    Result.error(reason) =>
+        if n < Settings.retries s && repeatable request reason {
+            pause! (pause_before s n ());
+            attempt! s request (n + 1)
+        } else { Result.error reason },
+};
+
+// --- reading the answer -----------------------------------------------------------------
+
+/// A response's body as a value: nothing for an empty one, the JSON it is
+/// when it says it is JSON or looks like it, and its text otherwise.
+let read : :map -> Result :any Failure;
+let read response = {
+    let body = http.body response;
+    let says_json = match http.content_type response {
+        Option.some(kind) => str.contains_str "json" kind,
+        Option.none => false,
+    };
+    let trimmed = str.trim_start body;
+    if str.is_blank body { Result.ok () }
+    else if says_json || str.starts_with "{" trimmed || str.starts_with "[" trimmed {
+        match json.parse body {
+            Result.ok(value) => Result.ok value,
+            Result.error(reason) => if says_json { Result.error (Failure.decode reason body) } else { Result.ok body },
+        }
+    }
+    else { Result.ok body }
+};
+
+/// What stands between a response and an answer, by default: a status from
+/// 200 to 299 goes on, and any other is a `Failure.status` holding what the
+/// server said.
+let check : :map -> Result :map Failure;
+let check response =
+    if http.is_success response { Result.ok response }
+    else {
+        let said = match read response {
+            Result.ok(value) => value,
+            Result.error(_) => http.body response,
+        };
+        Result.error (Failure.status (http.status response) said response)
+    };
+
+/// What a command makes of an answer that was read.
+priv let shaped : Command -> :any -> :any;
+priv let shaped c value = match Command.decode c {
+    () => value,
+    f => f value,
+};
+
+/// A command sent and its answer read, with the response it came in:
+/// `[value, response]`, the value as it was read, before the command's
+/// `decode`. `prepare` sees the request last, and may sign it; `checking` is
+/// `check`, or an API's own idea of what a failure is.
+let exchange! : Settings -> (:map -> :map) -> (:map -> Result :map Failure) -> Command -> Result [:any] Failure;
+let exchange! s prepare checking c = match attempt! s (prepare (request_of s c)) 0 {
+    Result.error(reason) => Result.error (Failure.transport reason),
+    Result.ok(response) => match checking response {
+        Result.error(failure) => Result.error failure,
+        Result.ok(passed) => match read passed {
+            Result.error(failure) => Result.error failure,
+            Result.ok(value) => Result.ok [value, passed],
+        },
+    },
+};
+
+/// `run!`, with the hooks a deriving client supplies (`std.http.client`).
+let run_with! : Settings -> (:map -> :map) -> (:map -> Result :map Failure) -> Command -> Result :any Failure;
+let run_with! s prepare checking c = match exchange! s prepare checking c {
+    Result.ok([value, _]) => Result.ok (shaped c value),
+    Result.error(failure) => Result.error failure,
+};
+
+/// Send a command: its answer, read and decoded, or why there is none.
+let run! : Settings -> Command -> Result :any Failure;
+let run! s c = run_with! s (fn request -> request) check c;
+
+// --- answers that come in pieces ----------------------------------------------------------
+//
+// A `next` is asked, after each page, for the command that fetches the one
+// after it: it is given the command just sent, the page as it was read, and
+// the response, and answers `none` when there are no more. The three below
+// are the three ways APIs say it.
+
+/// The cursor is in the page: `next_cursor ["data", "after"] "after"` reads
+/// it from `page.data.after` and sends it as `?after=..`, until it is absent,
+/// null or empty.
+let next_cursor : [:string] -> :string -> (Command -> :any -> :map -> Option Command);
+let next_cursor path name = fn c page _ -> match dig path page {
+    () => Option.none,
+    "" => Option.none,
+    cursor => Option.some (with_query name cursor c),
+};
+
+/// The value at a path of keys in nested maps, or `()`.
+let dig : [:string] -> :any -> :any;
+let dig path value = list.fold (fn v key -> if type_of v == :map { v.[key else ()] } else { () }) value path;
+
+/// The next page is a URL in the `Link` header, marked `rel="next"`, as
+/// GitHub and many others send it.
+let next_link : Command -> :any -> :map -> Option Command;
+let next_link c _ response = match http.header "link" response {
+    Option.none => Option.none,
+    Option.some(links) => match list.find (fn part -> str.contains_str "rel=\"next\"" part) (str.split "," links) {
+        Option.none => Option.none,
+        Option.some(part) => {
+            let address = str.before ">" (str.after "<" part);
+            if address == "" { Option.none }
+            else { Option.some (c |> Command.set_path address |> Command.set_params %{} |> Command.set_query []) }
+        },
+    },
+};
+
+/// Pages are numbered: `next_number "page" items` asks for the page after
+/// the one in `?page=` -- the first being 1 -- until `items` finds a page empty.
+let next_number : :string -> (:any -> [:any]) -> (Command -> :any -> :map -> Option Command);
+let next_number name items = fn c page _ ->
+    if list.is_empty (items page) { Option.none }
+    else {
+        let now = match list.lookup name (Command.query c) {
+            Option.some(n) => if type_of n == :integer { n } else { Option.unwrap_or 1 (num.parse_int (text_of n)) },
+            Option.none => 1,
+        };
+        Option.some (with_query name (now + 1) c)
+    };
+
+/// `pages!`, with the hooks a deriving client supplies.
+let pages_with! : Settings -> (:map -> :map) -> (:map -> Result :map Failure) -> (Command -> :any -> :map -> Option Command) -> Command -> Result [:any] Failure;
+let pages_with! s prepare checking next c = {
+    let rec go! at !n acc = match exchange! s prepare checking at {
+        Result.error(failure) => Result.error failure,
+        Result.ok([value, response]) => {
+            let pages = _list_cons (shaped at value) acc;
+            if n + 1 >= Settings.max_pages s { Result.ok (list.reverse pages) }
+            else {
+                match next at value response {
+                    Option.some(following) => go! following (n + 1) pages,
+                    Option.none => Result.ok (list.reverse pages),
+                }
+            }
+        },
+    };
+    go! c 0 []
+};
+
+/// Every page of an answer that comes in pieces, each decoded as the command
+/// says, in order; `next` says where the one after is. The first failure is
+/// the answer.
+let pages! : Settings -> (Command -> :any -> :map -> Option Command) -> Command -> Result [:any] Failure;
+let pages! s next c = pages_with! s (fn request -> request) check next c;
+
+/// Every item of every page: `items` is what a decoded page holds.
+let all! : Settings -> (Command -> :any -> :map -> Option Command) -> (:any -> [:any]) -> Command -> Result [:any] Failure;
+let all! s next items c = match pages! s next c {
+    Result.ok(found) => Result.ok (list.flat_map items found),
+    Result.error(failure) => Result.error failure,
+};
+
+when test {
+    import std.test;
+
+    /// A stand-in for the network: answers each request with the next of
+    /// `answers`. The count is kept by a process that ends when the last has
+    /// been asked for, so a test makes exactly as many requests as it lists
+    /// answers and leaves nothing running.
+    let canned! : [:map] -> :any;
+    let canned! answers = {
+        let seen = spawn! $( {
+            let rec loop! n = if n >= len answers { () } else {
+                match recv! () {
+                    [:next, from] => { send! from [:at, n]; loop! (n + 1) },
+                    _ => (),
+                }
+            };
+            loop! 0
+        } );
+        fn! request -> {
+            send! seen [:next, self! ()];
+            let n = match recv! () {
+                [:at, at] => at,
+                _ => 0,
+            };
+            Result.ok (http.Response.set_url (http.Request.url request) (list.nth (num.min n (len answers - 1)) answers))
+        }
+    };
+
+    /// Settings whose network is `canned!` and whose retries do not wait.
+    let quick! : [:map] -> Settings;
+    let quick! answers = Settings.new ()
+        |> Settings.set_base "https://api.test/v1/"
+        |> Settings.set_backoff 0
+        |> Settings.set_transport (canned! answers);
+
+    let tests : [:any];
+    let tests = [
+        test.case "a path's names are filled, each as one piece"
+            $( test.eq! "/r/a%2Fb/hot/7" (filled %{"sub" => "a/b", "n" => 7} "/r/{sub}/hot/{n}") ),
+        test.case "the target is the base, the path and every query"
+            $( test.eq! "https://api.test/v1/users/7?key=k&limit=10&q=a+b"
+                        (target (Settings.new () |> Settings.set_base "https://api.test/v1/" |> Settings.set_auth (Auth.query "key" "k"))
+                                (get "/users/{id}" |> with_param "id" 7 |> with_query "limit" 10 |> with_query "q" "a b")) ),
+        test.case "an optional query is passed straight through"
+            $( test.eq! [["b", 2], ["a", 3]]
+                        (Command.query (get "/" |> with_query "a" 1 |> with_query "b" (Option.some 2) |> with_query "c" Option.none
+                                                |> with_query "d" () |> with_query "a" 3)) ),
+        test.case "a URL for a path is used as it stands"
+            $( test.eq! "https://other.test/x" (target (Settings.new () |> Settings.set_base "https://api.test") (get "https://other.test/x")) ),
+        test.case "the request carries the credentials, the headers and the body"
+            $( {
+                let r = request_of (Settings.new () |> Settings.set_base "https://api.test" |> Settings.set_auth (Auth.bearer "t")
+                                        |> Settings.set_headers [["x-team", "a"]])
+                                   (post "/things" |> with_json %{"n" => 1} |> with_header "x-team" "b");
+                test.eq! ["POST", Option.some "Bearer t", Option.some "b", "{\"n\":1}", Option.some "dream-std-api"]
+                         [http.Request.method r, http.header "authorization" r, http.header "x-team" r, http.Request.body r, http.header "user-agent" r]
+            } ),
+        test.case "an answer is read as JSON and decoded"
+            $( test.eq! (Result.ok "ada")
+                        (run! (quick! [http.json %{"name" => "ada"}]) (get "/users/1" |> decoding (fn u -> u.["name"]))) ),
+        test.case "no content is nothing"
+            $( test.eq! (Result.ok ()) (run! (quick! [http.no_content]) (delete "/users/1")) ),
+        test.case "a refusal is a failure holding what the server said"
+            $( test.eq! [404, "gone"]
+                        (match run! (quick! [http.with_status 404 (http.json %{"why" => "gone"})]) (get "/x") {
+                            Result.error(Failure.status(code, body, _)) => [code, body.["why"]],
+                            other => [0, to_string other],
+                        }) ),
+        test.case "a busy server is asked again"
+            $( test.eq! (Result.ok %{"ok" => true})
+                        (run! (quick! [http.status_only 503, http.status_only 429, http.json %{"ok" => true}]) (get "/x")) ),
+        test.case "and not for ever"
+            $( test.eq! 503
+                        (match run! (quick! [http.status_only 503, http.status_only 503, http.status_only 503]) (get "/x") {
+                            Result.error(Failure.status(code, _, _)) => code,
+                            _ => 0,
+                        }) ),
+        test.case "what will not answer is a transport failure"
+            $( test.eq! [true, true]
+                        (match run! (Settings.new () |> Settings.set_retries 0 |> Settings.set_transport (fn _ -> Result.error (error.new :timeout "slow"))) (get "/x") {
+                            Result.error(failure) => [is_temporary failure, str.starts_with "no answer" (describe failure)],
+                            _ => [false, false],
+                        }) ),
+        test.case "JSON that is not is a decode failure"
+            $( test.eq! true
+                        (match run! (quick! [http.with_header "content-type" "application/json" (http.text "{oops")]) (get "/x") {
+                            Result.error(Failure.decode(_, body)) => body == "{oops",
+                            _ => false,
+                        }) ),
+        test.case "pages by a cursor in the body"
+            $( test.eq! (Result.ok [1, 2, 3, 4, 5])
+                        (all! (quick! [http.json %{"items" => [1, 2], "next" => "b"}, http.json %{"items" => [3, 4], "next" => "c"},
+                                       http.json %{"items" => [5], "next" => ()}])
+                              (next_cursor ["next"] "after") (fn page -> page.["items"]) (get "/things")) ),
+        test.case "pages by a Link header"
+            $( test.eq! (Result.ok [[1], [2]])
+                        (pages! (quick! [http.with_header "link" "<https://api.test/v1/t?page=2>; rel=\"next\", <https://api.test/v1/t?page=9>; rel=\"last\"" (http.json [1]),
+                                         http.json [2]])
+                                next_link (get "/t")) ),
+        test.case "pages by number, until one is empty"
+            $( test.eq! (Result.ok [1, 2, 3])
+                        (all! (quick! [http.json [1, 2], http.json [3], http.json []]) (next_number "page" (fn page -> page)) (fn page -> page) (get "/t")) ),
+        test.case "pages stop at the most allowed"
+            $( test.eq! (Result.ok [[1], [1]])
+                        (pages! (Settings.set_max_pages 2 (quick! [http.json [1], http.json [1]])) (next_number "page" (fn page -> page)) (get "/t")) ),
+    ];
+}

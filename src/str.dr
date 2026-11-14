@@ -697,11 +697,223 @@ let trim s = {
 
 // --- tests ------------------------------------------------------------------
 
+// --- more of what text is asked for -----------------------------------------------
+//
+// Cases and pieces. The case functions are ASCII's, as `upper` and `lower`
+// are, and take a name apart the way a person reads one: at anything that is
+// not a letter or a digit, and where a capital follows a small letter.
+
+/// Each word's first letter upper-cased and the rest lower-cased, a word being
+/// a run of letters and digits: `title "the quick-brown fox"` is `"The Quick-Brown Fox"`.
+let title : :string -> :string;
+let title s = of_chars (title_from true (chars s));
+
+/// `title`'s walk: `starts` is whether this character begins a word.
+priv let title_from : :bool -> [:char] -> [:char];
+priv let rec title_from starts cs = match cs {
+    [] => [],
+    [c, ..rest] => _list_cons (if starts { upper_char c } else { lower_char c }) (title_from (not (char.is_alnum c)) rest),
+};
+
+/// Upper case made lower and lower made upper.
+let swap_case : :string -> :string;
+let swap_case s = map (fn c -> if char.is_upper c { lower_char c } else { upper_char c }) s;
+
+/// The words of a name, lower-cased, however it was written: `"parseHttpHeader"`,
+/// `"parse_http_header"` and `"Parse HTTP header"` are each `["parse", "http", "header"]`.
+let name_words : :string -> [:string];
+let name_words s =
+    list.map (fn w -> lower (of_chars (list.reverse w)))
+             (list.filter (fn w -> not (list.is_empty w)) (name_runs (chars s) [] false));
+
+/// The runs `name_words` cuts, each reversed: `after_small` is whether the
+/// character before was a small letter or a digit, which a capital then ends.
+priv let name_runs : [:char] -> [:char] -> :bool -> [[:char]];
+priv let rec name_runs cs !run after_small = match cs {
+    [] => [run],
+    [c, ..rest] =>
+        if not (char.is_alnum c) { _list_cons run (name_runs rest [] false) }
+        else if char.is_upper c && after_small { _list_cons run (name_runs rest [c] false) }
+        else { name_runs rest (_list_cons c run) (char.is_lower c || char.is_digit c) },
+};
+
+/// `snake_case "parseHttpHeader"` is `"parse_http_header"`.
+let snake_case : :string -> :string;
+let snake_case s = join_str "_" (name_words s);
+
+/// `kebab_case "parseHttpHeader"` is `"parse-http-header"`: what a URL or a flag wants.
+let kebab_case : :string -> :string;
+let kebab_case s = join_str "-" (name_words s);
+
+/// `camel_case "parse_http_header"` is `"parseHttpHeader"`.
+let camel_case : :string -> :string;
+let camel_case s = match name_words s {
+    [] => "",
+    [first, ..rest] => concat_all (_list_cons first (list.map capitalize rest)),
+};
+
+/// `pascal_case "parse_http_header"` is `"ParseHttpHeader"`.
+let pascal_case : :string -> :string;
+let pascal_case s = concat_all (list.map capitalize (name_words s));
+
+/// Test whether the string is one or more decimal digits and nothing else.
+let is_digits : :string -> :bool;
+let is_digits s = len s > 0 && all char.is_digit s;
+
+/// Test whether the string is one or more ASCII letters and nothing else.
+let is_alpha : :string -> :bool;
+let is_alpha s = len s > 0 && all char.is_alpha s;
+
+/// Test whether the string is one or more ASCII letters and digits and nothing else.
+let is_alnum : :string -> :bool;
+let is_alnum s = len s > 0 && all char.is_alnum s;
+
+/// Test whether the string has a letter and no lower-case one.
+let is_upper : :string -> :bool;
+let is_upper s = any char.is_alpha s && not (any char.is_lower s);
+
+/// Test whether the string has a letter and no upper-case one.
+let is_lower : :string -> :bool;
+let is_lower s = any char.is_alpha s && not (any char.is_upper s);
+
+/// The first `old` replaced by `fresh`, and the string as it was when there is none.
+let replace_first : :string -> :string -> :string -> :string;
+let replace_first old fresh s = match split_once old s {
+    Option.some([before_, after_]) => concat_all [before_, fresh, after_],
+    Option.none => s,
+};
+
+/// The string without any occurrence of `sub`.
+let remove : :string -> :string -> :string;
+let remove sub s = replace sub "" s;
+
+/// Every run of whitespace made one space, and none at either end.
+let squeeze : :string -> :string;
+let squeeze s = join_str " " (words s);
+
+/// What comes before the first `sub`; the whole string when there is none.
+let before : :string -> :string -> :string;
+let before sub s = match split_once sub s {
+    Option.some([head_, _]) => head_,
+    Option.none => s,
+};
+
+/// What comes after the first `sub`; `""` when there is none.
+let after : :string -> :string -> :string;
+let after sub s = match split_once sub s {
+    Option.some([_, rest]) => rest,
+    Option.none => "",
+};
+
+/// What comes before the last `sub`; the whole string when there is none.
+let before_last : :string -> :string -> :string;
+let before_last sub s = match split_last sub s {
+    Option.some([head_, _]) => head_,
+    Option.none => s,
+};
+
+/// What comes after the last `sub`; `""` when there is none: `after_last "." "a.tar.gz"` is `"gz"`.
+let after_last : :string -> :string -> :string;
+let after_last sub s = match split_last sub s {
+    Option.some([_, rest]) => rest,
+    Option.none => "",
+};
+
+/// The first `n` characters -- characters, not bytes.
+let take : :integer -> :string -> :string;
+let take n s = of_chars (list.take n (chars s));
+
+/// The string without its first `n` characters.
+let drop : :integer -> :string -> :string;
+let drop n s = of_chars (list.drop n (chars s));
+
+/// The last `n` characters.
+let take_last : :integer -> :string -> :string;
+let take_last n s = of_chars (list.take_last n (chars s));
+
+/// The string without its last `n` characters.
+let drop_last : :integer -> :string -> :string;
+let drop_last n s = of_chars (list.drop_last n (chars s));
+
+/// The character at position `i`, counting characters from zero, or `none`.
+let char_at : :integer -> :string -> Option :char;
+let char_at i s = if i < 0 { Option.none } else {
+    match list.drop i (chars s) {
+        [c, .._] => Option.some c,
+        [] => Option.none,
+    }
+};
+
+/// `sub` put in before the character at position `i`; at the end when `i` is past it.
+let insert : :integer -> :string -> :string -> :string;
+let insert i sub s = concat_all [take i s, sub, drop i s];
+
+/// Test whether two strings are equal but for the case of their ASCII letters.
+let equals_fold : :string -> :string -> :bool;
+let equals_fold a b = lower a == lower b;
+
+/// Test whether the string starts with any of `prefixes`.
+let starts_with_any : [:string] -> :string -> :bool;
+let starts_with_any prefixes s = list.any (fn p -> starts_with p s) prefixes;
+
+/// Test whether the string ends with any of `suffixes`.
+let ends_with_any : [:string] -> :string -> :bool;
+let ends_with_any suffixes s = list.any (fn p -> ends_with p s) suffixes;
+
+/// Test whether the string contains any of `subs`.
+let contains_any : [:string] -> :string -> :bool;
+let contains_any subs s = list.any (fn p -> contains_str p s) subs;
+
+/// The string with `left` in front and `right` behind: `surround "(" ")" "x"` is `"(x)"`.
+let surround : :string -> :string -> :string -> :string;
+let surround left right s = concat_all [left, s, right];
+
+/// What a person means by yes or no, whatever the case and the space around
+/// it: `true`, `yes`, `on`, `1` and `false`, `no`, `off`, `0`. `none` for anything else.
+let parse_bool : :string -> Option :bool;
+let parse_bool s = match lower (trim s) {
+    "true" => Option.some true,
+    "yes" => Option.some true,
+    "on" => Option.some true,
+    "1" => Option.some true,
+    "false" => Option.some false,
+    "no" => Option.some false,
+    "off" => Option.some false,
+    "0" => Option.some false,
+    _ => Option.none,
+};
+
 when test {
     import std.test;
 
     let tests : [:any];
     let tests = [
+        test.case "title"                   $( test.eq! "The Quick-Brown Fox" (title "the QUICK-brown fox") ),
+        test.case "swap_case"               $( test.eq! "hELLO 1" (swap_case "Hello 1") ),
+        test.case "name_words, however it was written"
+            $( test.eq! [["parse", "http", "header"], ["parse", "http", "header"], ["parse", "http", "header"], []]
+                        [name_words "parseHttpHeader", name_words "parse_http_header", name_words "Parse HTTP header", name_words ""] ),
+        test.case "the cases of a name"
+            $( test.eq! ["parse_http_header", "parse-http-header", "parseHttpHeader", "ParseHttpHeader"]
+                        [snake_case "parseHttpHeader", kebab_case "ParseHttpHeader", camel_case "parse_http_header", pascal_case "parse-http header"] ),
+        test.case "what a string is made of"
+            $( test.eq! [true, false, false, true, true, true, false, true]
+                        [is_digits "042", is_digits "", is_digits "4a", is_alpha "ab", is_alnum "a1", is_upper "AB 1", is_upper "Ab", is_lower "ab-1"] ),
+        test.case "replace_first and remove" $( test.eq! ["x-b-a", "aba", "bb"] [replace_first "a" "x" "a-b-a", replace_first "z" "x" "aba", remove "a" "abab"] ),
+        test.case "squeeze"                 $( test.eq! "a b c" (squeeze "  a \t b\n c ") ),
+        test.case "before and after"
+            $( test.eq! ["k", "v=w", "k=v", "w", "none", ""]
+                        [before "=" "k=v=w", after "=" "k=v=w", before_last "=" "k=v=w", after_last "=" "k=v=w", before "=" "none", after "=" "none"] ),
+        test.case "take and drop count characters"
+            $( test.eq! ["h\u{e9}", "llo", "lo", "h\u{e9}l"] [take 2 "h\u{e9}llo", drop 2 "h\u{e9}llo", take_last 2 "h\u{e9}llo", drop_last 2 "h\u{e9}llo"] ),
+        test.case "char_at"                 $( test.eq! [Option.some 'b', Option.none, Option.none] [char_at 1 "abc", char_at 3 "abc", char_at (0 - 1) "abc"] ),
+        test.case "insert"                  $( test.eq! ["a-bc", "abc-"] [insert 1 "-" "abc", insert 9 "-" "abc"] ),
+        test.case "equals_fold"             $( test.eq! [true, false] [equals_fold "Hello" "hELLO", equals_fold "a" "b"] ),
+        test.case "any of several"
+            $( test.eq! [true, false, true, true]
+                        [starts_with_any ["x", "ab"] "abc", starts_with_any [] "abc", ends_with_any [".dr", ".md"] "a.md", contains_any ["q", "b"] "abc"] ),
+        test.case "surround"                $( test.eq! "(x)" (surround "(" ")" "x") ),
+        test.case "parse_bool"              $( test.eq! [Option.some true, Option.some false, Option.none] [parse_bool " Yes ", parse_bool "OFF", parse_bool "maybe"] ),
         // --- from std.seq, over characters ---
         test.case "seq count"        $( test.eq! 3 (count (fn c -> c == 'l') "Hello, World") ),
         test.case "seq any"          $( test.true! (any (fn c -> c == 'W') "Hello, World") ),

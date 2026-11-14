@@ -1,0 +1,113 @@
+// A client of one API, as something to derive: `std.http.api` with a value of
+// your own in front of it.
+//
+//     // reddit.dr
+//     import std.http.api;
+//
+//     mapping Reddit derive std.http.client {
+//         token : :string
+//
+//         settings self = api.Settings.new ()
+//             |> api.Settings.set_base "https://oauth.reddit.com"
+//             |> api.Settings.set_auth (api.Auth.bearer (token self))
+//             |> api.Settings.set_user_agent "dream:reddit-example:0.1"
+//
+//         next_page self command page response = api.next_cursor ["data", "after"] "after" command page response
+//
+//         /// The posts of a subreddit, newest first.
+//         newest! self sub = all! self (fn page -> page.["data"].["children"])
+//                                 (api.get "/r/{sub}/new" |> api.with_param "sub" sub |> api.with_query "limit" 100)
+//
+//         /// Who the token belongs to.
+//         me! self = get! self "/api/v1/me"
+//     }
+//
+//     Reddit.newest! (Reddit.make token) "programming"
+//
+// That is a whole client. The one hole is `settings`: what `api.Settings`
+// this client's value stands for. Everything else has an answer already and
+// is there to be replaced when an API is unusual in that way:
+//
+// - `prepare self request` sees every request last, to sign it or stamp it;
+// - `check self response` decides what a failure is, for the API that answers
+//   200 with `{"error": ..}` inside;
+// - `next_page self command page response` says where the page after this
+//   one is, which is what `pages!` and `all!` follow.
+//
+// What a deriving module gets: `run!` for a command built with
+// `api.get`/`api.post` and the rest, `get!`, `post!`, `put!`, `patch!` and
+// `delete!` for the request that needs no more than a path and a body, and
+// `pages!` and `all!`. Each answers `Result value api.Failure`, so a chain of
+// calls is a chain of `let?`. `derive` writes them into the deriving module
+// as ordinary functions calling its own `settings`: nothing is looked up when
+// a request is made.
+//
+// A value that is only settings needs none of this: `api.run!` takes an
+// `api.Settings` as it is.
+
+import std.http.api;
+import std.list;
+
+// --- the hole, and the hooks ---------------------------------------------------------
+
+/// The `api.Settings` this client's value stands for: where the API is, and
+/// who is asking.
+let settings : :any -> api.Settings;
+virtual let settings self;
+
+/// A request, about to be sent: answer it as it should go. For a signature
+/// over the whole request, or a header that changes each time.
+let prepare : :any -> :map -> :map;
+virtual let prepare self request = request;
+
+/// A response, about to be read: `Result.ok` of it to go on, or the failure
+/// it is. By default any status from 200 to 299 goes on (`api.check`).
+let check : :any -> :map -> Result :map api.Failure;
+virtual let check self response = api.check response;
+
+/// The command for the page after this one, or `none` when this is the last:
+/// one of `api.next_cursor`, `api.next_link` and `api.next_number`, usually.
+/// By default there is only ever one page.
+let next_page : :any -> api.Command -> :any -> :map -> Option api.Command;
+virtual let next_page self command page response = Option.none;
+
+// --- what a client gets -----------------------------------------------------------------
+
+/// Send a command: its answer, read and decoded, or why there is none.
+let run! : :any -> api.Command -> Result :any api.Failure;
+let run! self command =
+    api.run_with! (settings self) (fn request -> prepare self request) (fn response -> check self response) command;
+
+/// `GET path`, answered with the body as it was read.
+let get! : :any -> :string -> Result :any api.Failure;
+let get! self path = run! self (api.get path);
+
+/// `DELETE path`.
+let delete! : :any -> :string -> Result :any api.Failure;
+let delete! self path = run! self (api.delete path);
+
+/// `POST path` with `body` as JSON.
+let post! : :any -> :string -> :any -> Result :any api.Failure;
+let post! self path body = run! self (api.with_json body (api.post path));
+
+/// `PUT path` with `body` as JSON.
+let put! : :any -> :string -> :any -> Result :any api.Failure;
+let put! self path body = run! self (api.with_json body (api.put path));
+
+/// `PATCH path` with `body` as JSON.
+let patch! : :any -> :string -> :any -> Result :any api.Failure;
+let patch! self path body = run! self (api.with_json body (api.patch path));
+
+/// Every page of a command's answer, each decoded, in order, as `next_page`
+/// finds them.
+let pages! : :any -> api.Command -> Result [:any] api.Failure;
+let pages! self command =
+    api.pages_with! (settings self) (fn request -> prepare self request) (fn response -> check self response)
+                    (fn c page response -> next_page self c page response) command;
+
+/// Every item of every page: `items` is what a decoded page holds.
+let all! : :any -> (:any -> [:any]) -> api.Command -> Result [:any] api.Failure;
+let all! self items command = match pages! self command {
+    Result.ok(found) => Result.ok (list.flat_map items found),
+    Result.error(failure) => Result.error failure,
+};
